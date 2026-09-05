@@ -6,3 +6,38 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# Path dependency, not a published crate: same submodule-only constraint as
+# providers/cpu/Cargo.toml -- this crate is only buildable from within a
+# checkout of the parent Magnetar repository with this submodule checked out
+# at `providers/cuda`.
+magnetar-runtime = { path = "../../magnetar-runtime" }
+# `dynamic-loading` dlopens libcuda/libnvrtc at runtime instead of linking
+# against them at build time -- required so this crate keeps building and
+# testing on CI's GPU-less, CUDA-Toolkit-less `submodule-integration` runner
+# (see openspec/changes/implement-cuda-provider-baseline/design.md). No
+# `cuda-version` feature is selected: dynamic loading resolves the driver's
+# actual version at runtime instead.
+# `cuda-13000` only selects which CUDA version's numeric ABI constants get
+# compiled in (struct layouts/enum values); combined with `dynamic-loading`
+# it does not link against or require the CUDA Toolkit/driver to be present
+# at build time (verified against cudarc 0.19.9's build.rs: dynamic-linking/
+# static-linking, the only paths that emit `cargo:rustc-link-lib`/
+# `-link-search`, are gated out under `dynamic-loading`). The actual driver
+# and NVRTC libraries are `dlopen`ed at runtime instead -- see
+# CudaProvider::new's graceful-unavailability path when that fails.
+# Specifically `cuda-13000` (not a later 13.x): cudarc's dynamic-loading
+# NVRTC search list is derived from this feature's major/minor at compile
+# time (`nvrtc64_{major}{minor}_0.dll` on Windows), and NVIDIA ships that
+# file under the stable name `nvrtc64_130_0.dll` across the whole CUDA 13.x
+# series (verified against both this workstation's Toolkit 13.2 install and
+# arc-gpu-magnetar's `nvidia/cuda:13.0.2-cudnn-devel` container image) --
+# `cuda-13010`/`cuda-13020`/etc. would derive a wrong, nonexistent filename.
+# The driver library itself has no such versioned filename to get wrong.
+cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-13000"] }
+
+[dev-dependencies]
+# Used only by conformance tests, as the numerical oracle `provider-roadmap`
+# requires optimized Providers be checked against (`design.md`'s
+# "conformance scope" decision): compares `CudaKernels` output directly to
+# `providers/cpu`'s reference functions on the same fixtures.
+magnetar-provider-cpu = { path = "../cpu" }
