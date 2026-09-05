@@ -16,6 +16,23 @@
 //! links against the CUDA driver/NVRTC at build time (see `Cargo.toml`), so
 //! the only thing that can fail there is the runtime `dlopen` attempt this
 //! module already treats as a normal, expected outcome.
+//!
+//! One real-hardware-vs-CI discrepancy this had to learn the hard way
+//! (confirmed by CI's `submodule-integration`/`provider integration` jobs,
+//! which run on a genuinely driver-less `ubuntu-latest`, unlike every
+//! machine this crate had been manually verified on so far): `cudarc`'s
+//! dynamic-loading mode does **not** turn "the shared library file does not
+//! exist anywhere on this system" into a catchable [`DriverError`] --
+//! `cudarc::panic_no_lib_found` unconditionally `panic!`s in that specific
+//! case (a version-mismatch-but-library-present case, the only one this
+//! module originally accounted for, *does* return a normal `Err`). Every
+//! function that can trigger a fresh dlopen attempt is therefore wrapped in
+//! [`std::panic::catch_unwind`] below, converting that panic into the same
+//! graceful-unavailable outcome a `DriverError` would have produced. The
+//! panic message still prints to stderr (Rust's default hook runs before
+//! unwinding, and swapping the process-global hook here would risk
+//! swallowing a genuinely different panic on another thread in the same
+//! `cargo test` run) -- noisy but harmless, and still a normal test pass.
 
 use cudarc::driver::sys::CUresult;
 use cudarc::driver::{CudaContext, DriverError};
@@ -73,12 +90,13 @@ pub struct CudaProvider {
 
 impl CudaProvider {
     pub fn new() -> Self {
-        match Self::discover_primary_device() {
+        match Self::discover_primary_device_catching_missing_library_panic() {
             Ok((context, device)) => {
                 let device = Arc::new(device);
-                let executor = CudaKernels::compile_and_load(&context).ok().map(|kernels| {
-                    Arc::new(CudaExecutor::new(kernels, device.metadata.id.clone()))
-                });
+                let executor =
+                    Self::compile_kernels_catching_missing_library_panic(&context).map(|kernels| {
+                        Arc::new(CudaExecutor::new(kernels, device.metadata.id.clone()))
+                    });
                 Self {
                     metadata: cuda_provider_metadata(),
                     context: Some(context),
@@ -95,10 +113,23 @@ impl CudaProvider {
         }
     }
 
-    /// Attempts to load the CUDA driver and bind device ordinal 0. Never
-    /// panics: every failure mode (no driver, no device, version mismatch)
-    /// comes back as an `Err` that [`Self::new`] turns into the graceful
-    /// unavailable state.
+    /// [`Self::discover_primary_device`], but also converts a
+    /// `cudarc::panic_no_lib_found` panic (the shared library is completely
+    /// absent, not merely an incompatible version -- see this module's doc
+    /// comment) into the same `Err` outcome the caller already handles.
+    fn discover_primary_device_catching_missing_library_panic()
+    -> Result<(Arc<CudaContext>, DeviceDescriptor), DriverError> {
+        match std::panic::catch_unwind(Self::discover_primary_device) {
+            Ok(result) => result,
+            Err(_panic) => Err(DriverError(CUresult::CUDA_ERROR_NO_DEVICE)),
+        }
+    }
+
+    /// Attempts to load the CUDA driver and bind device ordinal 0. May
+    /// panic via `cudarc` if the driver shared library is completely
+    /// absent -- callers must go through
+    /// [`Self::discover_primary_device_catching_missing_library_panic`],
+    /// never this directly.
     fn discover_primary_device() -> Result<(Arc<CudaContext>, DeviceDescriptor), DriverError> {
         let device_count = CudaContext::device_count()?;
         if device_count <= 0 {
@@ -107,6 +138,19 @@ impl CudaProvider {
         let context = CudaContext::new(0)?;
         let device = cuda_device_descriptor(&context)?;
         Ok((context, device))
+    }
+
+    /// [`CudaKernels::compile_and_load`], but also converts an NVRTC
+    /// `cudarc::panic_no_lib_found` panic (the NVRTC shared library is
+    /// completely absent -- same class of issue as the driver, in principle
+    /// reachable even when the driver itself was found) into `None`, the
+    /// same outcome a compile/load `Err` already produces here.
+    fn compile_kernels_catching_missing_library_panic(
+        context: &Arc<CudaContext>,
+    ) -> Option<CudaKernels> {
+        std::panic::catch_unwind(|| CudaKernels::compile_and_load(context))
+            .ok()
+            .and_then(Result::ok)
     }
 
     /// Whether this Provider found a usable CUDA driver and device.
