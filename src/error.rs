@@ -107,13 +107,20 @@ impl From<CudaError> for magnetar_runtime::kernel::KernelError {
             CudaErrorCode::DeviceUnavailable => KernelError::KernelDeviceUnsupported {
                 device: error.detail,
             },
-            // No dedicated KernelError variant for allocation/compilation/
-            // driver failures; KernelExecutionFailed is the closest honest
-            // fit -- these are real per-invocation execution failures, not
-            // a request the Runtime could have avoided by asking for
+            // Device memory exhaustion has its own dedicated Kernel error
+            // category (`enable-device-resident-kernel-chaining` task 1.1)
+            // rather than folding into the generic execution-failed case
+            // below -- a caller can distinguish "ran out of device memory"
+            // from an opaque driver/compilation failure.
+            CudaErrorCode::OutOfDeviceMemory => KernelError::KernelOutOfDeviceMemory {
+                reason: error.detail,
+            },
+            // No dedicated KernelError variant for compilation/driver
+            // failures; KernelExecutionFailed is the closest honest fit --
+            // these are real per-invocation execution failures, not a
+            // request the Runtime could have avoided by asking for
             // something else (unlike the categories above).
             CudaErrorCode::ExecutionFailed
-            | CudaErrorCode::OutOfDeviceMemory
             | CudaErrorCode::CompilationFailed
             | CudaErrorCode::DriverFailed => KernelError::KernelExecutionFailed {
                 reason: error.detail,

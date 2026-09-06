@@ -5,9 +5,30 @@
 //! branch, this workstation and `arc-gpu-magnetar` exercise the "available"
 //! branch, and both are asserted here rather than skipped.
 
+use crate::error::{CudaError, CudaErrorCode};
 use crate::provider::{CUDA_PROVIDER_NAME, CudaProvider};
 use magnetar_runtime::affinity::ProviderHealth;
+use magnetar_runtime::kernel::{KernelError, KernelErrorCode};
 use magnetar_runtime::provider::Provider;
+
+#[test]
+fn out_of_device_memory_maps_to_dedicated_kernel_error_category() {
+    let error = CudaError::new(
+        CudaErrorCode::OutOfDeviceMemory,
+        "requested 8GiB, 2GiB free",
+    );
+    let kernel_error: KernelError = error.into();
+    assert_eq!(
+        kernel_error.code(),
+        KernelErrorCode::KernelOutOfDeviceMemory
+    );
+    match kernel_error {
+        KernelError::KernelOutOfDeviceMemory { reason } => {
+            assert!(reason.contains("8GiB"));
+        }
+        other => panic!("expected KernelOutOfDeviceMemory, got {other:?}"),
+    }
+}
 
 #[test]
 fn construction_never_panics_and_reports_stable_identity() {
@@ -82,6 +103,30 @@ fn kernel_advertisements_agree_with_availability() {
             "an unavailable CudaProvider must not advertise kernels bound to no real Device"
         );
     }
+}
+
+#[test]
+fn health_is_degraded_when_device_found_but_executor_missing() {
+    let provider = CudaProvider::new();
+    let Some(context) = provider.context() else {
+        // No compatible driver/device on this host at all -- nothing to
+        // simulate a partial failure against (GPU-less CI).
+        return;
+    };
+    let device = crate::device::cuda_device_descriptor(&context)
+        .expect("device discovery must succeed given a context already exists");
+    let degraded = CudaProvider::with_device_but_no_executor_for_test(context, device);
+    assert_eq!(
+        degraded.health(),
+        ProviderHealth::Degraded,
+        "a Device found but no working executor must report Degraded, not Available"
+    );
+    assert!(degraded.execution_api().is_none());
+    assert_eq!(
+        degraded.devices().len(),
+        1,
+        "the Device itself is still real and should still be reported"
+    );
 }
 
 #[test]

@@ -7,10 +7,15 @@
 //! compatible CUDA driver/device is present, rather than failing --
 //! `cuda-provider`'s conformance scope is explicitly hardware-gated (see
 //! `design.md`'s "graceful unavailability" decision and tasks.md 9.3).
+//!
+//! Each test uploads its `HostTensor` fixtures once via
+//! [`CudaKernels::upload`] and downloads the kernel's output once via
+//! [`CudaKernels::download`] -- the same two host/device crossing points
+//! `CudaExecutor` itself uses, not an implicit per-kernel round trip.
 
 use magnetar_runtime::HostTensor;
 
-use crate::kernels::CudaKernels;
+use crate::kernels::{CudaDeviceBuffer, CudaKernels};
 use crate::provider::CudaProvider;
 
 const TOLERANCE: f32 = 1e-3;
@@ -21,6 +26,14 @@ fn kernels_or_skip() -> Option<CudaKernels> {
     Some(CudaKernels::compile_and_load(&context).expect(
         "kernel compilation must succeed on a machine that already passed device discovery",
     ))
+}
+
+fn upload(kernels: &CudaKernels, tensor: &HostTensor) -> CudaDeviceBuffer {
+    kernels.upload(tensor).expect("upload must succeed")
+}
+
+fn download(kernels: &CudaKernels, buffer: &CudaDeviceBuffer) -> HostTensor {
+    kernels.download(buffer).expect("download must succeed")
 }
 
 fn assert_close(actual: &HostTensor, expected: &HostTensor) {
@@ -45,8 +58,10 @@ fn add_matches_reference_cpu() {
     let a = HostTensor::new([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
     let b = HostTensor::new([2, 3], [6.0, 5.0, 4.0, 3.0, 2.0, 1.0]).unwrap();
     let expected = magnetar_provider_cpu::add(&a, &b).unwrap();
-    let actual = kernels.add(&a, &b).unwrap();
-    assert_close(&actual, &expected);
+    let actual_dev = kernels
+        .add(&upload(&kernels, &a), &upload(&kernels, &b))
+        .unwrap();
+    assert_close(&download(&kernels, &actual_dev), &expected);
 }
 
 #[test]
@@ -57,8 +72,10 @@ fn mul_matches_reference_cpu() {
     let a = HostTensor::new([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
     let b = HostTensor::new([2, 3], [6.0, 5.0, 4.0, 3.0, 2.0, 1.0]).unwrap();
     let expected = magnetar_provider_cpu::mul(&a, &b).unwrap();
-    let actual = kernels.mul(&a, &b).unwrap();
-    assert_close(&actual, &expected);
+    let actual_dev = kernels
+        .mul(&upload(&kernels, &a), &upload(&kernels, &b))
+        .unwrap();
+    assert_close(&download(&kernels, &actual_dev), &expected);
 }
 
 #[test]
@@ -68,8 +85,8 @@ fn silu_matches_reference_cpu() {
     };
     let input = HostTensor::new([2, 3], [-2.0, -0.5, 0.0, 0.5, 1.0, 2.0]).unwrap();
     let expected = magnetar_provider_cpu::silu(&input);
-    let actual = kernels.silu(&input).unwrap();
-    assert_close(&actual, &expected);
+    let actual_dev = kernels.silu(&upload(&kernels, &input)).unwrap();
+    assert_close(&download(&kernels, &actual_dev), &expected);
 }
 
 #[test]
@@ -79,8 +96,8 @@ fn softmax_rows_matches_reference_cpu() {
     };
     let input = HostTensor::new([2, 3], [1.0, 2.0, 3.0, -1.0, 0.0, 1.0]).unwrap();
     let expected = magnetar_provider_cpu::softmax_rows(&input).unwrap();
-    let actual = kernels.softmax_rows(&input).unwrap();
-    assert_close(&actual, &expected);
+    let actual_dev = kernels.softmax_rows(&upload(&kernels, &input)).unwrap();
+    assert_close(&download(&kernels, &actual_dev), &expected);
 }
 
 #[test]
@@ -95,8 +112,10 @@ fn embedding_lookup_matches_reference_cpu() {
     .unwrap();
     let ids = HostTensor::new([3], [0.0, 2.0, 1.0]).unwrap();
     let expected = magnetar_provider_cpu::embedding_lookup(&table, &ids).unwrap();
-    let actual = kernels.embedding_lookup(&table, &ids).unwrap();
-    assert_close(&actual, &expected);
+    let actual_dev = kernels
+        .embedding_lookup(&upload(&kernels, &table), &upload(&kernels, &ids))
+        .unwrap();
+    assert_close(&download(&kernels, &actual_dev), &expected);
 }
 
 #[test]
@@ -106,7 +125,11 @@ fn embedding_lookup_rejects_out_of_range_id_before_dispatch() {
     };
     let table = HostTensor::new([2, 2], [0.0, 0.0, 0.0, 0.0]).unwrap();
     let ids = HostTensor::new([1], [5.0]).unwrap();
-    assert!(kernels.embedding_lookup(&table, &ids).is_err());
+    assert!(
+        kernels
+            .embedding_lookup(&upload(&kernels, &table), &upload(&kernels, &ids))
+            .is_err()
+    );
 }
 
 #[test]
@@ -117,8 +140,10 @@ fn rmsnorm_matches_reference_cpu() {
     let input = HostTensor::new([2, 3], [1.0, 2.0, 3.0, -1.0, 0.5, 2.0]).unwrap();
     let weight = HostTensor::new([3], [1.0, 0.5, 2.0]).unwrap();
     let expected = magnetar_provider_cpu::rmsnorm(&input, &weight, 1e-5).unwrap();
-    let actual = kernels.rmsnorm(&input, &weight, 1e-5).unwrap();
-    assert_close(&actual, &expected);
+    let actual_dev = kernels
+        .rmsnorm(&upload(&kernels, &input), &upload(&kernels, &weight), 1e-5)
+        .unwrap();
+    assert_close(&download(&kernels, &actual_dev), &expected);
 }
 
 #[test]
@@ -128,8 +153,10 @@ fn rope_matches_reference_cpu() {
     };
     let input = HostTensor::new([2, 4], [1.0, 0.0, 0.0, 1.0, 0.5, 0.5, -0.5, -0.5]).unwrap();
     let expected = magnetar_provider_cpu::rope(&input, 10000.0, 1.0, 4, 0).unwrap();
-    let actual = kernels.rope(&input, 10000.0, 1.0, 4, 0).unwrap();
-    assert_close(&actual, &expected);
+    let actual_dev = kernels
+        .rope(&upload(&kernels, &input), 10000.0, 1.0, 4, 0)
+        .unwrap();
+    assert_close(&download(&kernels, &actual_dev), &expected);
 }
 
 #[test]
@@ -140,8 +167,10 @@ fn matmul_matches_reference_cpu() {
     let a = HostTensor::new([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
     let b = HostTensor::new([3, 2], [1.0, 0.0, 0.0, 1.0, 1.0, 1.0]).unwrap();
     let expected = magnetar_provider_cpu::matmul(&a, &b, false, false).unwrap();
-    let actual = kernels.matmul(&a, &b, false, false).unwrap();
-    assert_close(&actual, &expected);
+    let actual_dev = kernels
+        .matmul(&upload(&kernels, &a), &upload(&kernels, &b), false, false)
+        .unwrap();
+    assert_close(&download(&kernels, &actual_dev), &expected);
 }
 
 #[test]
@@ -152,8 +181,10 @@ fn matmul_transposed_matches_reference_cpu() {
     let a = HostTensor::new([3, 2], [1.0, 4.0, 2.0, 5.0, 3.0, 6.0]).unwrap();
     let b = HostTensor::new([3, 2], [1.0, 0.0, 0.0, 1.0, 1.0, 1.0]).unwrap();
     let expected = magnetar_provider_cpu::matmul(&a, &b, true, false).unwrap();
-    let actual = kernels.matmul(&a, &b, true, false).unwrap();
-    assert_close(&actual, &expected);
+    let actual_dev = kernels
+        .matmul(&upload(&kernels, &a), &upload(&kernels, &b), true, false)
+        .unwrap();
+    assert_close(&download(&kernels, &actual_dev), &expected);
 }
 
 #[test]
@@ -165,10 +196,55 @@ fn causal_attention_matches_reference_cpu() {
     let k = HostTensor::new([3, 2], [1.0, 0.0, 0.0, 1.0, 0.5, 0.5]).unwrap();
     let v = HostTensor::new([3, 2], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
     let expected = magnetar_provider_cpu::attention(&q, &k, &v, 1, 2, None, None, true).unwrap();
-    let actual = kernels
-        .attention(&q, &k, &v, 1, 2, None, None, true)
+    let actual_dev = kernels
+        .attention(
+            &upload(&kernels, &q),
+            &upload(&kernels, &k),
+            &upload(&kernels, &v),
+            1,
+            2,
+            None,
+            None,
+            true,
+        )
         .unwrap();
-    assert_close(&actual, &expected);
+    assert_close(&download(&kernels, &actual_dev), &expected);
+}
+
+#[test]
+fn back_to_back_kernels_do_not_round_trip_through_host() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let a = HostTensor::new([2, 2], [1.0, 2.0, 3.0, 4.0]).unwrap();
+    let b = HostTensor::new([2, 2], [5.0, 6.0, 7.0, 8.0]).unwrap();
+    let a_dev = upload(&kernels, &a);
+    let b_dev = upload(&kernels, &b);
+    let uploads_before = kernels.upload_count();
+    let downloads_before = kernels.download_count();
+
+    // `sum`'s output feeds directly into `mul` as an input, exactly like
+    // two consecutive Kernels sharing a Provider/Device in the first-native
+    // dispatch loop -- neither call should touch the host.
+    let sum_dev = kernels.add(&a_dev, &b_dev).unwrap();
+    let product_dev = kernels.mul(&sum_dev, &b_dev).unwrap();
+    assert_eq!(
+        kernels.upload_count(),
+        uploads_before,
+        "chaining two device-resident kernels must not trigger an upload"
+    );
+    assert_eq!(
+        kernels.download_count(),
+        downloads_before,
+        "chaining two device-resident kernels must not trigger a download"
+    );
+
+    // Only the final, genuine host read crosses back.
+    let product = download(&kernels, &product_dev);
+    assert_eq!(kernels.download_count(), downloads_before + 1);
+    let expected_sum = magnetar_provider_cpu::add(&a, &b).unwrap();
+    let expected_product = magnetar_provider_cpu::mul(&expected_sum, &b).unwrap();
+    assert_close(&product, &expected_product);
 }
 
 #[test]
@@ -189,8 +265,17 @@ fn grouped_query_sliding_window_attention_matches_reference_cpu() {
     let v = HostTensor::new([4, 2], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap();
     let expected =
         magnetar_provider_cpu::attention(&q, &k, &v, 2, 2, Some(1), Some(2), true).unwrap();
-    let actual = kernels
-        .attention(&q, &k, &v, 2, 2, Some(1), Some(2), true)
+    let actual_dev = kernels
+        .attention(
+            &upload(&kernels, &q),
+            &upload(&kernels, &k),
+            &upload(&kernels, &v),
+            2,
+            2,
+            Some(1),
+            Some(2),
+            true,
+        )
         .unwrap();
-    assert_close(&actual, &expected);
+    assert_close(&download(&kernels, &actual_dev), &expected);
 }

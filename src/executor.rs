@@ -1,24 +1,24 @@
 //! `CudaExecutor`: this Provider's [`ProviderExecutionApi`] implementation.
-//! Mirrors `providers/cpu`'s `ReferenceCpuExecutor` structure closely (same
-//! opaque `TensorResourceId -> HostTensor` storage, same submit/complete
-//! bookkeeping, same Kernel-level `submit_kernel`/`complete_kernel`
-//! dispatch), but `run_invocation` calls [`CudaKernels`] methods instead of
-//! pure CPU functions, and Memory Manager admission reports genuine
+//! Mirrors `providers/cpu`'s `ReferenceCpuExecutor` structure (same opaque
+//! `TensorResourceId`-keyed storage, same submit/complete bookkeeping, same
+//! Kernel-level `submit_kernel`/`complete_kernel` dispatch), but
+//! `run_invocation` calls [`CudaKernels`] methods instead of pure CPU
+//! functions, and Memory Manager admission reports genuine
 //! [`MemoryPlacement::Device`] residency instead of `ProviderOwnedOpaque`.
 //!
-//! # Storage is host-resident between calls
+//! # Storage is device-resident between calls
 //!
-//! Like `ReferenceCpuExecutor`, tensors live in an in-process
-//! `Mutex<BTreeMap<TensorResourceId, HostTensor>>` between Kernel
-//! invocations. Each [`CudaKernels`] method already uploads its inputs and
-//! downloads its output internally per call (design.md's "explicit data
-//! movement" decision), so this executor does not additionally keep a
-//! *persistent* device-side buffer across separate Kernel invocations: two
-//! back-to-back kernels round-trip through host memory rather than chaining
-//! device-resident results. This is the same simplification `design.md`
-//! names under "direct `cuMemAlloc`/`cuMemFree` per buffer, not the Device
-//! Memory Pool contract" -- true cross-call device residency is future work,
-//! not part of this baseline.
+//! Tensors live in an in-process `Mutex<BTreeMap<TensorResourceId,
+//! CudaDeviceBuffer>>` between Kernel invocations: a real device
+//! allocation, not host bytes (`enable-device-resident-kernel-chaining`'s
+//! device allocation table decision). [`CudaKernels`]'s own methods take
+//! and return [`CudaDeviceBuffer`] directly and perform no implicit
+//! upload/download; this executor uploads only in `write_tensor`/
+//! `write_tensor_admitted` (a genuine host-to-device crossing, e.g. weight
+//! materialization) and downloads only in `read_tensor` (a genuine
+//! device-to-host crossing, e.g. final output extraction). Two
+//! back-to-back Kernel invocations that both read/write through this same
+//! table never round-trip through host memory.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -44,13 +44,14 @@ use magnetar_runtime::scheduler::{
 };
 use magnetar_runtime::{ExecutionPlanId, HostTensor};
 
-use crate::kernels::CudaKernels;
+use crate::error::CudaError;
+use crate::kernels::{CudaDeviceBuffer, CudaKernels};
 use crate::provider::CUDA_PROVIDER_NAME;
 
 pub struct CudaExecutor {
     kernels: CudaKernels,
     device_id: DeviceId,
-    storage: Mutex<BTreeMap<TensorResourceId, HostTensor>>,
+    storage: Mutex<BTreeMap<TensorResourceId, CudaDeviceBuffer>>,
     observations: Mutex<Vec<KernelObservation>>,
     submitted: Mutex<BTreeMap<ProviderExecutionId, ProviderExecutionRequest>>,
     kernel_executions: Mutex<BTreeMap<ProviderExecutionId, KernelResult>>,
@@ -80,12 +81,26 @@ impl CudaExecutor {
         DeviceBinding::new(self.device_id.clone())
     }
 
-    pub fn write_tensor(&self, id: TensorResourceId, tensor: HostTensor) {
-        self.storage.lock().unwrap().insert(id, tensor);
+    /// Uploads `tensor` into a fresh device allocation and stores it under
+    /// `id`, replacing whatever this Provider previously held for `id` (its
+    /// prior device allocation, if any, is freed when the replaced
+    /// [`CudaDeviceBuffer`] drops). A real host-to-device crossing --
+    /// callers that already have a same-Provider device-resident value
+    /// should never reach this; see [`Self::write_tensor_value`].
+    pub fn write_tensor(&self, id: TensorResourceId, tensor: HostTensor) -> Result<(), CudaError> {
+        let buffer = self.kernels.upload(&tensor)?;
+        self.storage.lock().unwrap().insert(id, buffer);
+        Ok(())
     }
 
+    /// Downloads `id`'s current device allocation to host-visible bytes. A
+    /// real device-to-host crossing -- only reached when host bytes are
+    /// genuinely requested (`TensorValue::into_host` at an actual
+    /// materialization boundary), not on every Kernel invocation.
     pub fn read_tensor(&self, id: &TensorResourceId) -> Option<HostTensor> {
-        self.storage.lock().unwrap().get(id).cloned()
+        let storage = self.storage.lock().unwrap();
+        let buffer = storage.get(id)?;
+        self.kernels.download(buffer).ok()
     }
 
     pub fn release_tensor(&self, id: &TensorResourceId) -> bool {
@@ -118,6 +133,20 @@ impl CudaExecutor {
             MemoryPlacement::Device(self.device_binding()),
             owner,
         ))?;
+        // Logical admission succeeded; now physically realize it. A real
+        // device allocation can fail here (device OOM, driver error) in a
+        // way host-resident storage never could -- roll the logical
+        // admission back rather than leave the Memory Manager's ledger
+        // claiming residency this Provider does not actually have.
+        let buffer = match self.kernels.upload(&tensor) {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                let _ = memory.release(allocation.id);
+                return Err(MemoryError::AllocationDenied {
+                    reason: format!("CUDA device upload failed: {error}"),
+                });
+            }
+        };
         let previous = self
             .resource_allocations
             .lock()
@@ -126,12 +155,29 @@ impl CudaExecutor {
         if let Some(previous) = previous {
             let _ = memory.release(previous);
         }
-        self.storage.lock().unwrap().insert(id, tensor);
+        self.storage.lock().unwrap().insert(id, buffer);
         Ok(())
     }
 
+    /// `Some(TensorValue::Opaque)` when `id` already has a live device
+    /// allocation -- never downloads. Callers that need host bytes call
+    /// [`Self::read_tensor`] (via `TensorValue::into_host`) explicitly.
     pub fn read_tensor_value(&self, id: &TensorResourceId) -> Option<TensorValue> {
-        self.read_tensor(id).map(TensorValue::Host)
+        if self.storage.lock().unwrap().contains_key(id) {
+            Some(TensorValue::Opaque)
+        } else {
+            None
+        }
+    }
+
+    fn opaque_passthrough_error(&self, id: &TensorResourceId) -> ProviderExecutionError {
+        ProviderExecutionError::new(
+            ProviderExecutionErrorCode::MaterializationFailed,
+            ProviderExecutionPhase::Submit,
+            self.provider_binding(),
+            Some(self.device_binding()),
+            format!("no existing device allocation for opaque resource '{id}'"),
+        )
     }
 
     pub fn write_tensor_value(
@@ -139,10 +185,30 @@ impl CudaExecutor {
         id: TensorResourceId,
         value: TensorValue,
     ) -> Result<(), ProviderExecutionError> {
-        if let TensorValue::Host(tensor) = value {
-            self.write_tensor(id, tensor);
+        match value {
+            TensorValue::Host(tensor) => self.write_tensor(id, tensor).map_err(|error| {
+                ProviderExecutionError::new(
+                    ProviderExecutionErrorCode::MaterializationFailed,
+                    ProviderExecutionPhase::Submit,
+                    self.provider_binding(),
+                    Some(self.device_binding()),
+                    format!("CUDA device upload failed: {error}"),
+                )
+            }),
+            // This Provider already owns `id`'s data under its existing
+            // device allocation (the same-Provider/Device passthrough
+            // decision in `enable-device-resident-kernel-chaining`) -- an
+            // `Opaque` write for a resource this table does not hold is
+            // not a portable cross-Provider handle, it is a genuine
+            // integrity failure.
+            TensorValue::Opaque => {
+                if self.storage.lock().unwrap().contains_key(&id) {
+                    Ok(())
+                } else {
+                    Err(self.opaque_passthrough_error(&id))
+                }
+            }
         }
-        Ok(())
     }
 
     pub fn write_tensor_value_admitted(
@@ -157,7 +223,15 @@ impl CudaExecutor {
             TensorValue::Host(tensor) => self
                 .write_tensor_admitted(memory, id, tensor, class, owner)
                 .map_err(TensorValueAdmissionError::Memory),
-            TensorValue::Opaque => Ok(()),
+            TensorValue::Opaque => {
+                if self.storage.lock().unwrap().contains_key(&id) {
+                    Ok(())
+                } else {
+                    Err(TensorValueAdmissionError::Provider(
+                        self.opaque_passthrough_error(&id),
+                    ))
+                }
+            }
         }
     }
 
@@ -174,11 +248,10 @@ impl CudaExecutor {
         ProviderExecutionId::new(format!("{CUDA_PROVIDER_NAME}:{label}:{ordinal}"))
     }
 
-    fn input_tensor(
-        &self,
+    fn input_resource_id(
         invocation: &KernelInvocation,
         index: usize,
-    ) -> Result<HostTensor, KernelError> {
+    ) -> Result<&TensorResourceId, KernelError> {
         let resource =
             invocation
                 .inputs
@@ -186,20 +259,14 @@ impl CudaExecutor {
                 .ok_or_else(|| KernelError::KernelExecutionFailed {
                     reason: format!("missing input at index {index}"),
                 })?;
-        self.read_tensor(&resource.resource.id)
-            .ok_or_else(|| KernelError::KernelExecutionFailed {
-                reason: format!(
-                    "no materialized data for input resource {}",
-                    resource.resource.id
-                ),
-            })
+        Ok(&resource.resource.id)
     }
 
     fn store_output(
         &self,
         invocation: &KernelInvocation,
         index: usize,
-        tensor: HostTensor,
+        buffer: CudaDeviceBuffer,
     ) -> Result<magnetar_runtime::compute::TensorResourceDescriptor, KernelError> {
         let resource =
             invocation
@@ -208,7 +275,10 @@ impl CudaExecutor {
                 .ok_or_else(|| KernelError::KernelExecutionFailed {
                     reason: format!("missing output at index {index}"),
                 })?;
-        self.write_tensor(resource.resource.id.clone(), tensor);
+        self.storage
+            .lock()
+            .unwrap()
+            .insert(resource.resource.id.clone(), buffer);
         Ok(resource.resource.clone())
     }
 
@@ -295,151 +365,168 @@ impl CudaExecutor {
     fn run_invocation(&self, invocation: &KernelInvocation) -> Result<KernelResult, KernelError> {
         let name = invocation.kernel.name.as_str();
         let mut result = KernelResult::success(invocation.id.clone());
-        let output = match name {
-            "matmul" => {
-                let a = self.input_tensor(invocation, 0)?;
-                let b = self.input_tensor(invocation, 1)?;
-                let transpose_a =
-                    Self::attribute_bool(&invocation.attributes, "transpose_a", false);
-                let transpose_b =
-                    Self::attribute_bool(&invocation.attributes, "transpose_b", false);
-                self.kernels
-                    .matmul(&a, &b, transpose_a, transpose_b)
-                    .map_err(KernelError::from)?
-            }
-            "embedding" => {
-                let table = self.input_tensor(invocation, 0)?;
-                let ids = self.input_tensor(invocation, 1)?;
-                self.kernels
-                    .embedding_lookup(&table, &ids)
-                    .map_err(KernelError::from)?
-            }
-            "rmsnorm" => {
-                let input = self.input_tensor(invocation, 0)?;
-                let weight = self.input_tensor(invocation, 1)?;
-                let epsilon = Self::attribute_float(&invocation.attributes, "epsilon", 1e-6);
-                self.kernels
-                    .rmsnorm(&input, &weight, epsilon)
-                    .map_err(KernelError::from)?
-            }
-            "rope" => {
-                let input = self.input_tensor(invocation, 0)?;
-                let base = Self::attribute_float(&invocation.attributes, "base", 10000.0);
-                let scale = Self::attribute_float(&invocation.attributes, "scale", 1.0);
-                let dimension = Self::attribute_integer(&invocation.attributes, "dimension")
-                    .ok_or_else(|| KernelError::KernelAttributeUnsupported {
-                        attribute: "dimension".into(),
-                    })?;
-                if let Some(OperatorAttributeValue::String(mode)) =
-                    invocation.attributes.get("position_mode")
-                    && mode != "sequential"
-                {
-                    return Err(KernelError::KernelAttributeUnsupported {
-                        attribute: format!("position_mode '{mode}' is not implemented"),
-                    });
+        // One storage lock for every input this invocation reads: each
+        // `get(index)` borrows directly from the device allocation table
+        // instead of downloading to host and re-uploading a fresh
+        // per-invocation copy. The kernel call below returns a freshly
+        // allocated, fully owned `CudaDeviceBuffer` that does not borrow
+        // from `storage`, so the lock can drop as soon as the match arm
+        // finishes.
+        let output = {
+            let storage = self.storage.lock().unwrap();
+            let get = |index: usize| -> Result<&CudaDeviceBuffer, KernelError> {
+                let id = Self::input_resource_id(invocation, index)?;
+                storage
+                    .get(id)
+                    .ok_or_else(|| KernelError::KernelExecutionFailed {
+                        reason: format!("no materialized data for input resource {id}"),
+                    })
+            };
+            match name {
+                "matmul" => {
+                    let a = get(0)?;
+                    let b = get(1)?;
+                    let transpose_a =
+                        Self::attribute_bool(&invocation.attributes, "transpose_a", false);
+                    let transpose_b =
+                        Self::attribute_bool(&invocation.attributes, "transpose_b", false);
+                    self.kernels
+                        .matmul(a, b, transpose_a, transpose_b)
+                        .map_err(KernelError::from)?
                 }
-                let position_offset = match invocation.attributes.get("position_offset") {
-                    None => 0,
-                    Some(OperatorAttributeValue::Integer(offset)) if *offset >= 0 => *offset as u64,
-                    Some(OperatorAttributeValue::Integer(offset)) => {
+                "embedding" => {
+                    let table = get(0)?;
+                    let ids = get(1)?;
+                    self.kernels
+                        .embedding_lookup(table, ids)
+                        .map_err(KernelError::from)?
+                }
+                "rmsnorm" => {
+                    let input = get(0)?;
+                    let weight = get(1)?;
+                    let epsilon = Self::attribute_float(&invocation.attributes, "epsilon", 1e-6);
+                    self.kernels
+                        .rmsnorm(input, weight, epsilon)
+                        .map_err(KernelError::from)?
+                }
+                "rope" => {
+                    let input = get(0)?;
+                    let base = Self::attribute_float(&invocation.attributes, "base", 10000.0);
+                    let scale = Self::attribute_float(&invocation.attributes, "scale", 1.0);
+                    let dimension = Self::attribute_integer(&invocation.attributes, "dimension")
+                        .ok_or_else(|| KernelError::KernelAttributeUnsupported {
+                            attribute: "dimension".into(),
+                        })?;
+                    if let Some(OperatorAttributeValue::String(mode)) =
+                        invocation.attributes.get("position_mode")
+                        && mode != "sequential"
+                    {
                         return Err(KernelError::KernelAttributeUnsupported {
-                            attribute: format!("position_offset {offset} must not be negative"),
+                            attribute: format!("position_mode '{mode}' is not implemented"),
                         });
                     }
-                    Some(_) => {
-                        return Err(KernelError::KernelAttributeUnsupported {
-                            attribute: "position_offset must be an integer".into(),
-                        });
-                    }
-                };
-                self.kernels
-                    .rope(&input, base, scale, dimension, position_offset)
-                    .map_err(KernelError::from)?
-            }
-            "attention" => {
-                let q = self.input_tensor(invocation, 0)?;
-                let k = self.input_tensor(invocation, 1)?;
-                let v = self.input_tensor(invocation, 2)?;
-                let head_count = Self::attribute_integer(&invocation.attributes, "head_count")
-                    .ok_or_else(|| KernelError::KernelAttributeUnsupported {
-                        attribute: "head_count".into(),
-                    })?;
-                let head_dimension =
-                    Self::attribute_integer(&invocation.attributes, "head_dimension").ok_or_else(
-                        || KernelError::KernelAttributeUnsupported {
-                            attribute: "head_dimension".into(),
-                        },
-                    )?;
-                let kv_head_count =
-                    Self::attribute_integer(&invocation.attributes, "kv_head_count");
-                let window_size = Self::attribute_integer(&invocation.attributes, "window_size");
-                let causal = Self::attribute_bool(&invocation.attributes, "causal", false);
-                if let Some(OperatorAttributeValue::String(mask_kind)) =
-                    invocation.attributes.get("attention_mask_kind")
-                {
-                    let expected_causal = match mask_kind.as_str() {
-                        "causal" => true,
-                        "bidirectional" => false,
-                        other => {
+                    let position_offset = match invocation.attributes.get("position_offset") {
+                        None => 0,
+                        Some(OperatorAttributeValue::Integer(offset)) if *offset >= 0 => {
+                            *offset as u64
+                        }
+                        Some(OperatorAttributeValue::Integer(offset)) => {
                             return Err(KernelError::KernelAttributeUnsupported {
-                                attribute: format!(
-                                    "attention_mask_kind '{other}' is not implemented"
-                                ),
+                                attribute: format!("position_offset {offset} must not be negative"),
+                            });
+                        }
+                        Some(_) => {
+                            return Err(KernelError::KernelAttributeUnsupported {
+                                attribute: "position_offset must be an integer".into(),
                             });
                         }
                     };
-                    if expected_causal != causal {
-                        return Err(KernelError::KernelAttributeUnsupported {
-                            attribute: format!(
-                                "attention_mask_kind '{mask_kind}' is inconsistent with causal={causal}"
-                            ),
-                        });
-                    }
+                    self.kernels
+                        .rope(input, base, scale, dimension, position_offset)
+                        .map_err(KernelError::from)?
                 }
-                self.kernels
-                    .attention(
-                        &q,
-                        &k,
-                        &v,
-                        head_count,
-                        head_dimension,
-                        kv_head_count,
-                        window_size,
-                        causal,
-                    )
-                    .map_err(KernelError::from)?
-            }
-            "softmax" => {
-                let input = self.input_tensor(invocation, 0)?;
-                self.kernels
-                    .softmax_rows(&input)
-                    .map_err(KernelError::from)?
-            }
-            "silu" => self
-                .kernels
-                .silu(&self.input_tensor(invocation, 0)?)
-                .map_err(KernelError::from)?,
-            "add" => {
-                let a = self.input_tensor(invocation, 0)?;
-                let b = self.input_tensor(invocation, 1)?;
-                self.kernels.add(&a, &b).map_err(KernelError::from)?
-            }
-            "mul" => {
-                let a = self.input_tensor(invocation, 0)?;
-                let b = self.input_tensor(invocation, 1)?;
-                self.kernels.mul(&a, &b).map_err(KernelError::from)?
-            }
-            "residual-add" => {
-                let input = self.input_tensor(invocation, 0)?;
-                let residual = self.input_tensor(invocation, 1)?;
-                self.kernels
-                    .residual_add(&input, &residual)
-                    .map_err(KernelError::from)?
-            }
-            other => {
-                return Err(KernelError::KernelNotFound {
-                    kernel: other.into(),
-                });
+                "attention" => {
+                    let q = get(0)?;
+                    let k = get(1)?;
+                    let v = get(2)?;
+                    let head_count = Self::attribute_integer(&invocation.attributes, "head_count")
+                        .ok_or_else(|| KernelError::KernelAttributeUnsupported {
+                            attribute: "head_count".into(),
+                        })?;
+                    let head_dimension =
+                        Self::attribute_integer(&invocation.attributes, "head_dimension")
+                            .ok_or_else(|| KernelError::KernelAttributeUnsupported {
+                                attribute: "head_dimension".into(),
+                            })?;
+                    let kv_head_count =
+                        Self::attribute_integer(&invocation.attributes, "kv_head_count");
+                    let window_size =
+                        Self::attribute_integer(&invocation.attributes, "window_size");
+                    let causal = Self::attribute_bool(&invocation.attributes, "causal", false);
+                    if let Some(OperatorAttributeValue::String(mask_kind)) =
+                        invocation.attributes.get("attention_mask_kind")
+                    {
+                        let expected_causal = match mask_kind.as_str() {
+                            "causal" => true,
+                            "bidirectional" => false,
+                            other => {
+                                return Err(KernelError::KernelAttributeUnsupported {
+                                    attribute: format!(
+                                        "attention_mask_kind '{other}' is not implemented"
+                                    ),
+                                });
+                            }
+                        };
+                        if expected_causal != causal {
+                            return Err(KernelError::KernelAttributeUnsupported {
+                                attribute: format!(
+                                    "attention_mask_kind '{mask_kind}' is inconsistent with causal={causal}"
+                                ),
+                            });
+                        }
+                    }
+                    self.kernels
+                        .attention(
+                            q,
+                            k,
+                            v,
+                            head_count,
+                            head_dimension,
+                            kv_head_count,
+                            window_size,
+                            causal,
+                        )
+                        .map_err(KernelError::from)?
+                }
+                "softmax" => {
+                    let input = get(0)?;
+                    self.kernels
+                        .softmax_rows(input)
+                        .map_err(KernelError::from)?
+                }
+                "silu" => self.kernels.silu(get(0)?).map_err(KernelError::from)?,
+                "add" => {
+                    let a = get(0)?;
+                    let b = get(1)?;
+                    self.kernels.add(a, b).map_err(KernelError::from)?
+                }
+                "mul" => {
+                    let a = get(0)?;
+                    let b = get(1)?;
+                    self.kernels.mul(a, b).map_err(KernelError::from)?
+                }
+                "residual-add" => {
+                    let input = get(0)?;
+                    let residual = get(1)?;
+                    self.kernels
+                        .residual_add(input, residual)
+                        .map_err(KernelError::from)?
+                }
+                other => {
+                    return Err(KernelError::KernelNotFound {
+                        kernel: other.into(),
+                    });
+                }
             }
         };
         let descriptor = self.store_output(invocation, 0, output)?;
@@ -697,8 +784,15 @@ impl ProviderExecutionApi for CudaExecutor {
         id: TensorResourceId,
         tensor: HostTensor,
     ) -> Result<(), ProviderExecutionError> {
-        CudaExecutor::write_tensor(self, id, tensor);
-        Ok(())
+        CudaExecutor::write_tensor(self, id, tensor).map_err(|error| {
+            ProviderExecutionError::new(
+                ProviderExecutionErrorCode::MaterializationFailed,
+                ProviderExecutionPhase::Submit,
+                self.provider_binding(),
+                Some(self.device_binding()),
+                format!("CUDA device upload failed: {error}"),
+            )
+        })
     }
 
     fn read_tensor(&self, id: &TensorResourceId) -> Option<HostTensor> {
@@ -753,5 +847,50 @@ impl ProviderExecutionApi for CudaExecutor {
 
     fn observations(&self) -> Vec<KernelObservation> {
         CudaExecutor::observations(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::CudaProvider;
+
+    fn executor_or_skip() -> Option<CudaExecutor> {
+        let provider = CudaProvider::new();
+        let context = provider.context()?;
+        let kernels = CudaKernels::compile_and_load(&context).expect(
+            "kernel compilation must succeed on a machine that already passed device discovery",
+        );
+        Some(CudaExecutor::new(kernels, DeviceId::new("test-device")))
+    }
+
+    #[test]
+    fn repeated_write_release_cycles_do_not_grow_storage_unboundedly() {
+        let Some(executor) = executor_or_skip() else {
+            return;
+        };
+        // Simulates a multi-step generation run: each step writes a fresh
+        // device-resident resource and releases the previous step's, the
+        // same pattern `first_native_runtime.rs` follows for per-step
+        // intermediate resources (`enable-device-resident-kernel-chaining`
+        // task 2.9).
+        for step in 0..50u32 {
+            let id = TensorResourceId::new(format!("step-{step}"));
+            let tensor = HostTensor::new([2, 2], [1.0, 2.0, 3.0, 4.0]).unwrap();
+            executor
+                .write_tensor(id, tensor)
+                .expect("upload must succeed");
+            if step >= 1 {
+                let previous = TensorResourceId::new(format!("step-{}", step - 1));
+                assert!(
+                    executor.release_tensor(&previous),
+                    "previous step's resource must still be present to release"
+                );
+            }
+            assert!(
+                executor.storage.lock().unwrap().len() <= 2,
+                "storage must not grow past the live window at step {step}"
+            );
+        }
     }
 }

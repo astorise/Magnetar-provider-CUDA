@@ -5,19 +5,51 @@
 //! directly comparable in conformance tests, but every method here can fail
 //! (allocation, launch, driver errors) in ways a pure host loop cannot --
 //! see `CudaError`.
+//!
+//! # Explicit data movement, device-resident chaining
+//!
+//! Every method here takes and returns [`CudaDeviceBuffer`], not
+//! [`HostTensor`]: inputs already on the device stay on the device, and a
+//! kernel's output is left in a freshly allocated device buffer rather than
+//! downloaded before returning (`enable-device-resident-kernel-chaining`).
+//! [`CudaKernels::upload`]/[`CudaKernels::download`] are the only two points
+//! that cross the host/device boundary, and only [`CudaExecutor`]
+//! (`executor.rs`) calls them -- when a resource is already device-resident
+//! under its existing `TensorResourceId`, the executor reuses the stored
+//! [`CudaDeviceBuffer`] directly instead of downloading and re-uploading it.
 
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaModule, CudaStream, LaunchConfig, PushKernelArg,
+    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
 };
 use cudarc::nvrtc::compile_ptx;
 use magnetar_runtime::HostTensor;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{CudaError, CudaErrorCode};
 
 const KERNEL_SOURCE: &str = include_str!("kernels.cu");
 
-fn same_shape(a: &HostTensor, b: &HostTensor) -> Result<(), CudaError> {
+/// A tensor resident entirely in this Provider's device memory, persisting
+/// across separate Kernel invocations (design.md's "device allocation table
+/// keyed by `TensorResourceId`" decision) instead of only for the duration
+/// of one upload-compute-download call.
+pub struct CudaDeviceBuffer {
+    pub(crate) slice: CudaSlice<f32>,
+    pub shape: Vec<u64>,
+}
+
+impl CudaDeviceBuffer {
+    pub fn len(&self) -> usize {
+        self.slice.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slice.is_empty()
+    }
+}
+
+fn same_shape_buf(a: &CudaDeviceBuffer, b: &CudaDeviceBuffer) -> Result<(), CudaError> {
     if a.shape != b.shape {
         return Err(CudaError::new(
             CudaErrorCode::ShapeUnsupported,
@@ -40,6 +72,13 @@ pub struct CudaKernels {
     stream: Arc<CudaStream>,
     #[allow(dead_code)]
     module: Arc<CudaModule>,
+    /// Counts real host<->device crossings (`upload`/`download` calls
+    /// only, never a Kernel launch itself) -- used by tests to prove two
+    /// chained Kernel invocations do not round-trip through the host
+    /// (`enable-device-resident-kernel-chaining` task 3.2), not for any
+    /// production decision.
+    upload_count: AtomicU64,
+    download_count: AtomicU64,
 }
 
 impl CudaKernels {
@@ -47,129 +86,176 @@ impl CudaKernels {
         let ptx = compile_ptx(KERNEL_SOURCE)?;
         let module = context.load_module(ptx)?;
         let stream = context.default_stream();
-        Ok(Self { stream, module })
+        Ok(Self {
+            stream,
+            module,
+            upload_count: AtomicU64::new(0),
+            download_count: AtomicU64::new(0),
+        })
+    }
+
+    /// Test/diagnostic-only: number of real host-to-device uploads
+    /// performed so far.
+    pub fn upload_count(&self) -> u64 {
+        self.upload_count.load(Ordering::Relaxed)
+    }
+
+    /// Test/diagnostic-only: number of real device-to-host downloads
+    /// performed so far. Does not count the small data-dependent-flag
+    /// downloads `embedding_lookup`/`softmax_rows` perform internally --
+    /// those are a single `i32`, not the tensor payload itself, and are
+    /// not the host round-trip this counter exists to catch.
+    pub fn download_count(&self) -> u64 {
+        self.download_count.load(Ordering::Relaxed)
     }
 
     fn function(&self, name: &'static str) -> Result<CudaFunction, CudaError> {
         Ok(self.module.load_function(name)?)
     }
 
-    pub fn add(&self, a: &HostTensor, b: &HostTensor) -> Result<HostTensor, CudaError> {
-        same_shape(a, b)?;
-        let n = a.data.len() as u64;
-        let a_dev = self.stream.clone_htod(&a.data)?;
-        let b_dev = self.stream.clone_htod(&b.data)?;
-        let mut out_dev = self.stream.alloc_zeros::<f32>(a.data.len())?;
-        let func = self.function("add_kernel")?;
-        let mut args = self.stream.launch_builder(&func);
-        args.arg(&a_dev).arg(&b_dev).arg(&mut out_dev).arg(&n);
-        unsafe { args.launch(LaunchConfig::for_num_elems(n as u32)) }?;
-        let out = self.stream.clone_dtoh(&out_dev)?;
-        self.stream.synchronize()?;
-        HostTensor::new(a.shape.clone(), out).map_err(host_error)
+    /// Uploads a host tensor into a fresh device allocation. The only
+    /// host-to-device crossing point in this module -- callers (the
+    /// executor's device allocation table) invoke this only when a
+    /// resource does not already have a live device buffer.
+    pub fn upload(&self, tensor: &HostTensor) -> Result<CudaDeviceBuffer, CudaError> {
+        let slice = self.stream.clone_htod(&tensor.data)?;
+        self.upload_count.fetch_add(1, Ordering::Relaxed);
+        Ok(CudaDeviceBuffer {
+            slice,
+            shape: tensor.shape.clone(),
+        })
     }
 
-    pub fn mul(&self, a: &HostTensor, b: &HostTensor) -> Result<HostTensor, CudaError> {
-        same_shape(a, b)?;
-        let n = a.data.len() as u64;
-        let a_dev = self.stream.clone_htod(&a.data)?;
-        let b_dev = self.stream.clone_htod(&b.data)?;
-        let mut out_dev = self.stream.alloc_zeros::<f32>(a.data.len())?;
+    /// Downloads a device buffer to host-visible bytes. The only
+    /// device-to-host crossing point in this module -- callers invoke this
+    /// only when host-visible bytes are genuinely requested (`read_tensor`,
+    /// or `TensorValue::into_host` at a real materialization boundary), not
+    /// as an automatic step of every Kernel invocation.
+    pub fn download(&self, buffer: &CudaDeviceBuffer) -> Result<HostTensor, CudaError> {
+        let data = self.stream.clone_dtoh(&buffer.slice)?;
+        self.stream.synchronize()?;
+        self.download_count.fetch_add(1, Ordering::Relaxed);
+        HostTensor::new(buffer.shape.clone(), data).map_err(host_error)
+    }
+
+    pub fn add(
+        &self,
+        a: &CudaDeviceBuffer,
+        b: &CudaDeviceBuffer,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        same_shape_buf(a, b)?;
+        let n = a.slice.len() as u64;
+        let mut out_dev = self.stream.alloc_zeros::<f32>(a.slice.len())?;
+        let func = self.function("add_kernel")?;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(&a.slice).arg(&b.slice).arg(&mut out_dev).arg(&n);
+        unsafe { args.launch(LaunchConfig::for_num_elems(n as u32)) }?;
+        Ok(CudaDeviceBuffer {
+            slice: out_dev,
+            shape: a.shape.clone(),
+        })
+    }
+
+    pub fn mul(
+        &self,
+        a: &CudaDeviceBuffer,
+        b: &CudaDeviceBuffer,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        same_shape_buf(a, b)?;
+        let n = a.slice.len() as u64;
+        let mut out_dev = self.stream.alloc_zeros::<f32>(a.slice.len())?;
         let func = self.function("mul_kernel")?;
         let mut args = self.stream.launch_builder(&func);
-        args.arg(&a_dev).arg(&b_dev).arg(&mut out_dev).arg(&n);
+        args.arg(&a.slice).arg(&b.slice).arg(&mut out_dev).arg(&n);
         unsafe { args.launch(LaunchConfig::for_num_elems(n as u32)) }?;
-        let out = self.stream.clone_dtoh(&out_dev)?;
-        self.stream.synchronize()?;
-        HostTensor::new(a.shape.clone(), out).map_err(host_error)
+        Ok(CudaDeviceBuffer {
+            slice: out_dev,
+            shape: a.shape.clone(),
+        })
     }
 
     pub fn residual_add(
         &self,
-        input: &HostTensor,
-        residual: &HostTensor,
-    ) -> Result<HostTensor, CudaError> {
+        input: &CudaDeviceBuffer,
+        residual: &CudaDeviceBuffer,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
         self.add(input, residual)
     }
 
-    pub fn silu(&self, input: &HostTensor) -> Result<HostTensor, CudaError> {
-        let n = input.data.len() as u64;
-        let in_dev = self.stream.clone_htod(&input.data)?;
-        let mut out_dev = self.stream.alloc_zeros::<f32>(input.data.len())?;
+    pub fn silu(&self, input: &CudaDeviceBuffer) -> Result<CudaDeviceBuffer, CudaError> {
+        let n = input.slice.len() as u64;
+        let mut out_dev = self.stream.alloc_zeros::<f32>(input.slice.len())?;
         let func = self.function("silu_kernel")?;
         let mut args = self.stream.launch_builder(&func);
-        args.arg(&in_dev).arg(&mut out_dev).arg(&n);
+        args.arg(&input.slice).arg(&mut out_dev).arg(&n);
         unsafe { args.launch(LaunchConfig::for_num_elems(n as u32)) }?;
-        let out = self.stream.clone_dtoh(&out_dev)?;
-        self.stream.synchronize()?;
-        HostTensor::new(input.shape.clone(), out).map_err(host_error)
+        Ok(CudaDeviceBuffer {
+            slice: out_dev,
+            shape: input.shape.clone(),
+        })
     }
 
     pub fn embedding_lookup(
         &self,
-        table: &HostTensor,
-        ids: &HostTensor,
-    ) -> Result<HostTensor, CudaError> {
-        let (vocab, dim) = rows_cols(table)?;
-        // Validated on the host, exactly like `providers/cpu::embedding_lookup`,
-        // so the error messages/behavior match: the kernel trusts every id it
-        // receives is already a valid in-range non-negative integer.
-        for &raw_id in &ids.data {
-            if raw_id < 0.0 || raw_id.fract() != 0.0 {
-                return Err(CudaError::new(
-                    CudaErrorCode::ShapeUnsupported,
-                    format!("token id {raw_id} is not a non-negative integer"),
-                ));
-            }
-            let id = raw_id as u64;
-            if id >= vocab {
-                return Err(CudaError::new(
-                    CudaErrorCode::ShapeUnsupported,
-                    format!("token id {id} exceeds vocabulary size {vocab}"),
-                ));
-            }
-        }
-        let num_ids = ids.data.len() as u64;
-        let table_dev = self.stream.clone_htod(&table.data)?;
-        let ids_dev = self.stream.clone_htod(&ids.data)?;
+        table: &CudaDeviceBuffer,
+        ids: &CudaDeviceBuffer,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        let (vocab, dim) = rows_cols_buf(table)?;
+        let num_ids = ids.slice.len() as u64;
         let mut out_dev = self
             .stream
-            .alloc_zeros::<f32>(ids.data.len() * dim as usize)?;
+            .alloc_zeros::<f32>(ids.slice.len() * dim as usize)?;
+        let mut invalid_id_flag = self.stream.alloc_zeros::<i32>(1)?;
         let func = self.function("embedding_lookup_kernel")?;
         let mut args = self.stream.launch_builder(&func);
-        args.arg(&table_dev)
-            .arg(&ids_dev)
+        args.arg(&table.slice)
+            .arg(&ids.slice)
             .arg(&mut out_dev)
             .arg(&dim)
-            .arg(&num_ids);
+            .arg(&num_ids)
+            .arg(&vocab)
+            .arg(&mut invalid_id_flag);
         unsafe { args.launch(LaunchConfig::for_num_elems(num_ids as u32)) }?;
-        let out = self.stream.clone_dtoh(&out_dev)?;
+        // Data-dependent failure (an out-of-range or non-integer token id)
+        // can only be observed by downloading this one-element flag -- the
+        // same device-computed-flag pattern `softmax_rows` already uses
+        // below, not a blanket per-kernel host round-trip.
+        let flag = self.stream.clone_dtoh(&invalid_id_flag)?;
         self.stream.synchronize()?;
-        HostTensor::new([num_ids, dim], out).map_err(host_error)
+        if flag[0] != 0 {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                "embedding lookup id is not a valid in-range non-negative integer",
+            ));
+        }
+        Ok(CudaDeviceBuffer {
+            slice: out_dev,
+            shape: vec![num_ids, dim],
+        })
     }
 
     pub fn rmsnorm(
         &self,
-        input: &HostTensor,
-        weight: &HostTensor,
+        input: &CudaDeviceBuffer,
+        weight: &CudaDeviceBuffer,
         epsilon: f32,
-    ) -> Result<HostTensor, CudaError> {
+    ) -> Result<CudaDeviceBuffer, CudaError> {
         let cols = *input.shape.last().ok_or_else(|| {
             CudaError::new(
                 CudaErrorCode::ShapeUnsupported,
                 "RMSNorm expects at least one dimension",
             )
         })?;
-        if cols == 0 || !input.data.len().is_multiple_of(cols as usize) {
+        if cols == 0 || !input.slice.len().is_multiple_of(cols as usize) {
             return Err(CudaError::new(
                 CudaErrorCode::ShapeUnsupported,
                 format!(
                     "RMSNorm data length {} is not divisible by hidden dimension {cols}",
-                    input.data.len()
+                    input.slice.len()
                 ),
             ));
         }
-        let rows = (input.data.len() / cols as usize) as u64;
+        let rows = (input.slice.len() / cols as usize) as u64;
         let weight_row_stride = if weight.shape == [cols] || weight.shape == [1, cols] {
             0u64
         } else if weight.shape == input.shape || weight.shape == [rows, cols] {
@@ -189,33 +275,32 @@ impl CudaKernels {
                 "RMSNorm epsilon must be positive",
             ));
         }
-        let in_dev = self.stream.clone_htod(&input.data)?;
-        let weight_dev = self.stream.clone_htod(&weight.data)?;
-        let mut out_dev = self.stream.alloc_zeros::<f32>(input.data.len())?;
+        let mut out_dev = self.stream.alloc_zeros::<f32>(input.slice.len())?;
         let func = self.function("rmsnorm_kernel")?;
         let mut args = self.stream.launch_builder(&func);
-        args.arg(&in_dev)
-            .arg(&weight_dev)
+        args.arg(&input.slice)
+            .arg(&weight.slice)
             .arg(&mut out_dev)
             .arg(&rows)
             .arg(&cols)
             .arg(&weight_row_stride)
             .arg(&epsilon);
         unsafe { args.launch(LaunchConfig::for_num_elems(rows as u32)) }?;
-        let out = self.stream.clone_dtoh(&out_dev)?;
-        self.stream.synchronize()?;
-        HostTensor::new(input.shape.clone(), out).map_err(host_error)
+        Ok(CudaDeviceBuffer {
+            slice: out_dev,
+            shape: input.shape.clone(),
+        })
     }
 
     pub fn rope(
         &self,
-        input: &HostTensor,
+        input: &CudaDeviceBuffer,
         base: f32,
         scale: f32,
         dimension: u64,
         position_offset: u64,
-    ) -> Result<HostTensor, CudaError> {
-        let (rows, cols) = rows_cols(input)?;
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        let (rows, cols) = rows_cols_buf(input)?;
         if dimension == 0 || !dimension.is_multiple_of(2) || dimension > cols {
             return Err(CudaError::new(
                 CudaErrorCode::ShapeUnsupported,
@@ -237,11 +322,10 @@ impl CudaKernels {
             ));
         }
         let half = dimension / 2;
-        let in_dev = self.stream.clone_htod(&input.data)?;
-        let mut out_dev = self.stream.alloc_zeros::<f32>(input.data.len())?;
+        let mut out_dev = self.stream.alloc_zeros::<f32>(input.slice.len())?;
         let func = self.function("rope_kernel")?;
         let mut args = self.stream.launch_builder(&func);
-        args.arg(&in_dev)
+        args.arg(&input.slice)
             .arg(&mut out_dev)
             .arg(&rows)
             .arg(&cols)
@@ -251,19 +335,19 @@ impl CudaKernels {
             .arg(&dimension)
             .arg(&position_offset);
         unsafe { args.launch(LaunchConfig::for_num_elems((rows * half) as u32)) }?;
-        let out = self.stream.clone_dtoh(&out_dev)?;
-        self.stream.synchronize()?;
-        HostTensor::new(input.shape.clone(), out).map_err(host_error)
+        Ok(CudaDeviceBuffer {
+            slice: out_dev,
+            shape: input.shape.clone(),
+        })
     }
 
-    pub fn softmax_rows(&self, input: &HostTensor) -> Result<HostTensor, CudaError> {
-        let (rows, cols) = rows_cols(input)?;
-        let in_dev = self.stream.clone_htod(&input.data)?;
-        let mut out_dev = self.stream.alloc_zeros::<f32>(input.data.len())?;
+    pub fn softmax_rows(&self, input: &CudaDeviceBuffer) -> Result<CudaDeviceBuffer, CudaError> {
+        let (rows, cols) = rows_cols_buf(input)?;
+        let mut out_dev = self.stream.alloc_zeros::<f32>(input.slice.len())?;
         let mut flag_dev = self.stream.alloc_zeros::<i32>(1)?;
         let func = self.function("softmax_rows_kernel")?;
         let mut args = self.stream.launch_builder(&func);
-        args.arg(&in_dev)
+        args.arg(&input.slice)
             .arg(&mut out_dev)
             .arg(&rows)
             .arg(&cols)
@@ -277,20 +361,21 @@ impl CudaKernels {
                 "softmax has a row with no finite entry to normalize",
             ));
         }
-        let out = self.stream.clone_dtoh(&out_dev)?;
-        self.stream.synchronize()?;
-        HostTensor::new(input.shape.clone(), out).map_err(host_error)
+        Ok(CudaDeviceBuffer {
+            slice: out_dev,
+            shape: input.shape.clone(),
+        })
     }
 
     pub fn matmul(
         &self,
-        a: &HostTensor,
-        b: &HostTensor,
+        a: &CudaDeviceBuffer,
+        b: &CudaDeviceBuffer,
         transpose_a: bool,
         transpose_b: bool,
-    ) -> Result<HostTensor, CudaError> {
-        let (a_rows, a_cols) = rows_cols(a)?;
-        let (b_rows, b_cols) = rows_cols(b)?;
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        let (a_rows, a_cols) = rows_cols_buf(a)?;
+        let (b_rows, b_cols) = rows_cols_buf(b)?;
         let (m, k) = if transpose_a {
             (a_cols, a_rows)
         } else {
@@ -317,13 +402,11 @@ impl CudaKernels {
         } else {
             (b_cols, 1u64)
         };
-        let a_dev = self.stream.clone_htod(&a.data)?;
-        let b_dev = self.stream.clone_htod(&b.data)?;
         let mut out_dev = self.stream.alloc_zeros::<f32>((m * n) as usize)?;
         let func = self.function("matmul_kernel")?;
         let mut args = self.stream.launch_builder(&func);
-        args.arg(&a_dev)
-            .arg(&b_dev)
+        args.arg(&a.slice)
+            .arg(&b.slice)
             .arg(&mut out_dev)
             .arg(&m)
             .arg(&k)
@@ -333,24 +416,25 @@ impl CudaKernels {
             .arg(&b_inner_stride)
             .arg(&b_col_stride);
         unsafe { args.launch(LaunchConfig::for_num_elems((m * n) as u32)) }?;
-        let out = self.stream.clone_dtoh(&out_dev)?;
-        self.stream.synchronize()?;
-        HostTensor::new([m, n], out).map_err(host_error)
+        Ok(CudaDeviceBuffer {
+            slice: out_dev,
+            shape: vec![m, n],
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn attention(
         &self,
-        q: &HostTensor,
-        k: &HostTensor,
-        v: &HostTensor,
+        q: &CudaDeviceBuffer,
+        k: &CudaDeviceBuffer,
+        v: &CudaDeviceBuffer,
         head_count: u64,
         head_dimension: u64,
         kv_head_count: Option<u64>,
         window_size: Option<u64>,
         causal: bool,
-    ) -> Result<HostTensor, CudaError> {
-        same_shape(k, v)?;
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        same_shape_buf(k, v)?;
         let kv_head_count = kv_head_count.unwrap_or(head_count);
         if head_count == 0 || head_dimension == 0 || kv_head_count == 0 {
             return Err(CudaError::new(
@@ -378,8 +462,8 @@ impl CudaKernels {
                 "window_size is only defined for causal attention",
             ));
         }
-        let (seq_len, q_model_dim) = rows_cols(q)?;
-        let (kv_seq_len, kv_model_dim) = rows_cols(k)?;
+        let (seq_len, q_model_dim) = rows_cols_buf(q)?;
+        let (kv_seq_len, kv_model_dim) = rows_cols_buf(k)?;
         if seq_len > kv_seq_len {
             return Err(CudaError::new(
                 CudaErrorCode::ShapeUnsupported,
@@ -408,15 +492,12 @@ impl CudaKernels {
         let causal_flag: i32 = if causal { 1 } else { 0 };
         let window_arg: i64 = window_size.map(|w| w as i64).unwrap_or(-1);
 
-        let q_dev = self.stream.clone_htod(&q.data)?;
-        let k_dev = self.stream.clone_htod(&k.data)?;
-        let v_dev = self.stream.clone_htod(&v.data)?;
-        let mut out_dev = self.stream.alloc_zeros::<f32>(q.data.len())?;
+        let mut out_dev = self.stream.alloc_zeros::<f32>(q.slice.len())?;
         let func = self.function("attention_kernel")?;
         let mut args = self.stream.launch_builder(&func);
-        args.arg(&q_dev)
-            .arg(&k_dev)
-            .arg(&v_dev)
+        args.arg(&q.slice)
+            .arg(&k.slice)
+            .arg(&v.slice)
             .arg(&mut out_dev)
             .arg(&seq_len)
             .arg(&kv_seq_len)
@@ -429,14 +510,15 @@ impl CudaKernels {
             .arg(&window_arg)
             .arg(&query_position_offset);
         unsafe { args.launch(LaunchConfig::for_num_elems((head_count * seq_len) as u32)) }?;
-        let out = self.stream.clone_dtoh(&out_dev)?;
-        self.stream.synchronize()?;
-        HostTensor::new(q.shape.clone(), out).map_err(host_error)
+        Ok(CudaDeviceBuffer {
+            slice: out_dev,
+            shape: q.shape.clone(),
+        })
     }
 }
 
-fn rows_cols(tensor: &HostTensor) -> Result<(u64, u64), CudaError> {
-    match tensor.shape.as_slice() {
+fn rows_cols_buf(buffer: &CudaDeviceBuffer) -> Result<(u64, u64), CudaError> {
+    match buffer.shape.as_slice() {
         [rows, cols] => Ok((*rows, *cols)),
         other => Err(CudaError::new(
             CudaErrorCode::ShapeUnsupported,

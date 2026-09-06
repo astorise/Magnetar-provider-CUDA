@@ -43,20 +43,37 @@ extern "C" __global__ void silu_kernel(const float* x, float* out, unsigned long
     }
 }
 
-// One thread per output row. `ids` are pre-validated on the host (in-range,
-// non-negative integers) before this kernel is ever launched.
+// One thread per output row. `ids` are validated device-side (in-range,
+// non-negative integers) rather than pre-checked on the host: `table` and
+// `ids` may both already be device-resident outputs of a prior Kernel
+// (`enable-device-resident-kernel-chaining`'s explicit-data-movement
+// decision), so no host-visible copy of `ids` is assumed to exist here.
+// An out-of-range or non-integer id sets `invalid_id_flag` and the row is
+// left unwritten, matching `softmax_rows_kernel`'s device-computed-flag
+// pattern below for a data-dependent failure the host must still observe.
 extern "C" __global__ void embedding_lookup_kernel(
     const float* table,
     const float* ids,
     float* out,
     unsigned long long dim,
-    unsigned long long num_ids
+    unsigned long long num_ids,
+    unsigned long long vocab,
+    int* invalid_id_flag
 ) {
     unsigned long long row = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= num_ids) {
         return;
     }
-    unsigned long long id = (unsigned long long)ids[row];
+    float raw_id = ids[row];
+    if (raw_id < 0.0f || raw_id != floorf(raw_id)) {
+        atomicExch(invalid_id_flag, 1);
+        return;
+    }
+    unsigned long long id = (unsigned long long)raw_id;
+    if (id >= vocab) {
+        atomicExch(invalid_id_flag, 1);
+        return;
+    }
     const float* src = table + id * dim;
     float* dst = out + row * dim;
     for (unsigned long long i = 0; i < dim; i++) {

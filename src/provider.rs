@@ -165,6 +165,24 @@ impl CudaProvider {
     pub fn context(&self) -> Option<Arc<CudaContext>> {
         self.context.clone()
     }
+
+    /// Test-only: builds a `CudaProvider` with a real, discovered Device
+    /// but no Kernel executor, simulating the "Device found, this
+    /// Provider's own Kernels failed to compile/load" case without
+    /// actually needing to break NVRTC compilation on real hardware --
+    /// see `health()`'s `Degraded` branch.
+    #[cfg(test)]
+    pub(crate) fn with_device_but_no_executor_for_test(
+        context: Arc<CudaContext>,
+        device: DeviceDescriptor,
+    ) -> Self {
+        Self {
+            metadata: cuda_provider_metadata(),
+            context: Some(context),
+            device: Some(Arc::new(device)),
+            executor: None,
+        }
+    }
 }
 
 impl Default for CudaProvider {
@@ -186,8 +204,19 @@ impl Provider for CudaProvider {
     }
 
     fn health(&self) -> ProviderHealth {
-        if self.is_available() {
-            ProviderHealth::Available
+        if self.device.is_some() {
+            if self.executor.is_some() {
+                ProviderHealth::Available
+            } else {
+                // A compatible Device was found, but this Provider's own
+                // Kernels failed to compile/load: real hardware is present
+                // and usable in principle, but this Provider cannot
+                // currently execute on it -- distinct from the "no
+                // hardware" case `Unavailable` describes
+                // (`enable-device-resident-kernel-chaining`'s health/
+                // execution_api reconciliation decision).
+                ProviderHealth::Degraded
+            }
         } else {
             ProviderHealth::Unavailable
         }
