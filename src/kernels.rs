@@ -292,6 +292,16 @@ impl CudaKernels {
         })
     }
 
+    /// Each row divides into `head_count` equal-width blocks of
+    /// `head_width = cols / head_count` columns; within each block
+    /// independently, the first `dimension` columns (`dimension <=
+    /// head_width`, partial RoPE is legal) are rotated in consecutive
+    /// pairs. Columns outside a rotated range are left unchanged --
+    /// `out_dev` is seeded as a device-to-device copy of `input`, not a
+    /// zero-allocation, so the kernel only needs to write the columns it
+    /// actually rotates. `head_count = 1` reproduces this Kernel's
+    /// pre-`make-first-native-cuda-hot-path-device-resident` single-block
+    /// behavior exactly (`head_width` becomes `cols`).
     pub fn rope(
         &self,
         input: &CudaDeviceBuffer,
@@ -299,13 +309,23 @@ impl CudaKernels {
         scale: f32,
         dimension: u64,
         position_offset: u64,
+        head_count: u64,
     ) -> Result<CudaDeviceBuffer, CudaError> {
         let (rows, cols) = rows_cols_buf(input)?;
-        if dimension == 0 || !dimension.is_multiple_of(2) || dimension > cols {
+        if head_count == 0 || !cols.is_multiple_of(head_count) {
             return Err(CudaError::new(
                 CudaErrorCode::ShapeUnsupported,
                 format!(
-                    "RoPE dimension {dimension} must be positive, even, and at most the row width {cols}"
+                    "RoPE head_count {head_count} must be positive and evenly divide the row width {cols}"
+                ),
+            ));
+        }
+        let head_width = cols / head_count;
+        if dimension == 0 || !dimension.is_multiple_of(2) || dimension > head_width {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!(
+                    "RoPE dimension {dimension} must be positive, even, and at most the head width {head_width}"
                 ),
             ));
         }
@@ -322,7 +342,7 @@ impl CudaKernels {
             ));
         }
         let half = dimension / 2;
-        let mut out_dev = self.stream.alloc_zeros::<f32>(input.slice.len())?;
+        let mut out_dev = self.stream.clone_dtod(&input.slice)?;
         let func = self.function("rope_kernel")?;
         let mut args = self.stream.launch_builder(&func);
         args.arg(&input.slice)
@@ -333,8 +353,13 @@ impl CudaKernels {
             .arg(&base)
             .arg(&scale)
             .arg(&dimension)
-            .arg(&position_offset);
-        unsafe { args.launch(LaunchConfig::for_num_elems((rows * half) as u32)) }?;
+            .arg(&position_offset)
+            .arg(&head_count);
+        unsafe {
+            args.launch(LaunchConfig::for_num_elems(
+                (rows * head_count * half) as u32,
+            ))
+        }?;
         Ok(CudaDeviceBuffer {
             slice: out_dev,
             shape: input.shape.clone(),

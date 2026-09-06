@@ -441,8 +441,13 @@ impl CudaExecutor {
                             });
                         }
                     };
+                    // `make-first-native-cuda-hot-path-device-resident`:
+                    // absent means single-block, identical to this
+                    // Kernel's behavior before `head_count` existed.
+                    let head_count =
+                        Self::attribute_integer(&invocation.attributes, "head_count").unwrap_or(1);
                     self.kernels
-                        .rope(input, base, scale, dimension, position_offset)
+                        .rope(input, base, scale, dimension, position_offset, head_count)
                         .map_err(KernelError::from)?
                 }
                 "attention" => {

@@ -152,9 +152,67 @@ fn rope_matches_reference_cpu() {
         return;
     };
     let input = HostTensor::new([2, 4], [1.0, 0.0, 0.0, 1.0, 0.5, 0.5, -0.5, -0.5]).unwrap();
-    let expected = magnetar_provider_cpu::rope(&input, 10000.0, 1.0, 4, 0).unwrap();
+    let expected = magnetar_provider_cpu::rope(&input, 10000.0, 1.0, 4, 0, 1).unwrap();
     let actual_dev = kernels
-        .rope(&upload(&kernels, &input), 10000.0, 1.0, 4, 0)
+        .rope(&upload(&kernels, &input), 10000.0, 1.0, 4, 0, 1)
+        .unwrap();
+    assert_close(&download(&kernels, &actual_dev), &expected);
+}
+
+/// `make-first-native-cuda-hot-path-device-resident` task 3.8: a genuine
+/// multi-head call (`head_count > 1`, `dimension == head_width`) must
+/// match `providers/cpu`'s corrected implementation on real hardware, not
+/// just the single-block case above.
+#[test]
+fn rope_multi_head_matches_reference_cpu() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    // 2 rows, head_count = 4, head_width = 2 -> cols = 8.
+    let data: Vec<f32> = (0..16).map(|i| i as f32 * 0.25 - 2.0).collect();
+    let input = HostTensor::new([2, 8], data).unwrap();
+    let expected = magnetar_provider_cpu::rope(&input, 10000.0, 1.0, 2, 3, 4).unwrap();
+    let actual_dev = kernels
+        .rope(&upload(&kernels, &input), 10000.0, 1.0, 2, 3, 4)
+        .unwrap();
+    assert_close(&download(&kernels, &actual_dev), &expected);
+}
+
+/// Partial RoPE on real hardware: `dimension < head_width` must rotate
+/// only the first `dimension` columns of each head's block, matching
+/// `providers/cpu`'s corrected implementation -- including the untouched
+/// tail, which the kernel now preserves via a device-to-device copy seed
+/// rather than a zero-allocation.
+#[test]
+fn rope_partial_rotation_matches_reference_cpu() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    // 2 rows, head_count = 2, head_width = 4, dimension = 2 (partial).
+    let data: Vec<f32> = (0..16).map(|i| i as f32 * 0.1 - 0.8).collect();
+    let input = HostTensor::new([2, 8], data).unwrap();
+    let expected = magnetar_provider_cpu::rope(&input, 10000.0, 1.0, 2, 0, 2).unwrap();
+    let actual_dev = kernels
+        .rope(&upload(&kernels, &input), 10000.0, 1.0, 2, 0, 2)
+        .unwrap();
+    assert_close(&download(&kernels, &actual_dev), &expected);
+}
+
+/// GQA-shaped case on real hardware: a smaller `head_count` (as K would
+/// have relative to Q under grouped-query attention) must also match
+/// `providers/cpu`'s corrected implementation, independently of any other
+/// `head_count`.
+#[test]
+fn rope_gqa_shaped_head_count_matches_reference_cpu() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    // 2 rows, head_count = 2 (e.g. kv_head_count), head_width = 4.
+    let data: Vec<f32> = (0..16).map(|i| i as f32 * 0.05).collect();
+    let input = HostTensor::new([2, 8], data).unwrap();
+    let expected = magnetar_provider_cpu::rope(&input, 10000.0, 1.0, 4, 1, 2).unwrap();
+    let actual_dev = kernels
+        .rope(&upload(&kernels, &input), 10000.0, 1.0, 4, 1, 2)
         .unwrap();
     assert_close(&download(&kernels, &actual_dev), &expected);
 }

@@ -111,7 +111,10 @@ extern "C" __global__ void rmsnorm_kernel(
     }
 }
 
-// One thread per (row, pair). `half = dimension / 2`.
+// One thread per (row, head, pair). `half = dimension / 2`, `head_width =
+// cols / head_count`. `out` is pre-seeded (device-to-device copy of
+// `input`, done Rust-side) so columns this kernel never touches -- a
+// partial-RoPE block's untouched tail -- keep their original values.
 extern "C" __global__ void rope_kernel(
     const float* input,
     float* out,
@@ -121,25 +124,30 @@ extern "C" __global__ void rope_kernel(
     float base,
     float scale,
     unsigned long long dimension,
-    unsigned long long position_offset
+    unsigned long long position_offset,
+    unsigned long long head_count
 ) {
     unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned long long total = rows * half;
+    unsigned long long per_row = head_count * half;
+    unsigned long long total = rows * per_row;
     if (idx >= total) {
         return;
     }
-    unsigned long long row = idx / half;
-    unsigned long long pair = idx % half;
+    unsigned long long head_width = cols / head_count;
+    unsigned long long row = idx / per_row;
+    unsigned long long rem = idx % per_row;
+    unsigned long long head = rem / half;
+    unsigned long long pair = rem % half;
     float position = (float)(position_offset + row) * scale;
     float frequency = powf(base, -2.0f * (float)pair / (float)dimension);
     float angle = position * frequency;
     float s = sinf(angle);
     float c = cosf(angle);
-    unsigned long long row_start = row * cols;
-    float even = input[row_start + 2 * pair];
-    float odd = input[row_start + 2 * pair + 1];
-    out[row_start + 2 * pair] = even * c - odd * s;
-    out[row_start + 2 * pair + 1] = even * s + odd * c;
+    unsigned long long col_base = row * cols + head * head_width;
+    float even = input[col_base + 2 * pair];
+    float odd = input[col_base + 2 * pair + 1];
+    out[col_base + 2 * pair] = even * c - odd * s;
+    out[col_base + 2 * pair + 1] = even * s + odd * c;
 }
 
 // One thread per row.
