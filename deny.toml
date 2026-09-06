@@ -1,0 +1,49 @@
+# cargo-deny policy for the CUDA Provider submodule.
+#
+# The root Magnetar repository's own `deny.toml`/`quality.yml` `cargo-deny`
+# job deliberately never sees this crate: it checks out without submodules
+# and runs `cargo deny --all-features check` against only
+# `magnetar-cli`/`magnetar-runtime` (`externalize-runtime-extension-modules`'s
+# "zero compile-time dependency on any externalized module"). `cudarc` --
+# this Provider's one new, critical, native-library-adjacent dependency --
+# therefore never entered any `cargo deny` graph until this file existed
+# (`docs/audits/cuda-provider-full-audit-2026-09-05.md`'s P2 finding,
+# `implement-cuda-provider-baseline` task 10.4). Run locally with:
+#   cargo deny --manifest-path providers/cuda/Cargo.toml check
+# CI: `.github/workflows/quality.yml`'s `provider-integration` job.
+
+[advisories]
+yanked = "deny"
+ignore = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+skip = []
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+# This crate itself (and its sibling `providers/cpu`) is a submodule of
+# Magnetar, never published to crates.io independently (see both crates'
+# `Cargo.toml` -- `publish = false`) -- cargo-deny would otherwise flag it
+# as "unlicensed" for lacking its own SPDX `license` field, which is not
+# the question this file exists to answer (that question is about
+# `cudarc` and the rest of the real dependency graph, checked in full
+# below regardless of this setting).
+private = { ignore = true }
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
