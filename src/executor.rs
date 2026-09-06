@@ -627,6 +627,25 @@ impl CudaExecutor {
                 )
                 .with_allocation(allocation_id),
             );
+            // Replace-and-release whatever this same resource id's previous
+            // Kernel invocation admitted, mirroring `write_tensor_admitted`'s
+            // own pattern (`enable-device-resident-kernel-chaining`'s
+            // discovered leak fix): a Kernel-internal output id (e.g.
+            // `{operation_id}.out`) is stable across every generation step
+            // that dispatches the same graph node, so without this, every
+            // single node dispatch would admit a fresh `MemoryAllocationId`
+            // that nothing ever releases -- an unbounded Memory Manager
+            // ledger leak over a long-running session, even though the
+            // underlying `CudaDeviceBuffer` itself does not physically leak
+            // (`storage`'s `BTreeMap::insert` already drops the prior entry).
+            let previous = self
+                .resource_allocations
+                .lock()
+                .unwrap()
+                .insert(resource.id.clone(), allocation_id);
+            if let Some(previous) = previous {
+                let _ = memory.release(previous);
+            }
         }
         result
     }
