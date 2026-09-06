@@ -41,3 +41,15 @@ cudarc = { version = "0.19", default-features = false, features = ["std", "drive
 # "conformance scope" decision): compares `CudaKernels` output directly to
 # `providers/cpu`'s reference functions on the same fixtures.
 magnetar-provider-cpu = { path = "../cpu" }
+# Measurement-only (`unify-provider-output-admission-and-residency`'s
+# Decision 4): benches/kernel_chaining.rs quantifies the H2D/D2H cost a
+# forced host round-trip between two device-resident Kernels pays, vs.
+# chaining them directly -- the same physical mechanism
+# `enable-device-resident-kernel-chaining` eliminated at the CudaExecutor
+# level. Never invoked by `cargo test`/CI; opt-in via `cargo bench`, and
+# gracefully skips (prints and returns) on a host with no compatible GPU.
+criterion = { version = "0.7", default-features = false }
+
+[[bench]]
+name = "kernel_chaining"
+harness = false
