@@ -25,4 +25,6 @@ mod tests;
 #[cfg(test)]
 mod tests_conformance;
 #[cfg(test)]
+mod tests_hardware_hot_path;
+#[cfg(test)]
 mod tests_provider_conformance;
