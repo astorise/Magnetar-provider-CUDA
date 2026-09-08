@@ -342,6 +342,7 @@ impl CudaKernels {
             ));
         }
         let half = dimension / 2;
+        let work_items = rope_launch_work_items(rows, head_count, half)?;
         let mut out_dev = self.stream.clone_dtod(&input.slice)?;
         let func = self.function("rope_kernel")?;
         let mut args = self.stream.launch_builder(&func);
@@ -355,11 +356,7 @@ impl CudaKernels {
             .arg(&dimension)
             .arg(&position_offset)
             .arg(&head_count);
-        unsafe {
-            args.launch(LaunchConfig::for_num_elems(
-                (rows * head_count * half) as u32,
-            ))
-        }?;
+        unsafe { args.launch(LaunchConfig::for_num_elems(work_items)) }?;
         Ok(CudaDeviceBuffer {
             slice: out_dev,
             shape: input.shape.clone(),
@@ -549,5 +546,57 @@ fn rows_cols_buf(buffer: &CudaDeviceBuffer) -> Result<(u64, u64), CudaError> {
             CudaErrorCode::ShapeUnsupported,
             format!("expected rank-2 tensor, got shape {other:?}"),
         )),
+    }
+}
+
+/// `rope`'s launch size, `rows * head_count * half`, checked rather than a
+/// bare `as u32` cast (audit-complet-cuda-hot-path-2026-09-08 P2-2): that
+/// product can overflow `u64` before the cast, or be silently truncated by
+/// it, for large enough shapes -- today's fixtures are far too small to hit
+/// this in practice, which is exactly why it needs an explicit check rather
+/// than relying on a test against real hardware to ever notice. A free
+/// function (not inlined in `CudaKernels::rope`) so it can be unit-tested
+/// directly, without a real CUDA context/device.
+fn rope_launch_work_items(rows: u64, head_count: u64, half: u64) -> Result<u32, CudaError> {
+    let work_items = rows
+        .checked_mul(head_count)
+        .and_then(|value| value.checked_mul(half))
+        .ok_or_else(|| {
+            CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!(
+                    "RoPE launch size overflows: rows {rows} * head_count {head_count} * half {half}"
+                ),
+            )
+        })?;
+    u32::try_from(work_items).map_err(|_| {
+        CudaError::new(
+            CudaErrorCode::ShapeUnsupported,
+            format!("RoPE launch size {work_items} exceeds u32::MAX work-items"),
+        )
+    })
+}
+
+#[cfg(test)]
+mod rope_launch_work_items_tests {
+    use super::rope_launch_work_items;
+    use crate::error::CudaErrorCode;
+
+    #[test]
+    fn accepts_a_realistic_small_shape() {
+        let work_items = rope_launch_work_items(2, 4, 8).expect("small shapes never overflow");
+        assert_eq!(work_items, 2 * 4 * 8);
+    }
+
+    #[test]
+    fn rejects_a_u64_multiplication_overflow() {
+        let error = rope_launch_work_items(u64::MAX, 2, 2).unwrap_err();
+        assert_eq!(error.code, CudaErrorCode::ShapeUnsupported);
+    }
+
+    #[test]
+    fn rejects_a_product_that_does_not_fit_in_u32() {
+        let error = rope_launch_work_items(1 << 20, 1 << 20, 2).unwrap_err();
+        assert_eq!(error.code, CudaErrorCode::ShapeUnsupported);
     }
 }
