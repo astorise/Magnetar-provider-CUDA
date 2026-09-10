@@ -64,6 +64,23 @@ fn add_matches_reference_cpu() {
     assert_close(&download(&kernels, &actual_dev), &expected);
 }
 
+/// Real Qwen2/2.5 QKV projection bias: `[rows, cols] + [cols]`, the bias
+/// row broadcast across every row -- `providers/cpu::add`'s own broadcast
+/// extension, dispatched here to CUDA's separate `bias_add_kernel`.
+#[test]
+fn add_broadcasts_a_bias_row_matching_reference_cpu() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let a = HostTensor::new([3, 2], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+    let bias = HostTensor::new([2], [100.0, 1000.0]).unwrap();
+    let expected = magnetar_provider_cpu::add(&a, &bias).unwrap();
+    let actual_dev = kernels
+        .add(&upload(&kernels, &a), &upload(&kernels, &bias))
+        .unwrap();
+    assert_close(&download(&kernels, &actual_dev), &expected);
+}
+
 #[test]
 fn mul_matches_reference_cpu() {
     let Some(kernels) = kernels_or_skip() else {

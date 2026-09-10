@@ -7,7 +7,7 @@
 //! no CUDA driver, no compatible GPU, or a driver/runtime version mismatch --
 //! it never fails Runtime initialization for the absence of hardware. When
 //! driver discovery fails, this Provider reports zero Devices and
-//! [`ProviderHealth::Unavailable`] instead of [`ProviderHealth::Unhealthy`]/
+//! [`ProviderHealth::Unavailable`] instead of a [`magnetar_runtime::affinity::ProviderHealthState::Unhealthy`]/
 //! failing outright: this is expected, policy-relevant absence of hardware,
 //! not an internal fault (`cuda-provider`'s "Graceful Unavailability Without
 //! Compatible Hardware" requirement). This is also what keeps this crate's

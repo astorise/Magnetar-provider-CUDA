@@ -81,6 +81,18 @@ extern "C" __global__ void embedding_lookup_kernel(
     }
 }
 
+// One thread per output element. `bias` is a single row of `cols` values,
+// broadcast across every row of `a` (real Qwen2/2.5 QKV projection bias:
+// `[rows, cols] + [cols] -> [rows, cols]`) -- mirrors `rmsnorm_kernel`'s
+// broadcast-row convention below, and `providers/cpu::add`'s own broadcast
+// case.
+extern "C" __global__ void bias_add_kernel(const float* a, const float* bias, float* out, unsigned long long cols, unsigned long long n) {
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = a[i] + bias[i % cols];
+    }
+}
+
 // One thread per row. `weight_row_stride` is 0 for a single broadcast weight
 // row, or `cols` for a per-row weight -- mirrors providers/cpu::rmsnorm's
 // `row_weight_stride` exactly.

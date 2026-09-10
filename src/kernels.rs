@@ -13,7 +13,7 @@
 //! kernel's output is left in a freshly allocated device buffer rather than
 //! downloaded before returning (`enable-device-resident-kernel-chaining`).
 //! [`CudaKernels::upload`]/[`CudaKernels::download`] are the only two points
-//! that cross the host/device boundary, and only [`CudaExecutor`]
+//! that cross the host/device boundary, and only [`crate::CudaExecutor`]
 //! (`executor.rs`) calls them -- when a resource is already device-resident
 //! under its existing `TensorResourceId`, the executor reuses the stored
 //! [`CudaDeviceBuffer`] directly instead of downloading and re-uploading it.
@@ -138,17 +138,59 @@ impl CudaKernels {
         HostTensor::new(buffer.shape.clone(), data).map_err(host_error)
     }
 
+    /// `a + b`, element-wise. `b` may either exactly match `a`'s shape, or
+    /// -- mirroring `rmsnorm`'s row-broadcast convention -- be a single row
+    /// (`b.shape == [cols]` or `[1, cols]` where `cols` is `a`'s last
+    /// dimension) broadcast across every row of `a` (real Qwen2/2.5 QKV
+    /// projection bias). Purely additive over the prior same-shape-only
+    /// behavior: matches `providers/cpu::add`'s own broadcast extension.
     pub fn add(
         &self,
         a: &CudaDeviceBuffer,
         b: &CudaDeviceBuffer,
     ) -> Result<CudaDeviceBuffer, CudaError> {
-        same_shape_buf(a, b)?;
+        if a.shape == b.shape {
+            let n = a.slice.len() as u64;
+            let mut out_dev = self.stream.alloc_zeros::<f32>(a.slice.len())?;
+            let func = self.function("add_kernel")?;
+            let mut args = self.stream.launch_builder(&func);
+            args.arg(&a.slice).arg(&b.slice).arg(&mut out_dev).arg(&n);
+            unsafe { args.launch(LaunchConfig::for_num_elems(n as u32)) }?;
+            return Ok(CudaDeviceBuffer {
+                slice: out_dev,
+                shape: a.shape.clone(),
+            });
+        }
+        let cols = *a.shape.last().ok_or_else(|| {
+            CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                "add expects at least one dimension",
+            )
+        })?;
+        if b.shape != [cols] && b.shape != [1, cols] {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!(
+                    "add expects b to match a's shape {:?} or broadcast as [{cols}]/[1, {cols}], got {:?}",
+                    a.shape, b.shape
+                ),
+            ));
+        }
         let n = a.slice.len() as u64;
+        if !n.is_multiple_of(cols) {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!("add data length {n} is not divisible by broadcast dimension {cols}"),
+            ));
+        }
         let mut out_dev = self.stream.alloc_zeros::<f32>(a.slice.len())?;
-        let func = self.function("add_kernel")?;
+        let func = self.function("bias_add_kernel")?;
         let mut args = self.stream.launch_builder(&func);
-        args.arg(&a.slice).arg(&b.slice).arg(&mut out_dev).arg(&n);
+        args.arg(&a.slice)
+            .arg(&b.slice)
+            .arg(&mut out_dev)
+            .arg(&cols)
+            .arg(&n);
         unsafe { args.launch(LaunchConfig::for_num_elems(n as u32)) }?;
         Ok(CudaDeviceBuffer {
             slice: out_dev,
