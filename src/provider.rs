@@ -252,4 +252,17 @@ impl Provider for CudaProvider {
             .clone()
             .map(|executor| executor as Arc<dyn ProviderExecutionApi>)
     }
+
+    /// `false`: `CudaExecutor::read_tensor_value` is deliberately device-
+    /// resident-only and never downloads a tensor's bytes to the host, so
+    /// multi-step decode's KV-history concatenation across steps -- which
+    /// needs host-readable KV tensors -- cannot complete for this Provider
+    /// (`close-tachyon-scope-audit-gaps` task 4.2). This makes that already
+    /// real, already fail-closed constraint an explicit, checked-early
+    /// signal (`InferenceApiError::Unsupported`) instead of the deep
+    /// `TensorError::ResidencyUnavailable` a caller previously only
+    /// discovered after a real prefill had already run.
+    fn supports_multi_step_decode(&self) -> bool {
+        false
+    }
 }
