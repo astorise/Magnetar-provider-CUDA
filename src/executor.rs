@@ -33,7 +33,7 @@ use magnetar_runtime::kernel::{
 };
 use magnetar_runtime::memory::{
     MemoryAllocationClass, MemoryAllocationId, MemoryAllocationOwner, MemoryAllocationRequest,
-    MemoryError, MemoryManager, MemoryManagerConfig, MemoryPlacement, TensorResidency,
+    MemoryError, MemoryManager, MemoryPlacement, TensorResidency,
 };
 use magnetar_runtime::operator::{OperatorAttributeValue, OperatorSpec};
 use magnetar_runtime::provider::{ProviderExecutionApi, TensorValue, TensorValueAdmissionError};
@@ -168,6 +168,17 @@ impl CudaExecutor {
         } else {
             None
         }
+    }
+
+    /// See [`ProviderExecutionApi::resident_shape`]: the device allocation
+    /// table already records each buffer's shape (`CudaDeviceBuffer.shape`),
+    /// so this never touches the device itself, let alone downloads.
+    pub fn resident_shape(&self, id: &TensorResourceId) -> Option<Vec<u64>> {
+        self.storage
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|buffer| buffer.shape.clone())
     }
 
     fn opaque_passthrough_error(&self, id: &TensorResourceId) -> ProviderExecutionError {
@@ -937,6 +948,10 @@ impl ProviderExecutionApi for CudaExecutor {
         CudaExecutor::read_tensor_value(self, id)
     }
 
+    fn resident_shape(&self, id: &TensorResourceId) -> Option<Vec<u64>> {
+        CudaExecutor::resident_shape(self, id)
+    }
+
     fn write_tensor_value(
         &self,
         id: TensorResourceId,
@@ -976,6 +991,7 @@ impl ProviderExecutionApi for CudaExecutor {
 mod tests {
     use super::*;
     use crate::provider::CudaProvider;
+    use magnetar_runtime::memory::MemoryManagerConfig;
 
     fn executor_or_skip() -> Option<CudaExecutor> {
         let provider = CudaProvider::new();

@@ -253,16 +253,16 @@ impl Provider for CudaProvider {
             .map(|executor| executor as Arc<dyn ProviderExecutionApi>)
     }
 
-    /// `false`: `CudaExecutor::read_tensor_value` is deliberately device-
-    /// resident-only and never downloads a tensor's bytes to the host, so
-    /// multi-step decode's KV-history concatenation across steps -- which
-    /// needs host-readable KV tensors -- cannot complete for this Provider
-    /// (`close-tachyon-scope-audit-gaps` task 4.2). This makes that already
-    /// real, already fail-closed constraint an explicit, checked-early
-    /// signal (`InferenceApiError::Unsupported`) instead of the deep
-    /// `TensorError::ResidencyUnavailable` a caller previously only
-    /// discovered after a real prefill had already run.
-    fn supports_multi_step_decode(&self) -> bool {
-        false
-    }
+    // `supports_multi_step_decode` reverts to the trait's `true` default
+    // (`implement-device-resident-multi-step-cuda-decode`): historical KV
+    // concatenation across decode steps now dispatches through the real,
+    // device-resident "concat" Kernel (`CudaKernels::concat`) instead of
+    // requiring `CudaExecutor::read_tensor_value` -- deliberately still
+    // device-resident-only -- to produce host-visible bytes it never did.
+    // `close-tachyon-scope-audit-gaps` task 4.2 previously overrode this to
+    // `false`, making that then-real, then-fail-closed constraint an
+    // explicit, checked-early `InferenceApiError::Unsupported` signal
+    // instead of a deep `TensorError::ResidencyUnavailable`; this change
+    // closes the constraint itself, so the override is removed rather than
+    // kept as dead documentation of a limitation that no longer exists.
 }
