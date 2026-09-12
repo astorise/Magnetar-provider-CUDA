@@ -1019,7 +1019,9 @@ mod tests {
     fn active_allocation_count(memory: &MemoryManager) -> usize {
         memory
             .allocations()
-            .filter(|allocation| allocation.state == magnetar_runtime::MemoryAllocationState::Active)
+            .filter(|allocation| {
+                allocation.state == magnetar_runtime::MemoryAllocationState::Active
+            })
             .count()
     }
 
