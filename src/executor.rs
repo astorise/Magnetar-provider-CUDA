@@ -33,7 +33,7 @@ use magnetar_runtime::kernel::{
 };
 use magnetar_runtime::memory::{
     MemoryAllocationClass, MemoryAllocationId, MemoryAllocationOwner, MemoryAllocationRequest,
-    MemoryError, MemoryManager, MemoryPlacement, TensorResidency,
+    MemoryError, MemoryManager, MemoryManagerConfig, MemoryPlacement, TensorResidency,
 };
 use magnetar_runtime::operator::{OperatorAttributeValue, OperatorSpec};
 use magnetar_runtime::provider::{ProviderExecutionApi, TensorValue, TensorValueAdmissionError};
@@ -233,6 +233,61 @@ impl CudaExecutor {
                 }
             }
         }
+    }
+
+    /// See [`ProviderExecutionApi::copy_tensor_admitted`]: duplicates
+    /// `from`'s current device-resident bytes to a fresh identity `to`, via
+    /// a real device-to-device copy -- never downloading to host. Mirrors
+    /// [`Self::write_tensor_admitted`]'s admit-then-write-with-rollback
+    /// sequence, replacing (and releasing) whatever `to` previously held.
+    pub fn copy_tensor_admitted(
+        &self,
+        memory: &mut MemoryManager,
+        from: &TensorResourceId,
+        to: TensorResourceId,
+        class: MemoryAllocationClass,
+        owner: MemoryAllocationOwner,
+    ) -> Result<(), TensorValueAdmissionError> {
+        let cloned_buffer = {
+            let storage = self.storage.lock().unwrap();
+            let buffer = storage.get(from).ok_or_else(|| {
+                TensorValueAdmissionError::Provider(ProviderExecutionError::new(
+                    ProviderExecutionErrorCode::MaterializationFailed,
+                    ProviderExecutionPhase::Submit,
+                    self.provider_binding(),
+                    Some(self.device_binding()),
+                    format!("copy_tensor_admitted: no existing device allocation for '{from}'"),
+                ))
+            })?;
+            self.kernels.clone_buffer(buffer).map_err(|error| {
+                TensorValueAdmissionError::Provider(ProviderExecutionError::new(
+                    ProviderExecutionErrorCode::MaterializationFailed,
+                    ProviderExecutionPhase::Submit,
+                    self.provider_binding(),
+                    Some(self.device_binding()),
+                    format!("copy_tensor_admitted: device-to-device copy failed: {error}"),
+                ))
+            })?
+        };
+        let byte_size = cloned_buffer.len() as u64 * std::mem::size_of::<f32>() as u64;
+        let allocation = memory
+            .allocate(MemoryAllocationRequest::new(
+                class,
+                byte_size,
+                MemoryPlacement::Device(self.device_binding()),
+                owner,
+            ))
+            .map_err(TensorValueAdmissionError::Memory)?;
+        let previous = self
+            .resource_allocations
+            .lock()
+            .unwrap()
+            .insert(to.clone(), allocation.id);
+        if let Some(previous) = previous {
+            let _ = memory.release(previous);
+        }
+        self.storage.lock().unwrap().insert(to, cloned_buffer);
+        Ok(())
     }
 
     pub fn observations(&self) -> Vec<KernelObservation> {
@@ -901,6 +956,17 @@ impl ProviderExecutionApi for CudaExecutor {
         CudaExecutor::write_tensor_value_admitted(self, memory, resource_id, value, class, owner)
     }
 
+    fn copy_tensor_admitted(
+        &self,
+        memory: &mut MemoryManager,
+        from: &TensorResourceId,
+        to: TensorResourceId,
+        class: MemoryAllocationClass,
+        owner: MemoryAllocationOwner,
+    ) -> Result<(), TensorValueAdmissionError> {
+        CudaExecutor::copy_tensor_admitted(self, memory, from, to, class, owner)
+    }
+
     fn observations(&self) -> Vec<KernelObservation> {
         CudaExecutor::observations(self)
     }
@@ -948,5 +1014,123 @@ mod tests {
                 "storage must not grow past the live window at step {step}"
             );
         }
+    }
+
+    fn active_allocation_count(memory: &MemoryManager) -> usize {
+        memory
+            .allocations()
+            .filter(|allocation| allocation.state == magnetar_runtime::MemoryAllocationState::Active)
+            .count()
+    }
+
+    /// `implement-device-resident-multi-step-cuda-decode` task 4.4:
+    /// `copy_tensor_admitted` duplicates a Device-resident resource's real
+    /// bytes to a fresh identity without downloading to host -- verified
+    /// here by downloading only the *destination* (never the source) and
+    /// comparing against the source's own real content.
+    #[test]
+    fn copy_tensor_admitted_duplicates_bytes_without_host_materialization() {
+        let Some(executor) = executor_or_skip() else {
+            return;
+        };
+        let mut memory = MemoryManager::new(MemoryManagerConfig::default());
+        let source_id = TensorResourceId::new("copy-source");
+        let tensor = HostTensor::new([2, 2], [1.0, 2.0, 3.0, 4.0]).unwrap();
+        executor
+            .write_tensor_admitted(
+                &mut memory,
+                source_id.clone(),
+                tensor.clone(),
+                MemoryAllocationClass::Tensor,
+                MemoryAllocationOwner::Session("test".into()),
+            )
+            .expect("source write must succeed");
+
+        let dest_id = TensorResourceId::new("copy-destination");
+        executor
+            .copy_tensor_admitted(
+                &mut memory,
+                &source_id,
+                dest_id.clone(),
+                MemoryAllocationClass::Tensor,
+                MemoryAllocationOwner::Session("test".into()),
+            )
+            .expect("copy must succeed");
+
+        let copied = executor
+            .read_tensor(&dest_id)
+            .expect("destination resource must be present after copy");
+        assert_eq!(copied.shape, tensor.shape);
+        assert_eq!(copied.data, tensor.data);
+    }
+
+    /// A second copy to the same destination identity replaces (and
+    /// releases) the first, matching `write_tensor_value_admitted`'s own
+    /// replacement discipline -- the exact bounded-growth requirement the
+    /// KV pending/commit paths depend on.
+    #[test]
+    fn copy_tensor_admitted_replaces_a_previous_allocation_at_the_same_destination() {
+        let Some(executor) = executor_or_skip() else {
+            return;
+        };
+        let mut memory = MemoryManager::new(MemoryManagerConfig::default());
+        let source_id = TensorResourceId::new("copy-source-2");
+        executor
+            .write_tensor_admitted(
+                &mut memory,
+                source_id.clone(),
+                HostTensor::new([2], [1.0, 2.0]).unwrap(),
+                MemoryAllocationClass::Tensor,
+                MemoryAllocationOwner::Session("test".into()),
+            )
+            .expect("source write must succeed");
+
+        let dest_id = TensorResourceId::new("copy-destination-stable");
+        executor
+            .copy_tensor_admitted(
+                &mut memory,
+                &source_id,
+                dest_id.clone(),
+                MemoryAllocationClass::Tensor,
+                MemoryAllocationOwner::Session("test".into()),
+            )
+            .expect("first copy must succeed");
+        let count_after_first_copy = active_allocation_count(&memory);
+
+        for _ in 0..4 {
+            executor
+                .copy_tensor_admitted(
+                    &mut memory,
+                    &source_id,
+                    dest_id.clone(),
+                    MemoryAllocationClass::Tensor,
+                    MemoryAllocationOwner::Session("test".into()),
+                )
+                .expect("repeated copy to the same destination must succeed");
+        }
+        assert_eq!(
+            active_allocation_count(&memory),
+            count_after_first_copy,
+            "repeated copies to the same destination id must not accumulate allocations \
+             beyond the source's own allocation plus one stable destination allocation"
+        );
+    }
+
+    #[test]
+    fn copy_tensor_admitted_rejects_a_missing_source() {
+        let Some(executor) = executor_or_skip() else {
+            return;
+        };
+        let mut memory = MemoryManager::new(MemoryManagerConfig::default());
+        let error = executor
+            .copy_tensor_admitted(
+                &mut memory,
+                &TensorResourceId::new("does-not-exist"),
+                TensorResourceId::new("copy-destination-3"),
+                MemoryAllocationClass::Tensor,
+                MemoryAllocationOwner::Session("test".into()),
+            )
+            .expect_err("copying a nonexistent source must fail structurally");
+        assert!(matches!(error, TensorValueAdmissionError::Provider(_)));
     }
 }

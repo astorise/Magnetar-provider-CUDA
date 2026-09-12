@@ -138,6 +138,21 @@ impl CudaKernels {
         HostTensor::new(buffer.shape.clone(), data).map_err(host_error)
     }
 
+    /// Duplicates `buffer`'s current bytes into a fresh device allocation
+    /// via a real device-to-device copy -- never touching host memory.
+    /// The executor-level `copy_tensor_admitted` primitive
+    /// (`implement-device-resident-multi-step-cuda-decode`) uses this to
+    /// give a Tensor Resource's bytes a second, independent identity
+    /// (e.g. promoting a decode step's pending KV write to its committed
+    /// identity) without a D2H+H2D round trip.
+    pub fn clone_buffer(&self, buffer: &CudaDeviceBuffer) -> Result<CudaDeviceBuffer, CudaError> {
+        let slice = self.stream.clone_dtod(&buffer.slice)?;
+        Ok(CudaDeviceBuffer {
+            slice,
+            shape: buffer.shape.clone(),
+        })
+    }
+
     /// `a + b`, element-wise. `b` may either exactly match `a`'s shape, or
     /// -- mirroring `rmsnorm`'s row-broadcast convention -- be a single row
     /// (`b.shape == [cols]` or `[1, cols]` where `cols` is `a`'s last
