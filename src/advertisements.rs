@@ -72,6 +72,7 @@ pub fn cuda_kernel_advertisements(device_id: &DeviceId) -> Vec<KernelAdvertiseme
         baseline_advertisement("silu", OperatorFamily::Activation, device_id),
         baseline_advertisement("add", OperatorFamily::Tensor, device_id),
         baseline_advertisement("mul", OperatorFamily::Tensor, device_id),
+        baseline_advertisement("concat", OperatorFamily::Tensor, device_id),
         baseline_advertisement("residual-add", OperatorFamily::Tensor, device_id),
     ]
 }

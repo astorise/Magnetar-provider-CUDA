@@ -81,6 +81,25 @@ fn add_broadcasts_a_bias_row_matching_reference_cpu() {
     assert_close(&download(&kernels, &actual_dev), &expected);
 }
 
+/// KV-history concatenation's exact contract
+/// (`implement-device-resident-multi-step-cuda-decode`): stacking a
+/// growing historical K/V (`a`) above this step's newly computed K/V
+/// (`b`), both real Device-resident CUDA buffers, matching
+/// `magnetar_provider_cpu::concat`'s output exactly.
+#[test]
+fn concat_matches_reference_cpu() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let a = HostTensor::new([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+    let b = HostTensor::new([1, 3], [7.0, 8.0, 9.0]).unwrap();
+    let expected = magnetar_provider_cpu::concat(&a, &b).unwrap();
+    let actual_dev = kernels
+        .concat(&upload(&kernels, &a), &upload(&kernels, &b))
+        .unwrap();
+    assert_close(&download(&kernels, &actual_dev), &expected);
+}
+
 #[test]
 fn mul_matches_reference_cpu() {
     let Some(kernels) = kernels_or_skip() else {

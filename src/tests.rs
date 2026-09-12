@@ -115,7 +115,7 @@ fn kernel_advertisements_agree_with_availability() {
     if provider.is_available() {
         assert_eq!(
             advertisements.len(),
-            10,
+            11,
             "expected exactly the required-now kernel set this baseline implements"
         );
         let names: std::collections::BTreeSet<_> =
@@ -130,6 +130,7 @@ fn kernel_advertisements_agree_with_availability() {
             "silu",
             "add",
             "mul",
+            "concat",
             "residual-add",
         ] {
             assert!(

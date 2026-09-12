@@ -520,6 +520,11 @@ impl CudaExecutor {
                     let b = get(1)?;
                     self.kernels.mul(a, b).map_err(KernelError::from)?
                 }
+                "concat" => {
+                    let a = get(0)?;
+                    let b = get(1)?;
+                    self.kernels.concat(a, b).map_err(KernelError::from)?
+                }
                 "residual-add" => {
                     let input = get(0)?;
                     let residual = get(1)?;

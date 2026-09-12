@@ -224,6 +224,59 @@ impl CudaKernels {
         self.add(input, residual)
     }
 
+    /// Row-wise concatenation: `a` and `b` must share the same trailing
+    /// dimensions; the result stacks `a`'s rows above `b`'s rows.
+    /// KV-history concatenation's exact contract
+    /// (`implement-device-resident-multi-step-cuda-decode`): `a` is the
+    /// previous steps' historical K/V, `b` is this step's newly computed
+    /// K/V, both already Device-resident -- the whole point of this Kernel
+    /// is that neither ever needs to leave the device to be combined. No
+    /// `.cu` kernel is needed: `out_dev.split_at_mut` produces two
+    /// non-overlapping mutable views into one fresh allocation, and
+    /// `memcpy_dtod` copies each input directly into its own view.
+    pub fn concat(
+        &self,
+        a: &CudaDeviceBuffer,
+        b: &CudaDeviceBuffer,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        let Some((&a_rows, a_rest)) = a.shape.split_first() else {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                "concat expects a to have at least one dimension",
+            ));
+        };
+        let Some((&b_rows, b_rest)) = b.shape.split_first() else {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                "concat expects b to have at least one dimension",
+            ));
+        };
+        if a_rest != b_rest {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!(
+                    "concat expects a and b to share trailing dimensions, got {:?} and {:?}",
+                    a.shape, b.shape
+                ),
+            ));
+        }
+        let mut out_dev = self
+            .stream
+            .alloc_zeros::<f32>(a.slice.len() + b.slice.len())?;
+        {
+            let (mut first, mut second) = out_dev.split_at_mut(a.slice.len());
+            self.stream.memcpy_dtod(&a.slice, &mut first)?;
+            self.stream.memcpy_dtod(&b.slice, &mut second)?;
+        }
+        let mut shape = Vec::with_capacity(a.shape.len());
+        shape.push(a_rows + b_rows);
+        shape.extend_from_slice(a_rest);
+        Ok(CudaDeviceBuffer {
+            slice: out_dev,
+            shape,
+        })
+    }
+
     pub fn silu(&self, input: &CudaDeviceBuffer) -> Result<CudaDeviceBuffer, CudaError> {
         let n = input.slice.len() as u64;
         let mut out_dev = self.stream.alloc_zeros::<f32>(input.slice.len())?;
