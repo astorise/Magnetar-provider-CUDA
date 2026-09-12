@@ -258,7 +258,7 @@ impl CudaExecutor {
         to: TensorResourceId,
         class: MemoryAllocationClass,
         owner: MemoryAllocationOwner,
-    ) -> Result<(), TensorValueAdmissionError> {
+    ) -> Result<MemoryAllocationId, TensorValueAdmissionError> {
         let cloned_buffer = {
             let storage = self.storage.lock().unwrap();
             let buffer = storage.get(from).ok_or_else(|| {
@@ -298,7 +298,7 @@ impl CudaExecutor {
             let _ = memory.release(previous);
         }
         self.storage.lock().unwrap().insert(to, cloned_buffer);
-        Ok(())
+        Ok(allocation.id)
     }
 
     pub fn observations(&self) -> Vec<KernelObservation> {
@@ -978,7 +978,7 @@ impl ProviderExecutionApi for CudaExecutor {
         to: TensorResourceId,
         class: MemoryAllocationClass,
         owner: MemoryAllocationOwner,
-    ) -> Result<(), TensorValueAdmissionError> {
+    ) -> Result<MemoryAllocationId, TensorValueAdmissionError> {
         CudaExecutor::copy_tensor_admitted(self, memory, from, to, class, owner)
     }
 
