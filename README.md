@@ -38,15 +38,23 @@ below for the reasoning):
   `TensorValue::Opaque` (declining host materialization) is never returned.
 - **No Device Memory Pool.** Direct per-buffer allocate/free, no pooling.
 - **No multi-GPU placement, quantization, or flash/paged attention.**
-- **f32, contiguous layout only, for the advertised/planner-selectable Kernel
-  surface.** A separate, directly-callable primitive now exists for real
-  on-device native half-precision (`F16`/`bfloat16`) elementwise `add`/`mul`
-  compute (`CudaKernels::upload_half`/`download_half`/`add_half`/`mul_half`,
-  `enable-native-cuda-half-precision-elementwise-compute`) -- genuine 2-byte
-  device-resident buffers and a real on-device kernel, verified on real
-  hardware against an exact reference conversion model, but not yet
-  advertised through the Kernel Registry and not yet reachable from any
-  production graph, nor extended beyond `add`/`mul`.
+- **f32, contiguous layout only, for the `matmul`/`embedding`/`rmsnorm`/
+  `rope`/`attention`/`softmax`/`silu`/`concat`/`residual-add` Kernels.**
+  `add`/`mul` additionally have a real, on-device native half-precision
+  (`F16`/`bfloat16`) path: genuine 2-byte device-resident buffers and a
+  real on-device kernel (`CudaKernels::upload_half`/`download_half`/
+  `add_half`/`mul_half`), advertised as `add-half`/`mul-half` and
+  selectable through the same Kernel Registry/dispatch contract every
+  other Kernel uses (a `Float16`/`BrainFloat16` `KernelSelectionRequest`
+  selects it in preference to the `f32`-only `add`/`mul`) -- verified on
+  real hardware against an exact reference conversion model, both by
+  calling `CudaKernels` directly and through the full generic dispatch
+  path (`enable-native-cuda-half-precision-elementwise-compute`,
+  `wire-cuda-half-precision-into-kernel-registry-dispatch`). Not yet
+  device-resident between separate Kernel invocations the way `f32`
+  resources are (a half-precision resource round-trips through the host
+  once per invocation), not requested by any production graph, and not
+  extended beyond `add`/`mul`.
 
 **Graceful unavailability**: `CudaProvider::new()` always constructs
 successfully, even with no CUDA driver, no compatible GPU, or a
