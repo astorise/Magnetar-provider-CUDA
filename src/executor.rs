@@ -25,7 +25,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use magnetar_runtime::affinity::{DeviceBinding, ProviderBinding};
-use magnetar_runtime::compute::TensorResourceId;
+use magnetar_runtime::compute::{
+    ComputeDType, DTypeDescriptor, TensorDescriptor, TensorResourceId,
+};
 use magnetar_runtime::device::DeviceId;
 use magnetar_runtime::kernel::{
     KernelAdvertisement, KernelError, KernelInvocation, KernelObservation, KernelObservationKind,
@@ -45,8 +47,25 @@ use magnetar_runtime::scheduler::{
 use magnetar_runtime::{ExecutionPlanId, HostTensor};
 
 use crate::error::CudaError;
-use crate::kernels::{CudaDeviceBuffer, CudaKernels};
+use crate::kernels::{CudaDeviceBuffer, CudaHalfDType, CudaKernels};
 use crate::provider::CUDA_PROVIDER_NAME;
+
+/// Reads which half-precision format an `add-half`/`mul-half` invocation
+/// was selected for from its own declared input dtype -- the Kernel
+/// Registry already only selects this advertisement for a request whose
+/// `dtype_requirements` matched `Float16`/`BrainFloat16`
+/// (`advertisements::half_precision_advertisement`), so this cannot
+/// disagree with what selection already decided; it just recovers which of
+/// the two the caller asked for.
+fn half_dtype_from_descriptor(descriptor: &TensorDescriptor) -> Result<CudaHalfDType, KernelError> {
+    match &descriptor.dtype {
+        DTypeDescriptor::Portable(ComputeDType::Float16) => Ok(CudaHalfDType::Float16),
+        DTypeDescriptor::Portable(ComputeDType::BrainFloat16) => Ok(CudaHalfDType::BrainFloat16),
+        other => Err(KernelError::KernelDTypeUnsupported {
+            dtype: format!("{other:?}"),
+        }),
+    }
+}
 
 pub struct CudaExecutor {
     kernels: CudaKernels,
@@ -596,6 +615,50 @@ impl CudaExecutor {
                     let residual = get(1)?;
                     self.kernels
                         .residual_add(input, residual)
+                        .map_err(KernelError::from)?
+                }
+                "add-half" | "mul-half" => {
+                    // Genuine on-device half-precision compute -- real
+                    // rounding, real `CudaHalfBuffer` bytes -- but the
+                    // *resource* stays stored as `f32` in this table
+                    // between invocations (Phase 3's deliberately narrower
+                    // scope: dispatch/selection through the standard
+                    // contract, not persistent half-precision residency;
+                    // see `enable-native-cuda-half-precision-elementwise-
+                    // compute`'s design.md Risks). A host round trip
+                    // converts each side: this is real, verified compute,
+                    // not a `f32`-labeled no-op, but it is not yet
+                    // device-resident chaining like every other Kernel
+                    // here.
+                    let a = get(0)?;
+                    let b = get(1)?;
+                    let dtype =
+                        half_dtype_from_descriptor(&invocation.inputs[0].resource.descriptor)?;
+                    let a_host = self.kernels.download(a).map_err(KernelError::from)?;
+                    let b_host = self.kernels.download(b).map_err(KernelError::from)?;
+                    let a_half = self
+                        .kernels
+                        .upload_half(&a_host, dtype)
+                        .map_err(KernelError::from)?;
+                    let b_half = self
+                        .kernels
+                        .upload_half(&b_host, dtype)
+                        .map_err(KernelError::from)?;
+                    let result_half = if name == "add-half" {
+                        self.kernels
+                            .add_half(&a_half, &b_half)
+                            .map_err(KernelError::from)?
+                    } else {
+                        self.kernels
+                            .mul_half(&a_half, &b_half)
+                            .map_err(KernelError::from)?
+                    };
+                    let result_host = self
+                        .kernels
+                        .download_half(&result_half)
+                        .map_err(KernelError::from)?;
+                    self.kernels
+                        .upload(&result_host)
                         .map_err(KernelError::from)?
                 }
                 other => {

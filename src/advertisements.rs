@@ -60,6 +60,41 @@ fn baseline_advertisement(
     advertisement
 }
 
+/// An alternative implementation of the same `add`/`mul` Operator as
+/// [`baseline_advertisement`], advertising `Float16`/`BrainFloat16` instead
+/// of `Float32` -- a distinct `KernelId.name` (`"add-half"`/`"mul-half"`)
+/// under the identical `OperatorId`, exactly the same "same Operator,
+/// multiple candidate Kernels" shape this Provider and Reference CPU
+/// already form for every other Operator (`enable-native-cuda-half-
+/// precision-elementwise-compute`'s Phase 3: making
+/// [`crate::kernels::CudaKernels::add_half`]/`mul_half` -- real and
+/// hardware-verified since Phase 2, but previously reachable only by
+/// calling those methods directly -- selectable through the Runtime's
+/// actual Kernel Registry/dispatch contract for the first time).
+fn half_precision_advertisement(
+    base_name: &str,
+    family: OperatorFamily,
+    device_id: &DeviceId,
+) -> KernelAdvertisement {
+    let operator = OperatorId::magnetar(base_name, 1, family);
+    let name = format!("{base_name}-half");
+    let id = cuda_kernel_id(operator, &name);
+    let mut advertisement = KernelAdvertisement::new(id)
+        .with_dtypes(
+            TensorRole::Input,
+            [ComputeDType::Float16, ComputeDType::BrainFloat16],
+        )
+        .with_dtypes(
+            TensorRole::Output,
+            [ComputeDType::Float16, ComputeDType::BrainFloat16],
+        )
+        .with_layouts([TensorLayoutKind::Contiguous])
+        .with_memory_classes([KernelMemoryClass::Device])
+        .with_devices([DeviceBinding::new(device_id.clone())]);
+    advertisement.cancellation = KernelCancellationSupport::TimeoutOnly;
+    advertisement
+}
+
 /// The CUDA Provider's implemented kernel set for one discovered Device.
 pub fn cuda_kernel_advertisements(device_id: &DeviceId) -> Vec<KernelAdvertisement> {
     vec![
@@ -74,5 +109,7 @@ pub fn cuda_kernel_advertisements(device_id: &DeviceId) -> Vec<KernelAdvertiseme
         baseline_advertisement("mul", OperatorFamily::Tensor, device_id),
         baseline_advertisement("concat", OperatorFamily::Tensor, device_id),
         baseline_advertisement("residual-add", OperatorFamily::Tensor, device_id),
+        half_precision_advertisement("add", OperatorFamily::Tensor, device_id),
+        half_precision_advertisement("mul", OperatorFamily::Tensor, device_id),
     ]
 }

@@ -88,6 +88,20 @@ fn descriptor_1d(len: u64) -> TensorDescriptor {
     )
 }
 
+/// A 1D descriptor declaring a non-`Float32` `ComputeDType` -- used only to
+/// select the `add-half`/`mul-half` Kernel Registry candidate
+/// (`enable-native-cuda-half-precision-elementwise-compute` Phase 3):
+/// `dispatch`'s Kernel Selection Request carries this dtype, independent of
+/// what `stage_weight` actually uploaded (always real `f32` host bytes --
+/// `run_invocation`'s `"add-half"`/`"mul-half"` arm converts internally).
+fn descriptor_half(len: u64, dtype: ComputeDType) -> TensorDescriptor {
+    TensorDescriptor::new(
+        ShapeDescriptor::new([len]),
+        DTypeDescriptor::portable(dtype),
+        LayoutDescriptor::Contiguous,
+    )
+}
+
 /// Writes `tensor` Device-resident under `id`, exactly as
 /// `WeightMaterializationTransaction::stage_weight` stages a real Model
 /// Instance's weights -- the "weight ->" half of this chain's name.
@@ -138,6 +152,7 @@ fn dispatch(
         "matmul" => OperatorFamily::LinearAlgebra,
         "rmsnorm" => OperatorFamily::Normalization,
         "rope" => OperatorFamily::PositionEncoding,
+        "add" | "mul" => OperatorFamily::Tensor,
         other => panic!("{step_name}: no OperatorFamily mapping for '{other}'"),
     };
     let operator = OperatorId::magnetar(operator_name, 1, family);
@@ -420,4 +435,104 @@ fn weight_matmul_rmsnorm_rope_projection_chain_runs_device_resident_on_real_hard
         "expected exactly the 4 staged weights/activation plus the 4 chain outputs to be \
          Active after a successful run"
     );
+}
+
+/// `enable-native-cuda-half-precision-elementwise-compute` Phase 3: proves
+/// `add_half`/`mul_half` (real and hardware-verified against an exact
+/// reference model since Phase 2, but previously reachable only by calling
+/// `CudaKernels` methods directly) are now selectable and dispatchable
+/// through the *exact same* generic Kernel Registry/dispatch contract this
+/// file's other tests already prove for the `f32`-only path: a
+/// `KernelSelectionRequest` declaring `Float16`/`BrainFloat16` resources
+/// must cause the Kernel Registry to select the new `add-half`/`mul-half`
+/// advertisement over the existing `f32`-only `add`/`mul` one, and the
+/// resulting dispatch must produce the same bit-exact result Phase 2's
+/// direct-call tests already established.
+#[test]
+fn half_precision_add_and_mul_dispatch_through_the_real_kernel_registry_on_real_hardware() {
+    let Some(mut fixture) = chain_fixture_or_skip() else {
+        return;
+    };
+
+    let a_data = vec![1.0, 2.5, 3.0, -4.25];
+    let b_data = vec![6.0, 0.2, 4.0, 3.0];
+    let a = HostTensor::new([4], a_data.clone()).unwrap();
+    let b = HostTensor::new([4], b_data.clone()).unwrap();
+
+    for (dtype, op_name, op) in [
+        (
+            ComputeDType::Float16,
+            "add",
+            (|x: f32, y: f32| x + y) as fn(f32, f32) -> f32,
+        ),
+        (ComputeDType::Float16, "mul", |x, y| x * y),
+        (ComputeDType::BrainFloat16, "add", |x, y| x + y),
+        (ComputeDType::BrainFloat16, "mul", |x, y| x * y),
+    ] {
+        let a_id = TensorResourceId::new(format!("half-dispatch.{op_name}.{dtype:?}.a"));
+        let b_id = TensorResourceId::new(format!("half-dispatch.{op_name}.{dtype:?}.b"));
+        stage_weight(&mut fixture, &a_id, a.clone());
+        stage_weight(&mut fixture, &b_id, b.clone());
+
+        let output_id = TensorResourceId::new(format!("half-dispatch.{op_name}.{dtype:?}.out"));
+        let output = dispatch(
+            &mut fixture,
+            &format!("{op_name}-half-{dtype:?}"),
+            op_name,
+            vec![
+                (a_id.clone(), descriptor_half(4, dtype)),
+                (b_id.clone(), descriptor_half(4, dtype)),
+            ],
+            output_id.clone(),
+            descriptor_half(4, dtype),
+            BTreeMap::new(),
+        );
+        assert!(
+            matches!(output, TensorValue::Opaque),
+            "{op_name}-half ({dtype:?}): output must stay Device-resident (Opaque)"
+        );
+
+        let actual = fixture
+            .executor
+            .read_tensor(&output_id)
+            .expect("the half-precision result must be downloadable on request");
+
+        let expected = half_reference(&a_data, &b_data, dtype, op);
+        assert_eq!(
+            actual.data, expected,
+            "{op_name}-half ({dtype:?}): dispatched-through-the-registry result must match \
+             the exact reference conversion model, same as Phase 2's direct-call tests"
+        );
+    }
+}
+
+/// Same exact-reference-model technique as `tests_conformance.rs`'s
+/// `half_expected`: the mathematically correct answer for an `op` on
+/// already-half-precision-rounded inputs is
+/// `decode(encode(decode(encode(a)) op decode(encode(b))))`, computed here
+/// via this crate's own `half_precision` module (the same one
+/// `CudaKernels::upload_half`/`download_half` use).
+type HalfEncoder = fn(f32) -> u16;
+type HalfDecoder = fn(u16) -> f32;
+
+fn half_reference(a: &[f32], b: &[f32], dtype: ComputeDType, op: fn(f32, f32) -> f32) -> Vec<f32> {
+    let (encode, decode): (HalfEncoder, HalfDecoder) = match dtype {
+        ComputeDType::Float16 => (
+            crate::half_precision::f32_to_f16,
+            crate::half_precision::f16_to_f32,
+        ),
+        ComputeDType::BrainFloat16 => (
+            crate::half_precision::f32_to_bf16,
+            crate::half_precision::bf16_to_f32,
+        ),
+        other => panic!("half_reference: unsupported dtype {other:?}"),
+    };
+    a.iter()
+        .zip(b)
+        .map(|(&x, &y)| {
+            let x = decode(encode(x));
+            let y = decode(encode(y));
+            decode(encode(op(x, y)))
+        })
+        .collect()
 }

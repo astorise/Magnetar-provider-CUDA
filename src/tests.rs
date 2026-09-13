@@ -115,8 +115,10 @@ fn kernel_advertisements_agree_with_availability() {
     if provider.is_available() {
         assert_eq!(
             advertisements.len(),
-            11,
-            "expected exactly the required-now kernel set this baseline implements"
+            13,
+            "expected exactly the required-now kernel set this baseline implements, plus the \
+             add-half/mul-half native half-precision Kernels \
+             (enable-native-cuda-half-precision-elementwise-compute)"
         );
         let names: std::collections::BTreeSet<_> =
             advertisements.iter().map(|a| a.id.name.as_str()).collect();
@@ -132,6 +134,8 @@ fn kernel_advertisements_agree_with_availability() {
             "mul",
             "concat",
             "residual-add",
+            "add-half",
+            "mul-half",
         ] {
             assert!(
                 names.contains(expected),
