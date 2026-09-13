@@ -309,3 +309,159 @@ extern "C" __global__ void attention_kernel(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Native half-precision (F16/BF16) elementwise compute
+// (`add-native-cuda-half-precision-compute` Phase 2)
+// ---------------------------------------------------------------------------
+//
+// Device-resident buffers hold real 2-byte `unsigned short` bit patterns,
+// not `f32` promoted to 4 bytes -- genuine memory savings and genuine
+// half-precision rounding behavior on-device, not merely a storage-format
+// label. Conversion to/from `float` happens per-element inside the kernel
+// via manual IEEE 754 bit manipulation (the same algorithm as this crate's
+// own `half_precision.rs`, itself ported from `magnetar-runtime`'s
+// exhaustively round-trip-tested original) rather than `cuda_fp16.h`/
+// `cuda_bf16.h`'s `__half`/`nv_bfloat16` types and intrinsics: NVRTC's
+// minimal preprocessor environment (see this file's own header comment)
+// does not reliably expose those headers, and `__int_as_float`/
+// `__float_as_int` are already proven to work here (`neg_inf()` above).
+
+__device__ __forceinline__ float half_bits_to_float(unsigned short bits) {
+    unsigned int sign = ((unsigned int)(bits >> 15)) << 31;
+    unsigned int exponent = (unsigned int)((bits >> 10) & 0x1F);
+    unsigned int mantissa = (unsigned int)(bits & 0x3FF);
+    unsigned int magnitude_bits;
+    if (exponent == 0) {
+        if (mantissa == 0) {
+            magnitude_bits = 0;
+        } else {
+            unsigned int m = mantissa;
+            unsigned int shift = 0;
+            while ((m & 0x400) == 0) {
+                m <<= 1;
+                shift += 1;
+            }
+            m &= 0x3FF;
+            unsigned int f32_exponent = 127 - 15 - shift + 1;
+            magnitude_bits = (f32_exponent << 23) | (m << 13);
+        }
+    } else if (exponent == 0x1F) {
+        magnitude_bits = (0xFFu << 23) | (mantissa << 13);
+    } else {
+        int f32_exponent = (int)exponent - 15 + 127;
+        magnitude_bits = ((unsigned int)f32_exponent << 23) | (mantissa << 13);
+    }
+    return __int_as_float((int)(sign | magnitude_bits));
+}
+
+__device__ __forceinline__ unsigned short float_to_half_bits(float value) {
+    unsigned int bits = (unsigned int)__float_as_int(value);
+    unsigned short sign = (unsigned short)((bits >> 16) & 0x8000);
+    unsigned int mantissa_f32 = bits & 0x007FFFFF;
+    int exp_f32 = (int)((bits >> 23) & 0xFF);
+
+    if (exp_f32 == 0xFF) {
+        if (mantissa_f32 == 0) {
+            return sign | 0x7C00;
+        }
+        unsigned short payload = (unsigned short)(mantissa_f32 >> 13);
+        if (payload == 0) {
+            payload = 1;
+        }
+        return sign | 0x7C00 | payload;
+    }
+
+    int unbiased = exp_f32 - 127;
+
+    if (unbiased > 15) {
+        return sign | 0x7C00;
+    }
+
+    if (unbiased < -14) {
+        unsigned int significand = (exp_f32 == 0) ? mantissa_f32 : (mantissa_f32 | 0x00800000u);
+        if (significand == 0) {
+            return sign;
+        }
+        unsigned int shift = (unsigned int)(-(unbiased + 1));
+        if (shift >= 32) {
+            return sign;
+        }
+        unsigned int half = 1u << (shift - 1);
+        unsigned int mask = (1u << shift) - 1;
+        unsigned int truncated = significand >> shift;
+        unsigned int remainder = significand & mask;
+        unsigned int result = truncated;
+        if (remainder > half || (remainder == half && (result & 1u) == 1u)) {
+            result += 1;
+        }
+        return sign | (unsigned short)result;
+    }
+
+    unsigned int half = 1u << 12;
+    unsigned int mask = (1u << 13) - 1;
+    unsigned int truncated = mantissa_f32 >> 13;
+    unsigned int remainder = mantissa_f32 & mask;
+    unsigned int mantissa10 = truncated;
+    if (remainder > half || (remainder == half && (mantissa10 & 1u) == 1u)) {
+        mantissa10 += 1;
+    }
+    unsigned int exp16 = (unsigned int)(unbiased + 15);
+    if (mantissa10 == 0x400) {
+        unsigned int new_exp = exp16 + 1;
+        if (new_exp >= 0x1F) {
+            return sign | 0x7C00;
+        }
+        return sign | (unsigned short)(new_exp << 10);
+    }
+    return sign | (unsigned short)((exp16 << 10) | mantissa10);
+}
+
+__device__ __forceinline__ float bf16_bits_to_float(unsigned short bits) {
+    return __int_as_float((int)(((unsigned int)bits) << 16));
+}
+
+__device__ __forceinline__ unsigned short float_to_bf16_bits(float value) {
+    unsigned int bits = (unsigned int)__float_as_int(value);
+    unsigned int exp_f32 = (bits >> 23) & 0xFF;
+    unsigned int mantissa_f32 = bits & 0x007FFFFF;
+    if (exp_f32 == 0xFF && mantissa_f32 != 0) {
+        unsigned short sign = (unsigned short)((bits >> 16) & 0x8000);
+        unsigned short mantissa7 = (unsigned short)((bits >> 16) & 0x7F);
+        if (mantissa7 == 0) {
+            mantissa7 = 0x40;
+        }
+        return sign | 0x7F80 | mantissa7;
+    }
+    unsigned int rounding_bias = 0x00007FFFu + ((bits >> 16) & 1u);
+    unsigned int rounded = bits + rounding_bias;
+    return (unsigned short)(rounded >> 16);
+}
+
+extern "C" __global__ void add_f16_kernel(const unsigned short* a, const unsigned short* b, unsigned short* out, unsigned long long n) {
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = float_to_half_bits(half_bits_to_float(a[i]) + half_bits_to_float(b[i]));
+    }
+}
+
+extern "C" __global__ void mul_f16_kernel(const unsigned short* a, const unsigned short* b, unsigned short* out, unsigned long long n) {
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = float_to_half_bits(half_bits_to_float(a[i]) * half_bits_to_float(b[i]));
+    }
+}
+
+extern "C" __global__ void add_bf16_kernel(const unsigned short* a, const unsigned short* b, unsigned short* out, unsigned long long n) {
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = float_to_bf16_bits(bf16_bits_to_float(a[i]) + bf16_bits_to_float(b[i]));
+    }
+}
+
+extern "C" __global__ void mul_bf16_kernel(const unsigned short* a, const unsigned short* b, unsigned short* out, unsigned long long n) {
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = float_to_bf16_bits(bf16_bits_to_float(a[i]) * bf16_bits_to_float(b[i]));
+    }
+}

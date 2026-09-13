@@ -27,8 +27,71 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{CudaError, CudaErrorCode};
+use crate::half_precision;
 
 const KERNEL_SOURCE: &str = include_str!("kernels.cu");
+
+/// Which half-precision format a [`CudaHalfBuffer`] holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CudaHalfDType {
+    Float16,
+    BrainFloat16,
+}
+
+/// A tensor resident in this Provider's device memory as real 2-byte
+/// half-precision bit patterns (`add-native-cuda-half-precision-compute`
+/// Phase 2) -- genuine on-device storage savings and genuine half-precision
+/// rounding behavior for [`CudaKernels::add_half`]/[`CudaKernels::mul_half`],
+/// not `f32` promoted and merely labeled. Deliberately a distinct type from
+/// [`CudaDeviceBuffer`] rather than a variant folded into it: every existing
+/// method on [`CudaDeviceBuffer`] (`matmul`, `rmsnorm`, `rope`,
+/// `attention`, ...) is untouched by this addition, and only the two
+/// methods that genuinely have a half-precision implementation gain one.
+/// Not yet reachable through [`crate::advertisements`] or the generic
+/// Kernel dispatch contract -- wiring an actual compute-dtype selection
+/// into the Runtime's planner is Phase 3, a separate, not-yet-designed
+/// chantier (see `add-native-cuda-half-precision-compute`'s `design.md`).
+pub struct CudaHalfBuffer {
+    slice: CudaSlice<u16>,
+    pub shape: Vec<u64>,
+    pub dtype: CudaHalfDType,
+}
+
+impl CudaHalfBuffer {
+    pub fn len(&self) -> usize {
+        self.slice.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slice.is_empty()
+    }
+}
+
+fn half_kernel_name(op: &str, dtype: CudaHalfDType) -> &'static str {
+    match (op, dtype) {
+        ("add", CudaHalfDType::Float16) => "add_f16_kernel",
+        ("add", CudaHalfDType::BrainFloat16) => "add_bf16_kernel",
+        ("mul", CudaHalfDType::Float16) => "mul_f16_kernel",
+        ("mul", CudaHalfDType::BrainFloat16) => "mul_bf16_kernel",
+        _ => unreachable!("half_kernel_name called with an unknown operator {op:?}"),
+    }
+}
+
+fn same_shape_half(a: &CudaHalfBuffer, b: &CudaHalfBuffer) -> Result<(), CudaError> {
+    if a.shape != b.shape {
+        return Err(CudaError::new(
+            CudaErrorCode::ShapeUnsupported,
+            format!("shape mismatch: {:?} vs {:?}", a.shape, b.shape),
+        ));
+    }
+    if a.dtype != b.dtype {
+        return Err(CudaError::new(
+            CudaErrorCode::ShapeUnsupported,
+            format!("dtype mismatch: {:?} vs {:?}", a.dtype, b.dtype),
+        ));
+    }
+    Ok(())
+}
 
 /// A tensor resident entirely in this Provider's device memory, persisting
 /// across separate Kernel invocations (design.md's "device allocation table
@@ -136,6 +199,104 @@ impl CudaKernels {
         self.stream.synchronize()?;
         self.download_count.fetch_add(1, Ordering::Relaxed);
         HostTensor::new(buffer.shape.clone(), data).map_err(host_error)
+    }
+
+    /// Uploads a host tensor into a fresh device allocation as real
+    /// half-precision bytes, converting each `f32` value on the host via
+    /// this crate's `half_precision::f32_to_f16`/`f32_to_bf16` before the
+    /// upload -- `HostTensor` itself never carries a non-`f32` byte
+    /// (`add-native-cuda-half-precision-compute` design.md's decision not
+    /// to retype the shared Runtime<->Provider transport type).
+    pub fn upload_half(
+        &self,
+        tensor: &HostTensor,
+        dtype: CudaHalfDType,
+    ) -> Result<CudaHalfBuffer, CudaError> {
+        let bits: Vec<u16> = match dtype {
+            CudaHalfDType::Float16 => tensor
+                .data
+                .iter()
+                .map(|&value| half_precision::f32_to_f16(value))
+                .collect(),
+            CudaHalfDType::BrainFloat16 => tensor
+                .data
+                .iter()
+                .map(|&value| half_precision::f32_to_bf16(value))
+                .collect(),
+        };
+        let slice = self.stream.clone_htod(&bits)?;
+        self.upload_count.fetch_add(1, Ordering::Relaxed);
+        Ok(CudaHalfBuffer {
+            slice,
+            shape: tensor.shape.clone(),
+            dtype,
+        })
+    }
+
+    /// Downloads a half-precision device buffer to host-visible `f32`
+    /// bytes, converting each value via this crate's
+    /// `half_precision::f16_to_f32`/`bf16_to_f32` -- the inverse of
+    /// [`Self::upload_half`].
+    pub fn download_half(&self, buffer: &CudaHalfBuffer) -> Result<HostTensor, CudaError> {
+        let bits = self.stream.clone_dtoh(&buffer.slice)?;
+        self.stream.synchronize()?;
+        self.download_count.fetch_add(1, Ordering::Relaxed);
+        let data: Vec<f32> = match buffer.dtype {
+            CudaHalfDType::Float16 => bits
+                .iter()
+                .map(|&b| half_precision::f16_to_f32(b))
+                .collect(),
+            CudaHalfDType::BrainFloat16 => bits
+                .iter()
+                .map(|&b| half_precision::bf16_to_f32(b))
+                .collect(),
+        };
+        HostTensor::new(buffer.shape.clone(), data).map_err(host_error)
+    }
+
+    /// `a + b`, element-wise, computed and stored as real on-device
+    /// half-precision bit patterns (`add-native-cuda-half-precision-
+    /// compute` Phase 2) -- `a` and `b` must share the same shape and
+    /// [`CudaHalfDType`]. Unlike [`Self::add`], no row-broadcast variant
+    /// exists yet; this is a narrowly-scoped first increment, not full
+    /// parity with the `f32` path.
+    pub fn add_half(
+        &self,
+        a: &CudaHalfBuffer,
+        b: &CudaHalfBuffer,
+    ) -> Result<CudaHalfBuffer, CudaError> {
+        same_shape_half(a, b)?;
+        let n = a.slice.len() as u64;
+        let mut out_dev = self.stream.alloc_zeros::<u16>(a.slice.len())?;
+        let func = self.function(half_kernel_name("add", a.dtype))?;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(&a.slice).arg(&b.slice).arg(&mut out_dev).arg(&n);
+        unsafe { args.launch(LaunchConfig::for_num_elems(n as u32)) }?;
+        Ok(CudaHalfBuffer {
+            slice: out_dev,
+            shape: a.shape.clone(),
+            dtype: a.dtype,
+        })
+    }
+
+    /// `a * b`, element-wise. See [`Self::add_half`].
+    pub fn mul_half(
+        &self,
+        a: &CudaHalfBuffer,
+        b: &CudaHalfBuffer,
+    ) -> Result<CudaHalfBuffer, CudaError> {
+        same_shape_half(a, b)?;
+        let n = a.slice.len() as u64;
+        let mut out_dev = self.stream.alloc_zeros::<u16>(a.slice.len())?;
+        let func = self.function(half_kernel_name("mul", a.dtype))?;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(&a.slice).arg(&b.slice).arg(&mut out_dev).arg(&n);
+        unsafe { args.launch(LaunchConfig::for_num_elems(n as u32)) }?;
+        Ok(CudaHalfBuffer {
+            slice: out_dev,
+            shape: a.shape.clone(),
+            dtype: a.dtype,
+        })
     }
 
     /// Duplicates `buffer`'s current bytes into a fresh device allocation

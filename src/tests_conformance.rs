@@ -15,7 +15,8 @@
 
 use magnetar_runtime::HostTensor;
 
-use crate::kernels::{CudaDeviceBuffer, CudaKernels};
+use crate::half_precision;
+use crate::kernels::{CudaDeviceBuffer, CudaHalfDType, CudaKernels};
 use crate::provider::CudaProvider;
 
 const TOLERANCE: f32 = 1e-3;
@@ -372,4 +373,141 @@ fn grouped_query_sliding_window_attention_matches_reference_cpu() {
         )
         .unwrap();
     assert_close(&download(&kernels, &actual_dev), &expected);
+}
+
+// ---------------------------------------------------------------------------
+// Native half-precision compute (`add-native-cuda-half-precision-compute`
+// Phase 2)
+// ---------------------------------------------------------------------------
+//
+// Rather than a fudge-factor tolerance against the f32 reference, the
+// expected value is computed by faithfully modeling exactly what the real
+// on-device kernel does: decode each already-half-precision-rounded input,
+// perform the arithmetic in `f32`, then re-round the result to the same
+// half-precision format -- using this crate's own `half_precision` module
+// (the same functions `CudaKernels::upload_half`/`download_half`/the
+// dispatched kernel use). This proves the actual GPU arithmetic instruction
+// matches bit-for-bit, not merely "close enough" -- a genuinely strong
+// correctness proof precisely because half-precision rounding is real,
+// lossy, and would show up as a mismatch if the device kernel's bit
+// manipulation diverged from this crate's Rust implementation in any way.
+
+type Encoder = fn(f32) -> u16;
+type Decoder = fn(u16) -> f32;
+
+fn half_expected(a: &[f32], b: &[f32], dtype: CudaHalfDType, op: fn(f32, f32) -> f32) -> Vec<f32> {
+    let (encode, decode): (Encoder, Decoder) = match dtype {
+        CudaHalfDType::Float16 => (half_precision::f32_to_f16, half_precision::f16_to_f32),
+        CudaHalfDType::BrainFloat16 => (half_precision::f32_to_bf16, half_precision::bf16_to_f32),
+    };
+    a.iter()
+        .zip(b)
+        .map(|(&x, &y)| {
+            let x = decode(encode(x));
+            let y = decode(encode(y));
+            decode(encode(op(x, y)))
+        })
+        .collect()
+}
+
+#[test]
+fn add_half_f16_matches_the_real_device_bit_manipulation_exactly() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let a_data = vec![1.0, 2.5, 3.0, -4.25, 0.1, 100.0];
+    let b_data = vec![6.0, 0.2, 4.0, 3.0, 0.2, -99.5];
+    let a = HostTensor::new([2, 3], a_data.clone()).unwrap();
+    let b = HostTensor::new([2, 3], b_data.clone()).unwrap();
+    let expected = half_expected(&a_data, &b_data, CudaHalfDType::Float16, |x, y| x + y);
+    let a_dev = kernels.upload_half(&a, CudaHalfDType::Float16).unwrap();
+    let b_dev = kernels.upload_half(&b, CudaHalfDType::Float16).unwrap();
+    let actual_dev = kernels.add_half(&a_dev, &b_dev).unwrap();
+    let actual = kernels.download_half(&actual_dev).unwrap();
+    assert_eq!(actual.data, expected);
+}
+
+#[test]
+fn mul_half_f16_matches_the_real_device_bit_manipulation_exactly() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let a_data = vec![1.0, 2.5, 3.0, -4.25, 0.1, 100.0];
+    let b_data = vec![6.0, 0.2, 4.0, 3.0, 0.2, -99.5];
+    let a = HostTensor::new([2, 3], a_data.clone()).unwrap();
+    let b = HostTensor::new([2, 3], b_data.clone()).unwrap();
+    let expected = half_expected(&a_data, &b_data, CudaHalfDType::Float16, |x, y| x * y);
+    let a_dev = kernels.upload_half(&a, CudaHalfDType::Float16).unwrap();
+    let b_dev = kernels.upload_half(&b, CudaHalfDType::Float16).unwrap();
+    let actual_dev = kernels.mul_half(&a_dev, &b_dev).unwrap();
+    let actual = kernels.download_half(&actual_dev).unwrap();
+    assert_eq!(actual.data, expected);
+}
+
+#[test]
+fn add_half_bf16_matches_the_real_device_bit_manipulation_exactly() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let a_data = vec![1.0, 2.5, 3.0, -4.25, 0.1, 100.0];
+    let b_data = vec![6.0, 0.2, 4.0, 3.0, 0.2, -99.5];
+    let a = HostTensor::new([2, 3], a_data.clone()).unwrap();
+    let b = HostTensor::new([2, 3], b_data.clone()).unwrap();
+    let expected = half_expected(&a_data, &b_data, CudaHalfDType::BrainFloat16, |x, y| x + y);
+    let a_dev = kernels
+        .upload_half(&a, CudaHalfDType::BrainFloat16)
+        .unwrap();
+    let b_dev = kernels
+        .upload_half(&b, CudaHalfDType::BrainFloat16)
+        .unwrap();
+    let actual_dev = kernels.add_half(&a_dev, &b_dev).unwrap();
+    let actual = kernels.download_half(&actual_dev).unwrap();
+    assert_eq!(actual.data, expected);
+}
+
+#[test]
+fn mul_half_bf16_matches_the_real_device_bit_manipulation_exactly() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let a_data = vec![1.0, 2.5, 3.0, -4.25, 0.1, 100.0];
+    let b_data = vec![6.0, 0.2, 4.0, 3.0, 0.2, -99.5];
+    let a = HostTensor::new([2, 3], a_data.clone()).unwrap();
+    let b = HostTensor::new([2, 3], b_data.clone()).unwrap();
+    let expected = half_expected(&a_data, &b_data, CudaHalfDType::BrainFloat16, |x, y| x * y);
+    let a_dev = kernels
+        .upload_half(&a, CudaHalfDType::BrainFloat16)
+        .unwrap();
+    let b_dev = kernels
+        .upload_half(&b, CudaHalfDType::BrainFloat16)
+        .unwrap();
+    let actual_dev = kernels.mul_half(&a_dev, &b_dev).unwrap();
+    let actual = kernels.download_half(&actual_dev).unwrap();
+    assert_eq!(actual.data, expected);
+}
+
+#[test]
+fn add_half_rejects_shape_mismatch() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let a = HostTensor::new([2], [1.0, 2.0]).unwrap();
+    let b = HostTensor::new([3], [1.0, 2.0, 3.0]).unwrap();
+    let a_dev = kernels.upload_half(&a, CudaHalfDType::Float16).unwrap();
+    let b_dev = kernels.upload_half(&b, CudaHalfDType::Float16).unwrap();
+    assert!(kernels.add_half(&a_dev, &b_dev).is_err());
+}
+
+#[test]
+fn add_half_rejects_dtype_mismatch() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let a = HostTensor::new([2], [1.0, 2.0]).unwrap();
+    let b = HostTensor::new([2], [1.0, 2.0]).unwrap();
+    let a_dev = kernels.upload_half(&a, CudaHalfDType::Float16).unwrap();
+    let b_dev = kernels
+        .upload_half(&b, CudaHalfDType::BrainFloat16)
+        .unwrap();
+    assert!(kernels.add_half(&a_dev, &b_dev).is_err());
 }

@@ -12,6 +12,7 @@ pub mod advertisements;
 pub mod device;
 pub mod error;
 pub mod executor;
+mod half_precision;
 pub mod kernels;
 pub mod provider;
 
