@@ -46,10 +46,17 @@ below for the reasoning):
   `ProviderLoader` rejects a second `register_provider` call under an
   already-registered name -- coexist in one `Runtime`, verified against two
   real, physically distinct GPUs
-  (`integration-tests/multi-device-cpu-cuda`). Nothing in this crate itself
-  decides how work should be split across them, moves data between them
-  via real peer-to-peer access (only an explicit host round trip), or
-  ranks placement by per-Device memory feasibility -- that policy layer is
+  (`integration-tests/multi-device-cpu-cuda`). Real peer-to-peer
+  device-to-device movement between two such Devices is now real too:
+  `peer::device_can_access_peer`/`enable_peer_access` (real
+  `cuDeviceCanAccessPeer`/`cuCtxEnablePeerAccess` wrappers -- `cudarc`
+  itself has no safe wrapper for either) and
+  `CudaExecutor::copy_tensor_from_peer_admitted` (a real cross-context
+  `cuMemcpyPeerAsync`, never touching host memory)
+  (`add-real-peer-to-peer-gpu-movement`), verified genuinely executing on
+  the real two-GPU CI node. Nothing in this crate itself decides *when* to
+  use peer copy versus an explicit host round trip, or ranks placement by
+  per-Device memory feasibility -- that policy layer is
   `multi-device-placement`'s own, separate scope.
 - **f32, contiguous layout only, for the `matmul`/`embedding`/`rmsnorm`/
   `rope`/`attention`/`softmax`/`silu`/`concat`/`residual-add` Kernels.**
