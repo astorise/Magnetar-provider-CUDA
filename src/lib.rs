@@ -14,6 +14,7 @@ pub mod error;
 pub mod executor;
 mod half_precision;
 pub mod kernels;
+pub mod peer;
 pub mod provider;
 
 pub use error::{CudaError, CudaErrorCode};

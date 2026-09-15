@@ -331,6 +331,77 @@ impl CudaExecutor {
         Ok(allocation.id)
     }
 
+    /// Copies `peer_id`'s current device allocation from `peer`'s own
+    /// storage directly into this executor's own storage under `id`, via
+    /// a real cross-context CUDA device-to-device copy
+    /// (`CudaKernels::clone_buffer`'s own `CudaStream::memcpy_dtod`, which
+    /// automatically takes the real `cuMemcpyPeerAsync` path whenever
+    /// source and destination belong to different real CUDA contexts --
+    /// see `crate::peer`'s own doc comment) -- never touching host
+    /// memory, genuinely distinct from `write_tensor_value_admitted`'s
+    /// explicit host-staged crossing every other cross-Device movement in
+    /// this repository uses. Callers MUST have already confirmed real
+    /// peer capability via `crate::peer::device_can_access_peer` and
+    /// called `crate::peer::enable_peer_access` between the two Devices
+    /// -- this method does not check or enable peer access itself
+    /// (`multi-device-placement`'s "Peer Capability Is Explicit").
+    pub fn copy_tensor_from_peer_admitted(
+        &self,
+        memory: &mut MemoryManager,
+        peer: &CudaExecutor,
+        peer_id: &TensorResourceId,
+        id: TensorResourceId,
+        class: MemoryAllocationClass,
+        owner: MemoryAllocationOwner,
+    ) -> Result<MemoryAllocationId, TensorValueAdmissionError> {
+        let cloned_buffer = {
+            let peer_storage = peer.storage.lock().unwrap();
+            let buffer = peer_storage.get(peer_id).ok_or_else(|| {
+                TensorValueAdmissionError::Provider(ProviderExecutionError::new(
+                    ProviderExecutionErrorCode::MaterializationFailed,
+                    ProviderExecutionPhase::Submit,
+                    self.provider_binding(),
+                    Some(self.device_binding()),
+                    format!(
+                        "copy_tensor_from_peer_admitted: no existing device allocation for \
+                         '{peer_id}' on the peer Device"
+                    ),
+                ))
+            })?;
+            self.kernels.clone_buffer(buffer).map_err(|error| {
+                TensorValueAdmissionError::Provider(ProviderExecutionError::new(
+                    ProviderExecutionErrorCode::MaterializationFailed,
+                    ProviderExecutionPhase::Submit,
+                    self.provider_binding(),
+                    Some(self.device_binding()),
+                    format!(
+                        "copy_tensor_from_peer_admitted: real peer device-to-device copy \
+                         failed: {error}"
+                    ),
+                ))
+            })?
+        };
+        let byte_size = cloned_buffer.len() as u64 * std::mem::size_of::<f32>() as u64;
+        let allocation = memory
+            .allocate(MemoryAllocationRequest::new(
+                class,
+                byte_size,
+                MemoryPlacement::Device(self.device_binding()),
+                owner,
+            ))
+            .map_err(TensorValueAdmissionError::Memory)?;
+        let previous = self
+            .resource_allocations
+            .lock()
+            .unwrap()
+            .insert(id.clone(), allocation.id);
+        if let Some(previous) = previous {
+            let _ = memory.release(previous);
+        }
+        self.storage.lock().unwrap().insert(id, cloned_buffer);
+        Ok(allocation.id)
+    }
+
     pub fn observations(&self) -> Vec<KernelObservation> {
         self.observations.lock().unwrap().clone()
     }

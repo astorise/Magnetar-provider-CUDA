@@ -205,6 +205,19 @@ impl CudaProvider {
         self.context.clone()
     }
 
+    /// This Provider's own concrete `CudaExecutor`, if a compatible
+    /// driver/device was found and its Kernels compiled successfully.
+    /// [`Self::execution_api`] returns the same value type-erased behind
+    /// `Arc<dyn ProviderExecutionApi>`; this accessor exists for callers
+    /// that specifically need `CudaExecutor`'s own, non-trait methods
+    /// (e.g. [`CudaExecutor::copy_tensor_from_peer_admitted`], a real
+    /// cross-GPU peer copy no generic `ProviderExecutionApi` method
+    /// exposes -- `add-real-peer-to-peer-gpu-movement`), mirroring
+    /// `providers/cpu`'s own `ReferenceCpuProvider::executor()`.
+    pub fn executor(&self) -> Option<Arc<CudaExecutor>> {
+        self.executor.clone()
+    }
+
     /// Test-only: builds a `CudaProvider` with a real, discovered Device
     /// but no Kernel executor, simulating the "Device found, this
     /// Provider's own Kernels failed to compile/load" case without
