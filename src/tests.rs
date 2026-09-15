@@ -184,18 +184,31 @@ fn for_device_zero_matches_new_exactly() {
 /// module doc establishes for ordinal 0.
 #[test]
 fn for_device_one_reports_against_the_real_device_count() {
-    let real_device_count = match cudarc::driver::CudaContext::device_count() {
-        Ok(count) => count,
-        Err(_) => {
-            // No CUDA driver at all -- for_device(1, ..) must still
-            // construct successfully and report unavailable, exactly like
-            // ordinal 0 does with no driver.
-            let second = CudaProvider::for_device(1, "magnetar:provider/cuda:1");
-            assert!(!second.is_available());
-            assert_eq!(second.health(), ProviderHealth::Unavailable);
-            return;
-        }
-    };
+    // `cudarc::driver::CudaContext::device_count()` does not merely return
+    // an `Err` when the CUDA shared library is completely absent (not just
+    // an incompatible version) -- it panics, the exact same real behavior
+    // `provider.rs`'s own `discover_device_catching_missing_library_panic`
+    // exists to catch for `CudaProvider::new()`/`for_device` themselves
+    // (confirmed the hard way: this test's first version called
+    // `device_count()` unguarded and crashed outright on CI's genuinely
+    // CUDA-library-less `provider-integration`/`submodule-integration`
+    // runners, `cudarc-0.19.9/src/lib.rs:200`'s
+    // `Unable to dynamically load the "cuda" shared library` panic). This
+    // call needs the identical `catch_unwind` guard for the exact same
+    // reason.
+    let real_device_count =
+        match std::panic::catch_unwind(cudarc::driver::CudaContext::device_count) {
+            Ok(Ok(count)) => count,
+            Ok(Err(_)) | Err(_) => {
+                // No CUDA driver at all (or a version mismatch) -- for_device(1, ..)
+                // must still construct successfully and report unavailable,
+                // exactly like ordinal 0 does with no driver.
+                let second = CudaProvider::for_device(1, "magnetar:provider/cuda:1");
+                assert!(!second.is_available());
+                assert_eq!(second.health(), ProviderHealth::Unavailable);
+                return;
+            }
+        };
     let second_name = "magnetar:provider/cuda:1";
     let second = CudaProvider::for_device(1, second_name);
     assert_eq!(second.metadata().name, second_name);
