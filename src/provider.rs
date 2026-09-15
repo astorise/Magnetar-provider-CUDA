@@ -49,14 +49,22 @@ use crate::device::cuda_device_descriptor;
 use crate::executor::CudaExecutor;
 use crate::kernels::CudaKernels;
 
-/// Stable, package-qualified CUDA Provider identity.
+/// Stable, package-qualified CUDA Provider identity -- the default identity
+/// [`CudaProvider::new`] (device ordinal 0) registers under. A second real
+/// GPU (`CudaProvider::for_device`) registers under its own distinct name;
+/// see that constructor's own doc comment for why one name cannot serve
+/// both.
 pub const CUDA_PROVIDER_NAME: &str = "magnetar:provider/cuda";
 pub const CUDA_PROVIDER_VERSION: &str = "0.1.0";
 pub const CUDA_PROVIDER_VENDOR: &str = "magnetar";
 
 pub fn cuda_provider_metadata() -> ProviderMetadata {
+    cuda_provider_metadata_for(CUDA_PROVIDER_NAME)
+}
+
+fn cuda_provider_metadata_for(provider_name: &str) -> ProviderMetadata {
     ProviderMetadata::new(
-        CUDA_PROVIDER_NAME,
+        provider_name,
         CUDA_PROVIDER_VERSION,
         CUDA_PROVIDER_VENDOR,
         "Optimized, GPU-executing Provider built on the CUDA driver API",
@@ -90,22 +98,48 @@ pub struct CudaProvider {
 
 impl CudaProvider {
     pub fn new() -> Self {
-        match Self::discover_primary_device_catching_missing_library_panic() {
+        Self::for_device(0, CUDA_PROVIDER_NAME)
+    }
+
+    /// Builds a `CudaProvider` bound to a specific real GPU ordinal,
+    /// registering under `provider_name` rather than the default
+    /// [`CUDA_PROVIDER_NAME`] -- required for a second real GPU
+    /// (`add-real-second-gpu-cuda-provider`): `Runtime`'s `ProviderLoader`
+    /// rejects a second `register_provider` call under an
+    /// already-registered name outright (`ProviderError::
+    /// ProviderAlreadyRegistered`), so two `CudaProvider`s bound to two
+    /// different real Devices in the same Runtime must carry two distinct
+    /// names. `CudaProvider::new()` is exactly `for_device(0,
+    /// CUDA_PROVIDER_NAME)` -- this constructor changes nothing about
+    /// ordinal-0 behavior, it only adds the ability to ask for a different
+    /// ordinal under a different name.
+    ///
+    /// Gracefully unavailable, exactly like `new()`, when `ordinal` has no
+    /// real device behind it (including a genuinely single-GPU machine
+    /// asked for ordinal 1) -- never a construction error or panic.
+    pub fn for_device(ordinal: usize, provider_name: impl Into<String>) -> Self {
+        let provider_name = provider_name.into();
+        match Self::discover_device_catching_missing_library_panic(ordinal, &provider_name) {
             Ok((context, device)) => {
                 let device = Arc::new(device);
+                let provider_name_for_executor = provider_name.clone();
                 let executor =
                     Self::compile_kernels_catching_missing_library_panic(&context).map(|kernels| {
-                        Arc::new(CudaExecutor::new(kernels, device.metadata.id.clone()))
+                        Arc::new(CudaExecutor::new(
+                            kernels,
+                            device.metadata.id.clone(),
+                            provider_name_for_executor,
+                        ))
                     });
                 Self {
-                    metadata: cuda_provider_metadata(),
+                    metadata: cuda_provider_metadata_for(&provider_name),
                     context: Some(context),
                     device: Some(device),
                     executor,
                 }
             }
             Err(_reason) => Self {
-                metadata: cuda_provider_metadata(),
+                metadata: cuda_provider_metadata_for(&provider_name),
                 context: None,
                 device: None,
                 executor: None,
@@ -113,30 +147,35 @@ impl CudaProvider {
         }
     }
 
-    /// [`Self::discover_primary_device`], but also converts a
+    /// [`Self::discover_device`], but also converts a
     /// `cudarc::panic_no_lib_found` panic (the shared library is completely
     /// absent, not merely an incompatible version -- see this module's doc
     /// comment) into the same `Err` outcome the caller already handles.
-    fn discover_primary_device_catching_missing_library_panic()
-    -> Result<(Arc<CudaContext>, DeviceDescriptor), DriverError> {
-        match std::panic::catch_unwind(Self::discover_primary_device) {
+    fn discover_device_catching_missing_library_panic(
+        ordinal: usize,
+        provider_name: &str,
+    ) -> Result<(Arc<CudaContext>, DeviceDescriptor), DriverError> {
+        match std::panic::catch_unwind(|| Self::discover_device(ordinal, provider_name)) {
             Ok(result) => result,
             Err(_panic) => Err(DriverError(CUresult::CUDA_ERROR_NO_DEVICE)),
         }
     }
 
-    /// Attempts to load the CUDA driver and bind device ordinal 0. May
+    /// Attempts to load the CUDA driver and bind device `ordinal`. May
     /// panic via `cudarc` if the driver shared library is completely
     /// absent -- callers must go through
-    /// [`Self::discover_primary_device_catching_missing_library_panic`],
-    /// never this directly.
-    fn discover_primary_device() -> Result<(Arc<CudaContext>, DeviceDescriptor), DriverError> {
+    /// [`Self::discover_device_catching_missing_library_panic`], never this
+    /// directly.
+    fn discover_device(
+        ordinal: usize,
+        provider_name: &str,
+    ) -> Result<(Arc<CudaContext>, DeviceDescriptor), DriverError> {
         let device_count = CudaContext::device_count()?;
-        if device_count <= 0 {
+        if ordinal >= device_count.max(0) as usize {
             return Err(DriverError(CUresult::CUDA_ERROR_NO_DEVICE));
         }
-        let context = CudaContext::new(0)?;
-        let device = cuda_device_descriptor(&context)?;
+        let context = CudaContext::new(ordinal)?;
+        let device = cuda_device_descriptor(&context, provider_name)?;
         Ok((context, device))
     }
 
@@ -231,7 +270,7 @@ impl Provider for CudaProvider {
 
     fn kernel_advertisements(&self) -> Vec<KernelAdvertisement> {
         match &self.device {
-            Some(device) => cuda_kernel_advertisements(&device.metadata.id),
+            Some(device) => cuda_kernel_advertisements(&device.metadata.id, &self.metadata.name),
             // No Device discovered means no Kernel can execute anywhere;
             // advertising kernels bound to no real Device would be a false
             // claim of availability.

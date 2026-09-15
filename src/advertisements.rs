@@ -20,14 +20,12 @@ use magnetar_runtime::kernel::{
 };
 use magnetar_runtime::operator::{OperatorFamily, OperatorId, TensorLayoutKind, TensorRole};
 
-use crate::provider::CUDA_PROVIDER_NAME;
-
 pub const CUDA_KERNEL_FAMILY: KernelImplementationFamily = KernelImplementationFamily::Cuda;
 pub const CUDA_CONFORMANCE_PROFILE: &str = "cuda-conformance-v1";
 
-fn cuda_kernel_id(operator: OperatorId, name: &str) -> KernelId {
+fn cuda_kernel_id(operator: OperatorId, name: &str, provider_name: &str) -> KernelId {
     KernelId::new(
-        ProviderBinding::new(CUDA_PROVIDER_NAME),
+        ProviderBinding::new(provider_name),
         name,
         CapabilityVersion::new(1, 0, 0),
         operator,
@@ -41,9 +39,10 @@ fn baseline_advertisement(
     name: &str,
     family: OperatorFamily,
     device_id: &DeviceId,
+    provider_name: &str,
 ) -> KernelAdvertisement {
     let operator = OperatorId::magnetar(name, 1, family);
-    let id = cuda_kernel_id(operator, name);
+    let id = cuda_kernel_id(operator, name, provider_name);
     let mut advertisement = KernelAdvertisement::new(id)
         .with_dtypes(TensorRole::Input, [ComputeDType::Float32])
         .with_dtypes(TensorRole::Output, [ComputeDType::Float32])
@@ -75,10 +74,11 @@ fn half_precision_advertisement(
     base_name: &str,
     family: OperatorFamily,
     device_id: &DeviceId,
+    provider_name: &str,
 ) -> KernelAdvertisement {
     let operator = OperatorId::magnetar(base_name, 1, family);
     let name = format!("{base_name}-half");
-    let id = cuda_kernel_id(operator, &name);
+    let id = cuda_kernel_id(operator, &name, provider_name);
     let mut advertisement = KernelAdvertisement::new(id)
         .with_dtypes(
             TensorRole::Input,
@@ -96,20 +96,63 @@ fn half_precision_advertisement(
 }
 
 /// The CUDA Provider's implemented kernel set for one discovered Device.
-pub fn cuda_kernel_advertisements(device_id: &DeviceId) -> Vec<KernelAdvertisement> {
+///
+/// `provider_name` is a real parameter (see `device::cuda_device_descriptor`'s
+/// own doc comment): a second `CudaProvider` bound to a different real GPU
+/// ordinal advertises its Kernels under its own distinct Provider name, not
+/// the default `provider::CUDA_PROVIDER_NAME`.
+pub fn cuda_kernel_advertisements(
+    device_id: &DeviceId,
+    provider_name: &str,
+) -> Vec<KernelAdvertisement> {
     vec![
-        baseline_advertisement("matmul", OperatorFamily::LinearAlgebra, device_id),
-        baseline_advertisement("embedding", OperatorFamily::Tensor, device_id),
-        baseline_advertisement("rmsnorm", OperatorFamily::Normalization, device_id),
-        baseline_advertisement("rope", OperatorFamily::PositionEncoding, device_id),
-        baseline_advertisement("attention", OperatorFamily::Attention, device_id),
-        baseline_advertisement("softmax", OperatorFamily::Activation, device_id),
-        baseline_advertisement("silu", OperatorFamily::Activation, device_id),
-        baseline_advertisement("add", OperatorFamily::Tensor, device_id),
-        baseline_advertisement("mul", OperatorFamily::Tensor, device_id),
-        baseline_advertisement("concat", OperatorFamily::Tensor, device_id),
-        baseline_advertisement("residual-add", OperatorFamily::Tensor, device_id),
-        half_precision_advertisement("add", OperatorFamily::Tensor, device_id),
-        half_precision_advertisement("mul", OperatorFamily::Tensor, device_id),
+        baseline_advertisement(
+            "matmul",
+            OperatorFamily::LinearAlgebra,
+            device_id,
+            provider_name,
+        ),
+        baseline_advertisement(
+            "embedding",
+            OperatorFamily::Tensor,
+            device_id,
+            provider_name,
+        ),
+        baseline_advertisement(
+            "rmsnorm",
+            OperatorFamily::Normalization,
+            device_id,
+            provider_name,
+        ),
+        baseline_advertisement(
+            "rope",
+            OperatorFamily::PositionEncoding,
+            device_id,
+            provider_name,
+        ),
+        baseline_advertisement(
+            "attention",
+            OperatorFamily::Attention,
+            device_id,
+            provider_name,
+        ),
+        baseline_advertisement(
+            "softmax",
+            OperatorFamily::Activation,
+            device_id,
+            provider_name,
+        ),
+        baseline_advertisement("silu", OperatorFamily::Activation, device_id, provider_name),
+        baseline_advertisement("add", OperatorFamily::Tensor, device_id, provider_name),
+        baseline_advertisement("mul", OperatorFamily::Tensor, device_id, provider_name),
+        baseline_advertisement("concat", OperatorFamily::Tensor, device_id, provider_name),
+        baseline_advertisement(
+            "residual-add",
+            OperatorFamily::Tensor,
+            device_id,
+            provider_name,
+        ),
+        half_precision_advertisement("add", OperatorFamily::Tensor, device_id, provider_name),
+        half_precision_advertisement("mul", OperatorFamily::Tensor, device_id, provider_name),
     ]
 }

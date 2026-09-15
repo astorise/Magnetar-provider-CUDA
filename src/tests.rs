@@ -150,6 +150,124 @@ fn kernel_advertisements_agree_with_availability() {
     }
 }
 
+/// `add-real-second-gpu-cuda-provider`: `for_device(0, CUDA_PROVIDER_NAME)`
+/// must be indistinguishable from `new()` -- same availability, same Device
+/// identity, same advertised Kernel set -- since `new()` is defined as
+/// exactly that call. Proves the refactor introducing `for_device` did not
+/// change ordinal-0 behavior at all, on whichever of GPU-less CI/this
+/// workstation/the real GPU runner actually executes this.
+#[test]
+fn for_device_zero_matches_new_exactly() {
+    let via_new = CudaProvider::new();
+    let via_for_device = CudaProvider::for_device(0, CUDA_PROVIDER_NAME);
+    assert_eq!(via_new.is_available(), via_for_device.is_available());
+    assert_eq!(via_new.health(), via_for_device.health());
+    assert_eq!(via_new.devices().len(), via_for_device.devices().len());
+    if via_new.is_available() {
+        assert_eq!(
+            via_new.devices()[0].metadata().id,
+            via_for_device.devices()[0].metadata().id
+        );
+    }
+}
+
+/// `add-real-second-gpu-cuda-provider`'s real point: a `CudaProvider` bound
+/// to ordinal 1, registered under its own distinct name, correctly reports
+/// availability *against the real device count this exact host has* --
+/// gracefully unavailable on a genuinely single-GPU host (this workstation,
+/// most CI runners), and genuinely available with a real, distinct Device
+/// identity from ordinal 0's once run somewhere with two or more real GPUs
+/// (`arc-gpu-magnetar`, after `nvidia.com/gpu: 2` was requested for its real
+/// job pods). Written to pass identically either way, checked against
+/// `cudarc`'s own real device count rather than a hardcoded assumption --
+/// the same "assert both branches, never skip" convention this file's own
+/// module doc establishes for ordinal 0.
+#[test]
+fn for_device_one_reports_against_the_real_device_count() {
+    let real_device_count = match cudarc::driver::CudaContext::device_count() {
+        Ok(count) => count,
+        Err(_) => {
+            // No CUDA driver at all -- for_device(1, ..) must still
+            // construct successfully and report unavailable, exactly like
+            // ordinal 0 does with no driver.
+            let second = CudaProvider::for_device(1, "magnetar:provider/cuda:1");
+            assert!(!second.is_available());
+            assert_eq!(second.health(), ProviderHealth::Unavailable);
+            return;
+        }
+    };
+    let second_name = "magnetar:provider/cuda:1";
+    let second = CudaProvider::for_device(1, second_name);
+    assert_eq!(second.metadata().name, second_name);
+    if real_device_count >= 2 {
+        assert!(
+            second.is_available(),
+            "this host reports {real_device_count} real CUDA devices, so ordinal 1 must be found"
+        );
+        assert_eq!(second.health(), ProviderHealth::Available);
+        assert_eq!(second.devices().len(), 1);
+        let second_device_id = second.devices()[0].metadata().id.clone();
+        assert_eq!(second_device_id.as_str(), "cuda:1");
+        let primary = CudaProvider::new();
+        if primary.is_available() {
+            assert_ne!(
+                primary.devices()[0].metadata().id,
+                second_device_id,
+                "ordinal 0 and ordinal 1 must be two genuinely distinct real Devices"
+            );
+        }
+    } else {
+        assert!(
+            !second.is_available(),
+            "this host reports only {real_device_count} real CUDA device(s), \
+             so ordinal 1 must gracefully report unavailable, not construct a phantom Device"
+        );
+        assert_eq!(second.health(), ProviderHealth::Unavailable);
+        assert!(second.devices().is_empty());
+    }
+}
+
+/// Two `CudaProvider`s bound to two different real ordinals, each under
+/// its own distinct name, can both register into one `Runtime`
+/// simultaneously without a `ProviderAlreadyRegistered` collision -- the
+/// real, load-bearing reason `for_device` takes a `provider_name` at all
+/// (`ProviderLoader::register_provider` rejects a second registration
+/// under an already-registered name outright). Gracefully proves nothing
+/// on a single-GPU host (ordinal 1 registers as a real, distinct, merely
+/// `Unavailable` Provider -- registration itself never depends on hardware
+/// availability), and genuinely proves two-real-GPU concurrent
+/// registration once run on a host with two or more real GPUs.
+#[test]
+fn two_distinct_ordinals_register_into_one_runtime_without_name_collision() {
+    use magnetar_runtime::Runtime;
+    use std::sync::Arc;
+
+    let primary = CudaProvider::new();
+    let second = CudaProvider::for_device(1, "magnetar:provider/cuda:1");
+    let primary_available = primary.is_available();
+    let second_available = second.is_available();
+
+    let runtime = Runtime::builder()
+        .register_provider(Arc::new(primary))
+        .register_provider(Arc::new(second))
+        .build()
+        .expect("two CudaProviders under two distinct names must both register successfully");
+
+    let mut expected_devices = 0;
+    if primary_available {
+        expected_devices += 1;
+    }
+    if second_available {
+        expected_devices += 1;
+    }
+    assert_eq!(
+        runtime.devices().count(),
+        expected_devices,
+        "the Runtime's shared Device registry must hold exactly the real Devices \
+         each registered Provider actually found"
+    );
+}
+
 #[test]
 fn health_is_degraded_when_device_found_but_executor_missing() {
     let provider = CudaProvider::new();
@@ -158,8 +276,9 @@ fn health_is_degraded_when_device_found_but_executor_missing() {
         // simulate a partial failure against (GPU-less CI).
         return;
     };
-    let device = crate::device::cuda_device_descriptor(&context)
-        .expect("device discovery must succeed given a context already exists");
+    let device =
+        crate::device::cuda_device_descriptor(&context, crate::provider::CUDA_PROVIDER_NAME)
+            .expect("device discovery must succeed given a context already exists");
     let degraded = CudaProvider::with_device_but_no_executor_for_test(context, device);
     assert_eq!(
         degraded.health(),

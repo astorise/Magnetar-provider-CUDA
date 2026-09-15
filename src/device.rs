@@ -18,8 +18,6 @@ use magnetar_runtime::kernel::KernelMemoryClass;
 use magnetar_runtime::operator::TensorLayoutKind;
 use std::sync::Arc;
 
-use crate::provider::CUDA_PROVIDER_NAME;
-
 /// Builds this Runtime's stable identifier for the CUDA device at `ordinal`.
 pub fn cuda_device_id(ordinal: usize) -> DeviceId {
     DeviceId::new(format!("cuda:{ordinal}"))
@@ -29,7 +27,20 @@ pub fn cuda_device_id(ordinal: usize) -> DeviceId {
 /// CUDA device. Contiguous-f32-only for this baseline (`operator-scope`'s
 /// Initial DType/Layout Scope), matching what `cuda-provider`'s spec commits
 /// to.
-pub fn cuda_device_descriptor(ctx: &Arc<CudaContext>) -> Result<DeviceDescriptor, DriverError> {
+///
+/// `provider_name` is a real parameter, not always
+/// `provider::CUDA_PROVIDER_NAME`: a second `CudaProvider` instance bound to
+/// a different real GPU ordinal (`add-real-second-gpu-cuda-provider`) must
+/// register under its own distinct Provider name -- `ProviderLoader`
+/// rejects a second `register_provider` call under an already-registered
+/// name outright -- and every Device this function builds must carry
+/// exactly the Provider name that actually registered it
+/// (`ProviderRegistry::register_devices`'s own
+/// `metadata.provider == provider` consistency check).
+pub fn cuda_device_descriptor(
+    ctx: &Arc<CudaContext>,
+    provider_name: &str,
+) -> Result<DeviceDescriptor, DriverError> {
     let name = ctx.name()?;
     let (major, minor) = ctx.compute_capability()?;
     let total_mem = ctx.total_mem()? as u64;
@@ -46,7 +57,7 @@ pub fn cuda_device_descriptor(ctx: &Arc<CudaContext>) -> Result<DeviceDescriptor
         cuda_device_id(ctx.ordinal()),
         name,
         DeviceType::Gpu,
-        CUDA_PROVIDER_NAME,
+        provider_name,
     );
     metadata.vendor = "NVIDIA".into();
     metadata.architecture = format!("sm_{major}{minor}");

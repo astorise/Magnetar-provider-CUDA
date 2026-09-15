@@ -48,7 +48,6 @@ use magnetar_runtime::{ExecutionPlanId, HostTensor};
 
 use crate::error::CudaError;
 use crate::kernels::{CudaDeviceBuffer, CudaHalfDType, CudaKernels};
-use crate::provider::CUDA_PROVIDER_NAME;
 
 /// Reads which half-precision format an `add-half`/`mul-half` invocation
 /// was selected for from its own declared input dtype -- the Kernel
@@ -70,6 +69,13 @@ fn half_dtype_from_descriptor(descriptor: &TensorDescriptor) -> Result<CudaHalfD
 pub struct CudaExecutor {
     kernels: CudaKernels,
     device_id: DeviceId,
+    /// This executor's own Provider name -- not always
+    /// `provider::CUDA_PROVIDER_NAME`: a second `CudaProvider` instance
+    /// bound to a different real GPU ordinal registers under its own
+    /// distinct name (`add-real-second-gpu-cuda-provider`), and every
+    /// binding/execution-id this executor produces must carry exactly that
+    /// name, matching what actually registered its Device.
+    provider_name: String,
     storage: Mutex<BTreeMap<TensorResourceId, CudaDeviceBuffer>>,
     observations: Mutex<Vec<KernelObservation>>,
     submitted: Mutex<BTreeMap<ProviderExecutionId, ProviderExecutionRequest>>,
@@ -79,10 +85,15 @@ pub struct CudaExecutor {
 }
 
 impl CudaExecutor {
-    pub fn new(kernels: CudaKernels, device_id: DeviceId) -> Self {
+    pub fn new(
+        kernels: CudaKernels,
+        device_id: DeviceId,
+        provider_name: impl Into<String>,
+    ) -> Self {
         Self {
             kernels,
             device_id,
+            provider_name: provider_name.into(),
             storage: Mutex::new(BTreeMap::new()),
             observations: Mutex::new(Vec::new()),
             submitted: Mutex::new(BTreeMap::new()),
@@ -93,7 +104,7 @@ impl CudaExecutor {
     }
 
     fn provider_binding(&self) -> ProviderBinding {
-        ProviderBinding::new(CUDA_PROVIDER_NAME)
+        ProviderBinding::new(self.provider_name.as_str())
     }
 
     fn device_binding(&self) -> DeviceBinding {
@@ -330,7 +341,7 @@ impl CudaExecutor {
 
     fn next_provider_execution_id(&self, label: &str) -> ProviderExecutionId {
         let ordinal = self.next_execution_ordinal.fetch_add(1, Ordering::Relaxed);
-        ProviderExecutionId::new(format!("{CUDA_PROVIDER_NAME}:{label}:{ordinal}"))
+        ProviderExecutionId::new(format!("{}:{label}:{ordinal}", self.provider_name))
     }
 
     fn input_resource_id(
@@ -1062,7 +1073,11 @@ mod tests {
         let kernels = CudaKernels::compile_and_load(&context).expect(
             "kernel compilation must succeed on a machine that already passed device discovery",
         );
-        Some(CudaExecutor::new(kernels, DeviceId::new("test-device")))
+        Some(CudaExecutor::new(
+            kernels,
+            DeviceId::new("test-device"),
+            crate::provider::CUDA_PROVIDER_NAME,
+        ))
     }
 
     #[test]
