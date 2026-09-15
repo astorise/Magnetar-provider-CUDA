@@ -37,7 +37,20 @@ below for the reasoning):
   through host memory rather than chaining device-resident results, and
   `TensorValue::Opaque` (declining host materialization) is never returned.
 - **No Device Memory Pool.** Direct per-buffer allocate/free, no pooling.
-- **No multi-GPU placement, quantization, or flash/paged attention.**
+- **No quantization or flash/paged attention.**
+- **Binding to a specific real GPU ordinal is real, Runtime-level
+  multi-GPU placement policy is not.** `CudaProvider::for_device(ordinal,
+  provider_name)` (`add-real-second-gpu-cuda-provider`) lets more than one
+  `CudaProvider` instance -- each bound to a different real GPU ordinal
+  under its own distinct Provider name, required because `Runtime`'s
+  `ProviderLoader` rejects a second `register_provider` call under an
+  already-registered name -- coexist in one `Runtime`, verified against two
+  real, physically distinct GPUs
+  (`integration-tests/multi-device-cpu-cuda`). Nothing in this crate itself
+  decides how work should be split across them, moves data between them
+  via real peer-to-peer access (only an explicit host round trip), or
+  ranks placement by per-Device memory feasibility -- that policy layer is
+  `multi-device-placement`'s own, separate scope.
 - **f32, contiguous layout only, for the `matmul`/`embedding`/`rmsnorm`/
   `rope`/`attention`/`softmax`/`silu`/`concat`/`residual-add` Kernels.**
   `add`/`mul` additionally have a real, on-device native half-precision
