@@ -564,14 +564,16 @@ impl CudaExecutor {
                 "embedding" => {
                     let table = get(0)?;
                     let ids = get(1)?;
+                    let ids_values = self.kernels.download(ids).ok();
                     eprintln!(
                         "DEBUG embedding dispatch: table_resource={:?} table_shape={:?} \
-                         ids_resource={:?} ids_shape={:?} ids_len={}",
+                         ids_resource={:?} ids_shape={:?} ids_len={} ids_values={:?}",
                         Self::input_resource_id(invocation, 0),
                         table.shape,
                         Self::input_resource_id(invocation, 1),
                         ids.shape,
-                        ids.slice.len()
+                        ids.slice.len(),
+                        ids_values.map(|tensor| tensor.data)
                     );
                     self.kernels
                         .embedding_lookup(table, ids)
