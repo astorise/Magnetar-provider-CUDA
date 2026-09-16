@@ -564,6 +564,15 @@ impl CudaExecutor {
                 "embedding" => {
                     let table = get(0)?;
                     let ids = get(1)?;
+                    eprintln!(
+                        "DEBUG embedding dispatch: table_resource={:?} table_shape={:?} \
+                         ids_resource={:?} ids_shape={:?} ids_len={}",
+                        Self::input_resource_id(invocation, 0),
+                        table.shape,
+                        Self::input_resource_id(invocation, 1),
+                        ids.shape,
+                        ids.slice.len()
+                    );
                     self.kernels
                         .embedding_lookup(table, ids)
                         .map_err(KernelError::from)?
