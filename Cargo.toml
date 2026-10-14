@@ -4,19 +4,18 @@
 name = "magnetar-provider-cuda"
 version = "0.1.0"
 edition = "2024"
-# Never published to crates.io independently -- this crate is only
-# buildable from within a checkout of the parent Magnetar repository (see
-# the path dependency comment below). Also lets this crate's own
-# `deny.toml` exempt it from cargo-deny's license-field requirement without
-# asserting a license for it here.
-publish = false
+license = "MIT"
+description = "NVIDIA CUDA Provider for the Magnetar inference runtime."
+repository = "https://github.com/astorise/Magnetar-provider-CUDA"
+readme = "README.md"
+keywords = ["ai", "inference", "magnetar"]
+categories = ["science", "hardware-support"]
+rust-version = "1.98"
 
 [dependencies]
-# Path dependency, not a published crate: same submodule-only constraint as
-# providers/cpu/Cargo.toml -- this crate is only buildable from within a
-# checkout of the parent Magnetar repository with this submodule checked out
-# at `providers/cuda`.
-magnetar-runtime = { path = "../../magnetar-runtime" }
+# `path` resolves inside a checkout of the parent Magnetar repository;
+# `version` is what `cargo publish` records for crates.io consumers.
+magnetar-runtime = { version = "0.1.0", path = "../../magnetar-runtime" }
 # `dynamic-loading` dlopens libcuda/libnvrtc at runtime instead of linking
 # against them at build time -- required so this crate keeps building and
 # testing on CI's GPU-less, CUDA-Toolkit-less `submodule-integration` runner
