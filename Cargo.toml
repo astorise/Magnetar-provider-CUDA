@@ -54,7 +54,7 @@ magnetar-provider-cpu = { path = "../cpu" }
 # `enable-device-resident-kernel-chaining` eliminated at the CudaExecutor
 # level. Never invoked by `cargo test`/CI; opt-in via `cargo bench`, and
 # gracefully skips (prints and returns) on a host with no compatible GPU.
-criterion = { version = "0.7", default-features = false }
+criterion = { version = "0.8", default-features = false }
 
 [[bench]]
 name = "kernel_chaining"
