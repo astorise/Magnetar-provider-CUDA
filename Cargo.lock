@@ -850,7 +850,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-provider-cuda"
-version = "1.0.0-RC0"
+version = "1.0.0-RC1"
 dependencies = [
  "criterion",
  "cudarc",
@@ -860,7 +860,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-runtime"
-version = "1.0.0-RC0"
+version = "1.0.0-RC1"
 dependencies = [
  "ed25519-dalek",
  "flate2",
