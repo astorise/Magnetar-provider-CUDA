@@ -582,6 +582,30 @@ impl CudaKernels {
         position_offset: u64,
         head_count: u64,
     ) -> Result<CudaDeviceBuffer, CudaError> {
+        self.rope_with_pairing(
+            input,
+            base,
+            scale,
+            dimension,
+            position_offset,
+            head_count,
+            CudaRopePairing::Interleaved,
+        )
+    }
+
+    /// [`Self::rope`] with an explicit element pairing
+    /// (`fix-rope-rotation-pairing`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_with_pairing(
+        &self,
+        input: &CudaDeviceBuffer,
+        base: f32,
+        scale: f32,
+        dimension: u64,
+        position_offset: u64,
+        head_count: u64,
+        pairing: CudaRopePairing,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
         let (rows, cols) = rows_cols_buf(input)?;
         if head_count == 0 || !cols.is_multiple_of(head_count) {
             return Err(CudaError::new(
@@ -613,6 +637,10 @@ impl CudaKernels {
             ));
         }
         let half = dimension / 2;
+        let half_split: u32 = match pairing {
+            CudaRopePairing::Interleaved => 0,
+            CudaRopePairing::HalfSplit => 1,
+        };
         let work_items = rope_launch_work_items(rows, head_count, half)?;
         let mut out_dev = self.stream.clone_dtod(&input.slice)?;
         let func = self.function("rope_kernel")?;
@@ -626,7 +654,8 @@ impl CudaKernels {
             .arg(&scale)
             .arg(&dimension)
             .arg(&position_offset)
-            .arg(&head_count);
+            .arg(&head_count)
+            .arg(&half_split);
         unsafe { args.launch(LaunchConfig::for_num_elems(work_items)) }?;
         Ok(CudaDeviceBuffer {
             slice: out_dev,
@@ -828,6 +857,28 @@ fn rows_cols_buf(buffer: &CudaDeviceBuffer) -> Result<(u64, u64), CudaError> {
 /// than relying on a test against real hardware to ever notice. A free
 /// function (not inlined in `CudaKernels::rope`) so it can be unit-tested
 /// directly, without a real CUDA context/device.
+/// Which elements of a RoPE head block form each rotated pair, from the
+/// portable `rope` Operator's `rotation_pairing` attribute
+/// (`fix-rope-rotation-pairing`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CudaRopePairing {
+    /// Pairs `(2i, 2i + 1)`; the default when the attribute is absent.
+    Interleaved,
+    /// Pairs `(i, i + dimension / 2)`: Hugging Face `rotate_half`.
+    HalfSplit,
+}
+
+impl CudaRopePairing {
+    /// `None` for an unknown value, which callers reject.
+    pub fn from_attribute(value: &str) -> Option<Self> {
+        match value {
+            "interleaved" => Some(Self::Interleaved),
+            "half_split" => Some(Self::HalfSplit),
+            _ => None,
+        }
+    }
+}
+
 fn rope_launch_work_items(rows: u64, head_count: u64, half: u64) -> Result<u32, CudaError> {
     let work_items = rows
         .checked_mul(head_count)
@@ -869,5 +920,23 @@ mod rope_launch_work_items_tests {
     fn rejects_a_product_that_does_not_fit_in_u32() {
         let error = rope_launch_work_items(1 << 20, 1 << 20, 2).unwrap_err();
         assert_eq!(error.code, CudaErrorCode::ShapeUnsupported);
+    }
+}
+
+#[cfg(test)]
+mod rope_pairing_tests {
+    use super::CudaRopePairing;
+
+    #[test]
+    fn rotation_pairing_attribute_values_parse_and_unknown_values_are_rejected() {
+        assert_eq!(
+            CudaRopePairing::from_attribute("interleaved"),
+            Some(CudaRopePairing::Interleaved)
+        );
+        assert_eq!(
+            CudaRopePairing::from_attribute("half_split"),
+            Some(CudaRopePairing::HalfSplit)
+        );
+        assert_eq!(CudaRopePairing::from_attribute("neox"), None);
     }
 }
