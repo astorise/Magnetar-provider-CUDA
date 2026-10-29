@@ -2,7 +2,7 @@
 
 [package]
 name = "magnetar-provider-cuda"
-version = "1.0.0-RC1"
+version = "1.0.0"
 edition = "2024"
 license = "MIT"
 description = "NVIDIA CUDA Provider for the Magnetar inference runtime."
@@ -15,7 +15,7 @@ rust-version = "1.98"
 [dependencies]
 # `path` resolves inside a checkout of the parent Magnetar repository;
 # `version` is what `cargo publish` records for crates.io consumers.
-magnetar-runtime = { version = "1.0.0-RC1", path = "../../magnetar-runtime" }
+magnetar-runtime = { version = "1.0.0", path = "../../magnetar-runtime" }
 # `dynamic-loading` dlopens libcuda/libnvrtc at runtime instead of linking
 # against them at build time -- required so this crate keeps building and
 # testing on CI's GPU-less, CUDA-Toolkit-less `submodule-integration` runner
