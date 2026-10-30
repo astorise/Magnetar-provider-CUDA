@@ -813,12 +813,34 @@ impl CudaExecutor {
             std::collections::BTreeSet::new();
         for output in &invocation.outputs {
             let resource = &output.resource;
-            let self_admitted_before = self
+            // Pre-admitted whenever the residency record names an
+            // allocation other than the one this Provider tracks for the
+            // id: the caller admitted it, or re-admitted it after this
+            // Provider's own last write of the same id (an edge both
+            // pre-admitted per step and explicitly written). Self-admitting
+            // over it would overwrite the caller's residency record and
+            // orphan the caller's allocation once per step
+            // (`bound-memory-manager-bookkeeping`); instead the caller's
+            // record stays authoritative and this Provider's stale
+            // tracking entry for the id is dropped.
+            let tracked = self
                 .resource_allocations
                 .lock()
                 .unwrap()
-                .contains_key(&resource.id);
-            if !self_admitted_before && memory.tensor_residency(&resource.id).is_some() {
+                .get(&resource.id)
+                .copied();
+            let resident = memory
+                .tensor_residency(&resource.id)
+                .and_then(|residency| residency.allocation);
+            if memory.tensor_residency(&resource.id).is_some() && resident != tracked {
+                if let Some(stale) = self
+                    .resource_allocations
+                    .lock()
+                    .unwrap()
+                    .remove(&resource.id)
+                {
+                    let _ = memory.release(stale);
+                }
                 preadmitted.insert(resource.id.clone());
                 continue;
             }
