@@ -511,3 +511,40 @@ fn add_half_rejects_dtype_mismatch() {
         .unwrap();
     assert!(kernels.add_half(&a_dev, &b_dev).is_err());
 }
+
+/// `fix-rope-rotation-pairing`: the half-split pairing (Hugging Face
+/// `rotate_half`) on real hardware matches `providers/cpu`, multi-head and
+/// partial RoPE included.
+#[test]
+fn rope_half_split_matches_reference_cpu() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    // 3 rows, head_count = 2, head_width = 6, dimension = 4 (partial).
+    let data: Vec<f32> = (0..36).map(|i| i as f32 * 0.07 - 1.2).collect();
+    let input = HostTensor::new([3, 12], data).unwrap();
+    for (dimension, offset) in [(4, 5), (6, 0)] {
+        let expected = magnetar_provider_cpu::rope_with_pairing(
+            &input,
+            10000.0,
+            1.0,
+            dimension,
+            offset,
+            2,
+            magnetar_provider_cpu::RopePairing::HalfSplit,
+        )
+        .unwrap();
+        let actual_dev = kernels
+            .rope_with_pairing(
+                &upload(&kernels, &input),
+                10000.0,
+                1.0,
+                dimension,
+                offset,
+                2,
+                crate::kernels::CudaRopePairing::HalfSplit,
+            )
+            .unwrap();
+        assert_close(&download(&kernels, &actual_dev), &expected);
+    }
+}

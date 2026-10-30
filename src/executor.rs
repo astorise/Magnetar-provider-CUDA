@@ -47,7 +47,7 @@ use magnetar_runtime::scheduler::{
 use magnetar_runtime::{ExecutionPlanId, HostTensor};
 
 use crate::error::CudaError;
-use crate::kernels::{CudaDeviceBuffer, CudaHalfDType, CudaKernels};
+use crate::kernels::{CudaDeviceBuffer, CudaHalfDType, CudaKernels, CudaRopePairing};
 
 /// Reads which half-precision format an `add-half`/`mul-half` invocation
 /// was selected for from its own declared input dtype -- the Kernel
@@ -613,8 +613,36 @@ impl CudaExecutor {
                     // Kernel's behavior before `head_count` existed.
                     let head_count =
                         Self::attribute_integer(&invocation.attributes, "head_count").unwrap_or(1);
+                    // `fix-rope-rotation-pairing`: absent means
+                    // interleaved, this Kernel's behavior before the
+                    // attribute existed.
+                    let pairing = match invocation.attributes.get("rotation_pairing") {
+                        None => CudaRopePairing::Interleaved,
+                        Some(OperatorAttributeValue::String(value)) => {
+                            CudaRopePairing::from_attribute(value).ok_or_else(|| {
+                                KernelError::KernelAttributeUnsupported {
+                                    attribute: format!(
+                                        "rotation_pairing '{value}' is not implemented"
+                                    ),
+                                }
+                            })?
+                        }
+                        Some(_) => {
+                            return Err(KernelError::KernelAttributeUnsupported {
+                                attribute: "rotation_pairing must be a string".into(),
+                            });
+                        }
+                    };
                     self.kernels
-                        .rope(input, base, scale, dimension, position_offset, head_count)
+                        .rope_with_pairing(
+                            input,
+                            base,
+                            scale,
+                            dimension,
+                            position_offset,
+                            head_count,
+                            pairing,
+                        )
                         .map_err(KernelError::from)?
                 }
                 "attention" => {

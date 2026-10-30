@@ -127,6 +127,9 @@ extern "C" __global__ void rmsnorm_kernel(
 // cols / head_count`. `out` is pre-seeded (device-to-device copy of
 // `input`, done Rust-side) so columns this kernel never touches -- a
 // partial-RoPE block's untouched tail -- keep their original values.
+// `half_split` selects the element pairing (`fix-rope-rotation-pairing`):
+// 0 rotates (2i, 2i+1), 1 rotates (i, i + half) as Hugging Face
+// `rotate_half` does.
 extern "C" __global__ void rope_kernel(
     const float* input,
     float* out,
@@ -137,7 +140,8 @@ extern "C" __global__ void rope_kernel(
     float scale,
     unsigned long long dimension,
     unsigned long long position_offset,
-    unsigned long long head_count
+    unsigned long long head_count,
+    unsigned int half_split
 ) {
     unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     unsigned long long per_row = head_count * half;
@@ -156,10 +160,12 @@ extern "C" __global__ void rope_kernel(
     float s = sinf(angle);
     float c = cosf(angle);
     unsigned long long col_base = row * cols + head * head_width;
-    float even = input[col_base + 2 * pair];
-    float odd = input[col_base + 2 * pair + 1];
-    out[col_base + 2 * pair] = even * c - odd * s;
-    out[col_base + 2 * pair + 1] = even * s + odd * c;
+    unsigned long long first = half_split ? col_base + pair : col_base + 2 * pair;
+    unsigned long long second = half_split ? col_base + pair + half : col_base + 2 * pair + 1;
+    float a = input[first];
+    float b = input[second];
+    out[first] = a * c - b * s;
+    out[second] = a * s + b * c;
 }
 
 // One thread per row.
