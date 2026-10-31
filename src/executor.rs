@@ -572,6 +572,27 @@ impl CudaExecutor {
         // allocated, fully owned `CudaDeviceBuffer` that does not borrow
         // from `storage`, so the lock can drop as soon as the match arm
         // finishes.
+        // The resource this invocation overwrites: its previous buffer is
+        // dropped once the new output is stored anyway, so it is offered
+        // to the Kernel as its output allocation (a fresh allocation and a
+        // free per dispatched node otherwise). Never when the invocation
+        // also reads that resource.
+        let previous_output = invocation.outputs.first().and_then(|output| {
+            let id = &output.resource.id;
+            if invocation
+                .inputs
+                .iter()
+                .any(|input| &input.resource.id == id)
+            {
+                return None;
+            }
+            self.storage
+                .lock()
+                .unwrap()
+                .remove(id)
+                .map(|buffer| buffer.slice)
+        });
+        let _offered = self.kernels.offer_output(previous_output);
         let output = {
             let storage = self.storage.lock().unwrap();
             let get = |index: usize| -> Result<&CudaDeviceBuffer, KernelError> {

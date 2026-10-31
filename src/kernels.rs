@@ -170,6 +170,27 @@ pub struct CudaKernels {
     /// production decision.
     upload_count: AtomicU64,
     download_count: AtomicU64,
+    /// Kernel functions already looked up in `module`, by name: every
+    /// launch needs one, and `CudaModule::load_function` allocates a C
+    /// string and calls `cuModuleGetFunction` each time.
+    functions: std::sync::Mutex<std::collections::HashMap<&'static str, CudaFunction>>,
+    /// An output buffer the executor no longer needs (the previous value
+    /// of the resource the current invocation is about to overwrite),
+    /// taken by the next [`Self::alloc_output`] of the same length instead
+    /// of a fresh device allocation. See [`Self::offer_output`].
+    offered_output: std::sync::Mutex<Option<CudaSlice<f32>>>,
+}
+
+/// Drops an [`CudaKernels::offer_output`] buffer that the invocation did
+/// not take.
+pub struct OfferedOutput<'k> {
+    kernels: &'k CudaKernels,
+}
+
+impl Drop for OfferedOutput<'_> {
+    fn drop(&mut self) {
+        self.kernels.offered_output.lock().unwrap().take();
+    }
 }
 
 impl CudaKernels {
@@ -193,6 +214,8 @@ impl CudaKernels {
             module,
             upload_count: AtomicU64::new(0),
             download_count: AtomicU64::new(0),
+            functions: std::sync::Mutex::new(std::collections::HashMap::new()),
+            offered_output: std::sync::Mutex::new(None),
         })
     }
 
@@ -212,7 +235,13 @@ impl CudaKernels {
     }
 
     fn function(&self, name: &'static str) -> Result<CudaFunction, CudaError> {
-        Ok(self.module.load_function(name)?)
+        let mut functions = self.functions.lock().unwrap();
+        if let Some(function) = functions.get(name) {
+            return Ok(function.clone());
+        }
+        let function = self.module.load_function(name)?;
+        functions.insert(name, function.clone());
+        Ok(function)
     }
 
     /// Uploads a host tensor into a fresh device allocation. The only
@@ -345,12 +374,30 @@ impl CudaKernels {
     /// give a Tensor Resource's bytes a second, independent identity
     /// (e.g. promoting a decode step's pending KV write to its committed
     /// identity) without a D2H+H2D round trip.
+    /// Offers `buffer` to the next [`Self::alloc_output`] of its length
+    /// until the returned guard drops. The caller must own `buffer`
+    /// exclusively (removed from its storage) and must not read it again:
+    /// a Kernel writing its output into it is ordered after every earlier
+    /// use on this Provider's single stream.
+    pub fn offer_output(&self, buffer: Option<CudaSlice<f32>>) -> OfferedOutput<'_> {
+        *self.offered_output.lock().unwrap() = buffer;
+        OfferedOutput { kernels: self }
+    }
+
     /// An output buffer of `len` floats left uninitialized, for a Kernel
     /// (or copy) that writes every one of its elements before anything
     /// reads it. Skips the memset `alloc_zeros` would queue for each of the
     /// hundreds of outputs a decode step produces. Callers whose Kernel may
     /// leave elements unwritten keep `alloc_zeros`.
     fn alloc_output(&self, len: usize) -> Result<CudaSlice<f32>, CudaError> {
+        {
+            let mut offered = self.offered_output.lock().unwrap();
+            if offered.as_ref().is_some_and(|slice| slice.len() == len) {
+                // Every queued use of the offered buffer precedes this
+                // Kernel on the one stream this Provider uses.
+                return Ok(offered.take().expect("checked above"));
+            }
+        }
         // SAFETY: every caller launches a Kernel or copy that writes all
         // `len` elements on this same stream before the buffer is read.
         Ok(unsafe { self.stream.alloc::<f32>(len) }?)
