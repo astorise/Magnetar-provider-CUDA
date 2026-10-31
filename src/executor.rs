@@ -66,6 +66,9 @@ fn half_dtype_from_descriptor(descriptor: &TensorDescriptor) -> Result<CudaHalfD
     }
 }
 
+/// How many recent Kernel observations a [`CudaExecutor`] keeps.
+pub const KERNEL_OBSERVATION_LOG_CAPACITY: usize = 4096;
+
 pub struct CudaExecutor {
     kernels: CudaKernels,
     device_id: DeviceId,
@@ -402,12 +405,26 @@ impl CudaExecutor {
         Ok(allocation.id)
     }
 
+    /// The most recent Kernel observations, oldest first, at most
+    /// `KERNEL_OBSERVATION_LOG_CAPACITY` of them.
     pub fn observations(&self) -> Vec<KernelObservation> {
-        self.observations.lock().unwrap().clone()
+        let observations = self.observations.lock().unwrap();
+        let start = observations
+            .len()
+            .saturating_sub(KERNEL_OBSERVATION_LOG_CAPACITY);
+        observations[start..].to_vec()
     }
 
     fn observe(&self, observation: KernelObservation) {
-        self.observations.lock().unwrap().push(observation);
+        let mut observations = self.observations.lock().unwrap();
+        // Bounded like the Runtime's own observation logs: a resident model
+        // records two observations per dispatched Kernel for as long as it
+        // serves. Dropping the oldest half at twice the capacity keeps the
+        // cost per observation amortized O(1).
+        if observations.len() >= 2 * KERNEL_OBSERVATION_LOG_CAPACITY {
+            observations.drain(..KERNEL_OBSERVATION_LOG_CAPACITY);
+        }
+        observations.push(observation);
     }
 
     fn next_provider_execution_id(&self, label: &str) -> ProviderExecutionId {
