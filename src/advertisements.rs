@@ -113,6 +113,24 @@ pub fn cuda_kernel_advertisements(
             provider_name,
         ),
         baseline_advertisement(
+            "matmul-bias",
+            OperatorFamily::LinearAlgebra,
+            device_id,
+            provider_name,
+        ),
+        baseline_advertisement(
+            "matmul-residual",
+            OperatorFamily::LinearAlgebra,
+            device_id,
+            provider_name,
+        ),
+        baseline_advertisement(
+            "silu-mul",
+            OperatorFamily::Activation,
+            device_id,
+            provider_name,
+        ),
+        baseline_advertisement(
             "embedding",
             OperatorFamily::Tensor,
             device_id,

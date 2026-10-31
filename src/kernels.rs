@@ -31,6 +31,15 @@ use crate::half_precision;
 
 const KERNEL_SOURCE: &str = include_str!("kernels.cu");
 
+/// What a fused matmul adds to its product.
+#[derive(Clone, Copy)]
+enum MatmulAddend<'a> {
+    /// A `[n]` (or `[1, n]`) bias row added to every output row.
+    Row(&'a CudaDeviceBuffer),
+    /// A full `[m, n]` residual.
+    Full(&'a CudaDeviceBuffer),
+}
+
 /// Warps per block of `matmul_split_k_kernel`; must equal `MATMUL_SPLIT_K`
 /// in `kernels.cu`.
 const MATMUL_SPLIT_K: u32 = 16;
@@ -732,6 +741,88 @@ impl CudaKernels {
         transpose_a: bool,
         transpose_b: bool,
     ) -> Result<CudaDeviceBuffer, CudaError> {
+        self.matmul_with_addend(a, b, None, transpose_a, transpose_b)
+    }
+
+    /// `matmul(a, b) + bias`, `bias` a `[n]` (or `[1, n]`) row added to
+    /// every output row: the Runtime's fused `matmul-bias` Operator,
+    /// bit-identical to `matmul` followed by `add`.
+    pub fn matmul_bias(
+        &self,
+        a: &CudaDeviceBuffer,
+        b: &CudaDeviceBuffer,
+        bias: &CudaDeviceBuffer,
+        transpose_a: bool,
+        transpose_b: bool,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        self.matmul_with_addend(
+            a,
+            b,
+            Some(MatmulAddend::Row(bias)),
+            transpose_a,
+            transpose_b,
+        )
+    }
+
+    /// `residual + matmul(a, b)`, `residual` the `[m, n]` output's shape: the
+    /// Runtime's fused `matmul-residual` Operator, bit-identical to `matmul`
+    /// followed by `residual_add`.
+    pub fn matmul_residual(
+        &self,
+        a: &CudaDeviceBuffer,
+        b: &CudaDeviceBuffer,
+        residual: &CudaDeviceBuffer,
+        transpose_a: bool,
+        transpose_b: bool,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        self.matmul_with_addend(
+            a,
+            b,
+            Some(MatmulAddend::Full(residual)),
+            transpose_a,
+            transpose_b,
+        )
+    }
+
+    /// `silu(gate) * up`, elementwise: the Runtime's fused `silu-mul`
+    /// Operator, bit-identical to `silu` followed by `mul`.
+    pub fn silu_mul(
+        &self,
+        gate: &CudaDeviceBuffer,
+        up: &CudaDeviceBuffer,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        if gate.shape != up.shape {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!(
+                    "silu-mul expects gate and up to share a shape, got {:?} and {:?}",
+                    gate.shape, up.shape
+                ),
+            ));
+        }
+        let n = gate.slice.len() as u64;
+        let mut out_dev = self.alloc_output(gate.slice.len())?;
+        let func = self.function("silu_mul_kernel")?;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(&gate.slice)
+            .arg(&up.slice)
+            .arg(&mut out_dev)
+            .arg(&n);
+        unsafe { args.launch(LaunchConfig::for_num_elems(n as u32)) }?;
+        Ok(CudaDeviceBuffer {
+            slice: out_dev,
+            shape: gate.shape.clone(),
+        })
+    }
+
+    fn matmul_with_addend(
+        &self,
+        a: &CudaDeviceBuffer,
+        b: &CudaDeviceBuffer,
+        addend: Option<MatmulAddend<'_>>,
+        transpose_a: bool,
+        transpose_b: bool,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
         let (a_rows, a_cols) = rows_cols_buf(a)?;
         let (b_rows, b_cols) = rows_cols_buf(b)?;
         let (m, k) = if transpose_a {
@@ -760,6 +851,27 @@ impl CudaKernels {
         } else {
             (b_cols, 1u64)
         };
+        match addend {
+            Some(MatmulAddend::Row(bias)) if bias.shape != [n] && bias.shape != [1, n] => {
+                return Err(CudaError::new(
+                    CudaErrorCode::ShapeUnsupported,
+                    format!(
+                        "matmul-bias bias shape must be [{n}] or [1, {n}], got {:?}",
+                        bias.shape
+                    ),
+                ));
+            }
+            Some(MatmulAddend::Full(residual)) if residual.shape != [m, n] => {
+                return Err(CudaError::new(
+                    CudaErrorCode::ShapeUnsupported,
+                    format!(
+                        "matmul-residual residual shape must be [{m}, {n}], got {:?}",
+                        residual.shape
+                    ),
+                ));
+            }
+            _ => {}
+        }
         let mut out_dev = self.alloc_output((m * n) as usize)?;
         if b_col_stride == 1 && m <= MATMUL_SPLIT_K_MAX_ROWS {
             let func = self.function("matmul_split_k_kernel")?;
@@ -773,6 +885,14 @@ impl CudaKernels {
                 .arg(&a_row_stride)
                 .arg(&a_inner_stride)
                 .arg(&b_inner_stride);
+            // Without an addend the kernel never reads it; any valid device
+            // pointer will do.
+            let (addend_buffer, addend_mode) = match addend {
+                None => (b, 0i32),
+                Some(MatmulAddend::Row(bias)) => (bias, 1),
+                Some(MatmulAddend::Full(residual)) => (residual, 2),
+            };
+            args.arg(&addend_buffer.slice).arg(&addend_mode);
             let config = LaunchConfig {
                 grid_dim: (n.div_ceil(32) as u32, m as u32, 1),
                 block_dim: (32, MATMUL_SPLIT_K, 1),
@@ -797,10 +917,16 @@ impl CudaKernels {
             .arg(&b_inner_stride)
             .arg(&b_col_stride);
         unsafe { args.launch(LaunchConfig::for_num_elems((m * n) as u32)) }?;
-        Ok(CudaDeviceBuffer {
+        let product = CudaDeviceBuffer {
             slice: out_dev,
             shape: vec![m, n],
-        })
+        };
+        match addend {
+            Some(MatmulAddend::Row(addend) | MatmulAddend::Full(addend)) => {
+                self.add(&product, addend)
+            }
+            None => Ok(product),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
