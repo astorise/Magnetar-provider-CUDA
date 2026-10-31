@@ -336,6 +336,72 @@ fn matmul_bias_matches_reference_cpu_and_unfused_device_result() {
     }
 }
 
+/// `matmul_residual` and `silu_mul` (the Runtime's fused `matmul-residual`
+/// and `silu-mul`) against providers/cpu, and bit-identical to this
+/// Provider's own unfused pairs.
+#[test]
+fn matmul_residual_and_silu_mul_match_reference_cpu_and_unfused_device_results() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let values = |count: u64, seed: u64| -> Vec<f32> {
+        (0..count)
+            .map(|i| (((i * 7919 + seed * 104_729) % 2001) as f32 - 1000.0) * 1e-4)
+            .collect()
+    };
+    let bits = |tensor: &HostTensor| tensor.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    for (m, k, n, transpose_a) in [(1, 1000, 70, false), (3, 129, 65, false), (4, 50, 40, true)] {
+        let a = if transpose_a {
+            HostTensor::new([k, m], values(m * k, 1)).unwrap()
+        } else {
+            HostTensor::new([m, k], values(m * k, 1)).unwrap()
+        };
+        let b = HostTensor::new([k, n], values(k * n, 2)).unwrap();
+        let residual = HostTensor::new([m, n], values(m * n, 3)).unwrap();
+        let expected = magnetar_provider_cpu::residual_add(
+            &residual,
+            &magnetar_provider_cpu::matmul(&a, &b, transpose_a, false).unwrap(),
+        )
+        .unwrap();
+        let (a_dev, b_dev, residual_dev) = (
+            upload(&kernels, &a),
+            upload(&kernels, &b),
+            upload(&kernels, &residual),
+        );
+        let fused = download(
+            &kernels,
+            &kernels
+                .matmul_residual(&a_dev, &b_dev, &residual_dev, transpose_a, false)
+                .unwrap(),
+        );
+        assert_close(&fused, &expected);
+        let unfused = download(
+            &kernels,
+            &kernels
+                .residual_add(
+                    &residual_dev,
+                    &kernels.matmul(&a_dev, &b_dev, transpose_a, false).unwrap(),
+                )
+                .unwrap(),
+        );
+        assert_eq!(bits(&fused), bits(&unfused));
+    }
+
+    let gate = HostTensor::new([3, 70], values(210, 4)).unwrap();
+    let up = HostTensor::new([3, 70], values(210, 5)).unwrap();
+    let expected = magnetar_provider_cpu::mul(&magnetar_provider_cpu::silu(&gate), &up).unwrap();
+    let (gate_dev, up_dev) = (upload(&kernels, &gate), upload(&kernels, &up));
+    let fused = download(&kernels, &kernels.silu_mul(&gate_dev, &up_dev).unwrap());
+    assert_close(&fused, &expected);
+    let unfused = download(
+        &kernels,
+        &kernels
+            .mul(&kernels.silu(&gate_dev).unwrap(), &up_dev)
+            .unwrap(),
+    );
+    assert_eq!(bits(&fused), bits(&unfused));
+}
+
 /// The block-per-row `rmsnorm_kernel` on a width that is not a multiple of
 /// its thread count, with a broadcast and a per-row weight.
 #[test]

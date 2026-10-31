@@ -609,6 +609,25 @@ impl CudaExecutor {
                         .matmul_bias(a, b, bias, transpose_a, transpose_b)
                         .map_err(KernelError::from)?
                 }
+                // The Runtime's fused `residual + matmul(a, b)`.
+                "matmul-residual" => {
+                    let a = get(0)?;
+                    let b = get(1)?;
+                    let residual = get(2)?;
+                    let transpose_a =
+                        Self::attribute_bool(&invocation.attributes, "transpose_a", false);
+                    let transpose_b =
+                        Self::attribute_bool(&invocation.attributes, "transpose_b", false);
+                    Self::require_f32_accumulation(&invocation.attributes)?;
+                    self.kernels
+                        .matmul_residual(a, b, residual, transpose_a, transpose_b)
+                        .map_err(KernelError::from)?
+                }
+                // The Runtime's fused `silu(gate) * up`.
+                "silu-mul" => self
+                    .kernels
+                    .silu_mul(get(0)?, get(1)?)
+                    .map_err(KernelError::from)?,
                 "embedding" => {
                     let table = get(0)?;
                     let ids = get(1)?;
