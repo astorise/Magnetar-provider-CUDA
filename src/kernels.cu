@@ -389,6 +389,124 @@ extern "C" __global__ void attention_kernel(
     }
 }
 
+// One block of ATTENTION_THREADS threads per (head, query): the same
+// masking, scaling and softmax as `attention_kernel`, with each q.k score
+// computed once (keys spread over the threads) and kept in dynamic shared
+// memory, the softmax max and sum combined by fixed-order tree reductions
+// (deterministic), and each output dimension accumulated by its own thread
+// over coalesced V reads. Shared memory holds `head_dimension` floats of
+// q, ATTENTION_THREADS reduction slots and `kv_seq_len` scores; callers
+// fall back to `attention_kernel` when that does not fit.
+#define ATTENTION_THREADS 128
+extern "C" __global__ void attention_block_kernel(
+    const float* q,
+    const float* k,
+    const float* v,
+    float* out,
+    unsigned long long seq_len,
+    unsigned long long kv_seq_len,
+    unsigned long long head_count,
+    unsigned long long kv_head_count,
+    unsigned long long head_dimension,
+    unsigned long long q_model_dim,
+    unsigned long long kv_model_dim,
+    int causal,
+    long long window_size, // -1 means "no window"
+    unsigned long long query_position_offset
+) {
+    extern __shared__ float shared[];
+    float* q_shared = shared;
+    float* reduce = shared + head_dimension;
+    float* scores = reduce + ATTENTION_THREADS;
+    unsigned long long idx = blockIdx.x;
+    if (idx >= head_count * seq_len) {
+        return;
+    }
+    unsigned int tid = threadIdx.x;
+    unsigned long long head = idx / seq_len;
+    unsigned long long query_index = idx % seq_len;
+    unsigned long long group_size = head_count / kv_head_count;
+    unsigned long long kv_head = head / group_size;
+    unsigned long long q_offset = head * head_dimension;
+    unsigned long long kv_offset = kv_head * head_dimension;
+    float scale = 1.0f / sqrtf((float)head_dimension);
+
+    unsigned long long query_position = query_position_offset + query_index;
+    unsigned long long key_upper = causal ? (query_position + 1) : kv_seq_len;
+    unsigned long long key_lower = 0;
+    if (window_size >= 0) {
+        unsigned long long window = (unsigned long long)window_size;
+        unsigned long long back = window > 0 ? window - 1 : 0;
+        key_lower = query_position > back ? query_position - back : 0;
+        if (key_lower > key_upper) {
+            key_lower = key_upper;
+        }
+    }
+    unsigned long long key_count = key_upper - key_lower;
+
+    const float* q_row = q + query_index * q_model_dim + q_offset;
+    for (unsigned long long d = tid; d < head_dimension; d += ATTENTION_THREADS) {
+        q_shared[d] = q_row[d];
+    }
+    __syncthreads();
+
+    float local_max = neg_inf();
+    for (unsigned long long j = tid; j < key_count; j += ATTENTION_THREADS) {
+        const float* k_row = k + (key_lower + j) * kv_model_dim + kv_offset;
+        float dot = 0.0f;
+        for (unsigned long long d = 0; d < head_dimension; d++) {
+            dot += q_shared[d] * k_row[d];
+        }
+        float score = dot * scale;
+        scores[j] = score;
+        local_max = fmaxf(local_max, score);
+    }
+    reduce[tid] = local_max;
+    __syncthreads();
+    for (unsigned int stride = ATTENTION_THREADS / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            reduce[tid] = fmaxf(reduce[tid], reduce[tid + stride]);
+        }
+        __syncthreads();
+    }
+    float max_value = reduce[0];
+    __syncthreads();
+
+    float local_sum = 0.0f;
+    for (unsigned long long j = tid; j < key_count; j += ATTENTION_THREADS) {
+        float weight = expf(scores[j] - max_value);
+        scores[j] = weight;
+        local_sum += weight;
+    }
+    reduce[tid] = local_sum;
+    __syncthreads();
+    for (unsigned int stride = ATTENTION_THREADS / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            reduce[tid] += reduce[tid + stride];
+        }
+        __syncthreads();
+    }
+    float sum = reduce[0];
+    // Normalized before weighting V, as `attention_kernel` does: summing
+    // unnormalized weights times large finite V values could overflow
+    // where the normalized result is representable.
+    for (unsigned long long j = tid; j < key_count; j += ATTENTION_THREADS) {
+        scores[j] = scores[j] / sum;
+    }
+    __syncthreads();
+
+    // No key admitted (an empty window) leaves every output zero, as
+    // `attention_kernel`.
+    float* out_row = out + query_index * q_model_dim + q_offset;
+    for (unsigned long long d = tid; d < head_dimension; d += ATTENTION_THREADS) {
+        float acc = 0.0f;
+        for (unsigned long long j = 0; j < key_count; j++) {
+            acc += scores[j] * v[(key_lower + j) * kv_model_dim + kv_offset + d];
+        }
+        out_row[d] = acc;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Native half-precision (F16/BF16) elementwise compute
 // (`add-native-cuda-half-precision-compute` Phase 2)

@@ -568,6 +568,98 @@ fn grouped_query_sliding_window_attention_matches_reference_cpu() {
     assert_close(&download(&kernels, &actual_dev), &expected);
 }
 
+/// Deterministic pseudo-random values in [-0.5, 0.5).
+fn attention_values(len: usize, seed: usize) -> Vec<f32> {
+    (0..len)
+        .map(|i| (((i * 7919 + seed * 104_729) % 2003) as f32) / 2003.0 - 0.5)
+        .collect()
+}
+
+/// `attention_block_kernel` (one block per head and query) on Qwen2.5-like
+/// shapes: a decode step over a long history, a causal prefill, a sliding
+/// window over a GQA prefill, and a history too long for its shared memory,
+/// which uses `attention_kernel` instead.
+#[test]
+fn block_attention_matches_reference_cpu_on_decode_prefill_and_long_histories() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    // (seq_len, kv_seq_len, head_count, kv_head_count, head_dimension, window)
+    let cases: [(u64, u64, u64, u64, u64, Option<u64>); 4] = [
+        (1, 300, 14, 2, 64, None),
+        (37, 37, 14, 2, 64, None),
+        (23, 23, 4, 2, 8, Some(5)),
+        (1, 12_500, 2, 1, 4, None),
+    ];
+    for (case, (seq_len, kv_seq_len, heads, kv_heads, dim, window)) in cases.into_iter().enumerate()
+    {
+        let q = HostTensor::new(
+            [seq_len, heads * dim],
+            attention_values((seq_len * heads * dim) as usize, 3 * case + 1),
+        )
+        .unwrap();
+        let k = HostTensor::new(
+            [kv_seq_len, kv_heads * dim],
+            attention_values((kv_seq_len * kv_heads * dim) as usize, 3 * case + 2),
+        )
+        .unwrap();
+        let v = HostTensor::new(
+            [kv_seq_len, kv_heads * dim],
+            attention_values((kv_seq_len * kv_heads * dim) as usize, 3 * case + 3),
+        )
+        .unwrap();
+        let expected =
+            magnetar_provider_cpu::attention(&q, &k, &v, heads, dim, Some(kv_heads), window, true)
+                .unwrap();
+        let actual_dev = kernels
+            .attention(
+                &upload(&kernels, &q),
+                &upload(&kernels, &k),
+                &upload(&kernels, &v),
+                heads,
+                dim,
+                Some(kv_heads),
+                window,
+                true,
+            )
+            .unwrap();
+        assert_close(&download(&kernels, &actual_dev), &expected);
+    }
+}
+
+/// Large finite V values stay finite: weights are normalized before they
+/// weight V (Codex review on astorise/Magnetar-provider-CUDA#13).
+#[test]
+fn block_attention_keeps_large_finite_values_finite() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let q = HostTensor::new([1, 2], vec![0.0; 2]).unwrap();
+    let k = HostTensor::new([4, 2], vec![0.0; 8]).unwrap();
+    let v = HostTensor::new([4, 2], vec![1e38; 8]).unwrap();
+    let actual = download(
+        &kernels,
+        &kernels
+            .attention(
+                &upload(&kernels, &q),
+                &upload(&kernels, &k),
+                &upload(&kernels, &v),
+                1,
+                2,
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+    );
+    for value in &actual.data {
+        assert!(
+            value.is_finite() && (value / 1e38 - 1.0).abs() < 1e-5,
+            "{value}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Native half-precision compute (`add-native-cuda-half-precision-compute`
 // Phase 2)
