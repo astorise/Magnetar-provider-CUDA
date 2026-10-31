@@ -51,6 +51,14 @@ const MATMUL_SPLIT_K_MAX_ROWS: u64 = 65_535;
 /// `kernels.cu`.
 const RMSNORM_THREADS: u32 = 256;
 
+/// Threads per (head, query) of `attention_block_kernel`; must equal
+/// `ATTENTION_THREADS` in `kernels.cu`.
+const ATTENTION_THREADS: u32 = 128;
+
+/// Dynamic shared memory `attention_block_kernel` may use without opting a
+/// function into more (the CUDA default limit per block).
+const ATTENTION_MAX_SHARED_BYTES: u64 = 48 * 1024;
+
 /// Which half-precision format a [`CudaHalfBuffer`] holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CudaHalfDType {
@@ -1007,6 +1015,47 @@ impl CudaKernels {
         let causal_flag: i32 = if causal { 1 } else { 0 };
         let window_arg: i64 = window_size.map(|w| w as i64).unwrap_or(-1);
 
+        // `attention_block_kernel` keeps q, its reduction slots and every
+        // score of one (head, query) in shared memory; longer histories
+        // than that fits use the one-thread-per-(head, query) kernel.
+        let block_shared_bytes = (head_dimension + ATTENTION_THREADS as u64 + kv_seq_len)
+            * std::mem::size_of::<f32>() as u64;
+        if block_shared_bytes <= ATTENTION_MAX_SHARED_BYTES {
+            let blocks = u32::try_from(head_count * seq_len).map_err(|_| {
+                CudaError::new(
+                    CudaErrorCode::ShapeUnsupported,
+                    "attention launch size overflows a grid dimension",
+                )
+            })?;
+            // Writes every element (zero for an empty key window).
+            let mut out_dev = self.alloc_output(q.slice.len())?;
+            let func = self.function("attention_block_kernel")?;
+            let mut args = self.stream.launch_builder(&func);
+            args.arg(&q.slice)
+                .arg(&k.slice)
+                .arg(&v.slice)
+                .arg(&mut out_dev)
+                .arg(&seq_len)
+                .arg(&kv_seq_len)
+                .arg(&head_count)
+                .arg(&kv_head_count)
+                .arg(&head_dimension)
+                .arg(&q_model_dim)
+                .arg(&kv_model_dim)
+                .arg(&causal_flag)
+                .arg(&window_arg)
+                .arg(&query_position_offset);
+            let config = LaunchConfig {
+                grid_dim: (blocks, 1, 1),
+                block_dim: (ATTENTION_THREADS, 1, 1),
+                shared_mem_bytes: block_shared_bytes as u32,
+            };
+            unsafe { args.launch(config) }?;
+            return Ok(CudaDeviceBuffer {
+                slice: out_dev,
+                shape: q.shape.clone(),
+            });
+        }
         let mut out_dev = self.stream.alloc_zeros::<f32>(q.slice.len())?;
         let func = self.function("attention_kernel")?;
         let mut args = self.stream.launch_builder(&func);
