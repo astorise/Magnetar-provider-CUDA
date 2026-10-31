@@ -31,6 +31,17 @@ use crate::half_precision;
 
 const KERNEL_SOURCE: &str = include_str!("kernels.cu");
 
+/// Warps per block of `matmul_split_k_kernel`; must equal `MATMUL_SPLIT_K`
+/// in `kernels.cu`.
+const MATMUL_SPLIT_K: u32 = 16;
+
+/// Rows a split-K launch covers in its grid's y dimension (CUDA's limit).
+const MATMUL_SPLIT_K_MAX_ROWS: u64 = 65_535;
+
+/// Threads per row of `rmsnorm_kernel`; must equal `RMSNORM_THREADS` in
+/// `kernels.cu`.
+const RMSNORM_THREADS: u32 = 256;
+
 /// Which half-precision format a [`CudaHalfBuffer`] holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CudaHalfDType {
@@ -556,7 +567,12 @@ impl CudaKernels {
             .arg(&cols)
             .arg(&weight_row_stride)
             .arg(&epsilon);
-        unsafe { args.launch(LaunchConfig::for_num_elems(rows as u32)) }?;
+        let config = LaunchConfig {
+            grid_dim: (rows as u32, 1, 1),
+            block_dim: (RMSNORM_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { args.launch(config) }?;
         Ok(CudaDeviceBuffer {
             slice: out_dev,
             shape: input.shape.clone(),
@@ -725,6 +741,29 @@ impl CudaKernels {
             (b_cols, 1u64)
         };
         let mut out_dev = self.stream.alloc_zeros::<f32>((m * n) as usize)?;
+        if b_col_stride == 1 && m <= MATMUL_SPLIT_K_MAX_ROWS {
+            let func = self.function("matmul_split_k_kernel")?;
+            let mut args = self.stream.launch_builder(&func);
+            args.arg(&a.slice)
+                .arg(&b.slice)
+                .arg(&mut out_dev)
+                .arg(&m)
+                .arg(&k)
+                .arg(&n)
+                .arg(&a_row_stride)
+                .arg(&a_inner_stride)
+                .arg(&b_inner_stride);
+            let config = LaunchConfig {
+                grid_dim: (n.div_ceil(32) as u32, m as u32, 1),
+                block_dim: (32, MATMUL_SPLIT_K, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe { args.launch(config) }?;
+            return Ok(CudaDeviceBuffer {
+                slice: out_dev,
+                shape: vec![m, n],
+            });
+        }
         let func = self.function("matmul_kernel")?;
         let mut args = self.stream.launch_builder(&func);
         args.arg(&a.slice)
