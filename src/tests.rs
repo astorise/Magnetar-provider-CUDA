@@ -115,15 +115,17 @@ fn kernel_advertisements_agree_with_availability() {
     if provider.is_available() {
         assert_eq!(
             advertisements.len(),
-            13,
+            14,
             "expected exactly the required-now kernel set this baseline implements, plus the \
              add-half/mul-half native half-precision Kernels \
-             (enable-native-cuda-half-precision-elementwise-compute)"
+             (enable-native-cuda-half-precision-elementwise-compute) and the Runtime's fused \
+             matmul-bias (cache-and-optimize-prepared-graphs C03)"
         );
         let names: std::collections::BTreeSet<_> =
             advertisements.iter().map(|a| a.id.name.as_str()).collect();
         for expected in [
             "matmul",
+            "matmul-bias",
             "embedding",
             "rmsnorm",
             "rope",
