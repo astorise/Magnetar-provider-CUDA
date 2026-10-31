@@ -546,6 +546,22 @@ impl CudaExecutor {
         }
     }
 
+    /// `matmul` and `matmul-bias` accumulate in f32 only, like the CPU
+    /// Providers; any other requested `accumulation_dtype` is rejected
+    /// rather than silently computed in f32.
+    fn require_f32_accumulation(
+        attributes: &BTreeMap<String, OperatorAttributeValue>,
+    ) -> Result<(), KernelError> {
+        if let Some(OperatorAttributeValue::DType(dtype)) = attributes.get("accumulation_dtype")
+            && *dtype != ComputeDType::Float32
+        {
+            return Err(KernelError::KernelDTypeUnsupported {
+                dtype: format!("the CUDA Provider only accumulates in f32; requested {dtype:?}"),
+            });
+        }
+        Ok(())
+    }
+
     fn run_invocation(&self, invocation: &KernelInvocation) -> Result<KernelResult, KernelError> {
         let name = invocation.kernel.name.as_str();
         let mut result = KernelResult::success(invocation.id.clone());
@@ -574,6 +590,7 @@ impl CudaExecutor {
                         Self::attribute_bool(&invocation.attributes, "transpose_a", false);
                     let transpose_b =
                         Self::attribute_bool(&invocation.attributes, "transpose_b", false);
+                    Self::require_f32_accumulation(&invocation.attributes)?;
                     self.kernels
                         .matmul(a, b, transpose_a, transpose_b)
                         .map_err(KernelError::from)?
@@ -587,6 +604,7 @@ impl CudaExecutor {
                         Self::attribute_bool(&invocation.attributes, "transpose_a", false);
                     let transpose_b =
                         Self::attribute_bool(&invocation.attributes, "transpose_b", false);
+                    Self::require_f32_accumulation(&invocation.attributes)?;
                     self.kernels
                         .matmul_bias(a, b, bias, transpose_a, transpose_b)
                         .map_err(KernelError::from)?
@@ -1217,6 +1235,28 @@ mod tests {
     use super::*;
     use crate::provider::CudaProvider;
     use magnetar_runtime::memory::MemoryManagerConfig;
+
+    #[test]
+    fn matmul_kernels_reject_any_accumulation_dtype_but_f32() {
+        let with = |dtype| {
+            BTreeMap::from([(
+                "accumulation_dtype".to_string(),
+                OperatorAttributeValue::DType(dtype),
+            )])
+        };
+        assert!(CudaExecutor::require_f32_accumulation(&BTreeMap::new()).is_ok());
+        assert!(CudaExecutor::require_f32_accumulation(&with(ComputeDType::Float32)).is_ok());
+        for dtype in [
+            ComputeDType::Float16,
+            ComputeDType::BrainFloat16,
+            ComputeDType::Float64,
+        ] {
+            assert!(matches!(
+                CudaExecutor::require_f32_accumulation(&with(dtype)),
+                Err(KernelError::KernelDTypeUnsupported { .. })
+            ));
+        }
+    }
 
     fn executor_or_skip() -> Option<CudaExecutor> {
         let provider = CudaProvider::new();
