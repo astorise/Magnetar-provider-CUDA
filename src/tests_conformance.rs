@@ -627,6 +627,39 @@ fn block_attention_matches_reference_cpu_on_decode_prefill_and_long_histories() 
     }
 }
 
+/// Large finite V values stay finite: weights are normalized before they
+/// weight V (Codex review on astorise/Magnetar-provider-CUDA#13).
+#[test]
+fn block_attention_keeps_large_finite_values_finite() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let q = HostTensor::new([1, 2], vec![0.0; 2]).unwrap();
+    let k = HostTensor::new([4, 2], vec![0.0; 8]).unwrap();
+    let v = HostTensor::new([4, 2], vec![1e38; 8]).unwrap();
+    let actual = download(
+        &kernels,
+        &kernels
+            .attention(
+                &upload(&kernels, &q),
+                &upload(&kernels, &k),
+                &upload(&kernels, &v),
+                1,
+                2,
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+    );
+    for value in &actual.data {
+        assert!(
+            value.is_finite() && (value / 1e38 - 1.0).abs() < 1e-5,
+            "{value}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Native half-precision compute (`add-native-cuda-half-precision-compute`
 // Phase 2)

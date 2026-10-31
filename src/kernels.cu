@@ -487,15 +487,23 @@ extern "C" __global__ void attention_block_kernel(
         __syncthreads();
     }
     float sum = reduce[0];
+    // Normalized before weighting V, as `attention_kernel` does: summing
+    // unnormalized weights times large finite V values could overflow
+    // where the normalized result is representable.
+    for (unsigned long long j = tid; j < key_count; j += ATTENTION_THREADS) {
+        scores[j] = scores[j] / sum;
+    }
+    __syncthreads();
 
+    // No key admitted (an empty window) leaves every output zero, as
+    // `attention_kernel`.
     float* out_row = out + query_index * q_model_dim + q_offset;
     for (unsigned long long d = tid; d < head_dimension; d += ATTENTION_THREADS) {
         float acc = 0.0f;
         for (unsigned long long j = 0; j < key_count; j++) {
             acc += scores[j] * v[(key_lower + j) * kv_model_dim + kv_offset + d];
         }
-        // No key admitted (an empty window): zero, as `attention_kernel`.
-        out_row[d] = key_count > 0 ? acc / sum : 0.0f;
+        out_row[d] = acc;
     }
 }
 
