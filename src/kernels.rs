@@ -187,6 +187,13 @@ pub struct OfferedOutput<'k> {
     kernels: &'k CudaKernels,
 }
 
+impl OfferedOutput<'_> {
+    /// The offered buffer, if no Kernel took it.
+    pub fn reclaim(self) -> Option<CudaSlice<f32>> {
+        self.kernels.offered_output.lock().unwrap().take()
+    }
+}
+
 impl Drop for OfferedOutput<'_> {
     fn drop(&mut self) {
         self.kernels.offered_output.lock().unwrap().take();
