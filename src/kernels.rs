@@ -157,6 +157,17 @@ pub struct CudaKernels {
 
 impl CudaKernels {
     pub fn compile_and_load(context: &Arc<CudaContext>) -> Result<Self, CudaError> {
+        // cudarc only synchronizes through per-buffer events once a context
+        // has more than its default stream, and this Provider never creates
+        // one: every buffer is allocated, used and freed on the context's
+        // default stream. Event tracking would still create and destroy two
+        // events with every allocation (one per Kernel output, hundreds per
+        // decode step) without ever waiting on them.
+        //
+        // SAFETY: nothing here creates a second stream, so no buffer is used
+        // across streams of this context; turning tracking off changes no
+        // synchronization cudarc actually performs.
+        unsafe { context.disable_event_tracking() };
         let ptx = compile_ptx(KERNEL_SOURCE)?;
         let module = context.load_module(ptx)?;
         let stream = context.default_stream();
@@ -317,6 +328,17 @@ impl CudaKernels {
     /// give a Tensor Resource's bytes a second, independent identity
     /// (e.g. promoting a decode step's pending KV write to its committed
     /// identity) without a D2H+H2D round trip.
+    /// An output buffer of `len` floats left uninitialized, for a Kernel
+    /// (or copy) that writes every one of its elements before anything
+    /// reads it. Skips the memset `alloc_zeros` would queue for each of the
+    /// hundreds of outputs a decode step produces. Callers whose Kernel may
+    /// leave elements unwritten keep `alloc_zeros`.
+    fn alloc_output(&self, len: usize) -> Result<CudaSlice<f32>, CudaError> {
+        // SAFETY: every caller launches a Kernel or copy that writes all
+        // `len` elements on this same stream before the buffer is read.
+        Ok(unsafe { self.stream.alloc::<f32>(len) }?)
+    }
+
     pub fn clone_buffer(&self, buffer: &CudaDeviceBuffer) -> Result<CudaDeviceBuffer, CudaError> {
         let slice = self.stream.clone_dtod(&buffer.slice)?;
         Ok(CudaDeviceBuffer {
@@ -338,7 +360,7 @@ impl CudaKernels {
     ) -> Result<CudaDeviceBuffer, CudaError> {
         if a.shape == b.shape {
             let n = a.slice.len() as u64;
-            let mut out_dev = self.stream.alloc_zeros::<f32>(a.slice.len())?;
+            let mut out_dev = self.alloc_output(a.slice.len())?;
             let func = self.function("add_kernel")?;
             let mut args = self.stream.launch_builder(&func);
             args.arg(&a.slice).arg(&b.slice).arg(&mut out_dev).arg(&n);
@@ -370,7 +392,7 @@ impl CudaKernels {
                 format!("add data length {n} is not divisible by broadcast dimension {cols}"),
             ));
         }
-        let mut out_dev = self.stream.alloc_zeros::<f32>(a.slice.len())?;
+        let mut out_dev = self.alloc_output(a.slice.len())?;
         let func = self.function("bias_add_kernel")?;
         let mut args = self.stream.launch_builder(&func);
         args.arg(&a.slice)
@@ -392,7 +414,7 @@ impl CudaKernels {
     ) -> Result<CudaDeviceBuffer, CudaError> {
         same_shape_buf(a, b)?;
         let n = a.slice.len() as u64;
-        let mut out_dev = self.stream.alloc_zeros::<f32>(a.slice.len())?;
+        let mut out_dev = self.alloc_output(a.slice.len())?;
         let func = self.function("mul_kernel")?;
         let mut args = self.stream.launch_builder(&func);
         args.arg(&a.slice).arg(&b.slice).arg(&mut out_dev).arg(&n);
@@ -447,9 +469,7 @@ impl CudaKernels {
                 ),
             ));
         }
-        let mut out_dev = self
-            .stream
-            .alloc_zeros::<f32>(a.slice.len() + b.slice.len())?;
+        let mut out_dev = self.alloc_output(a.slice.len() + b.slice.len())?;
         {
             let (mut first, mut second) = out_dev.split_at_mut(a.slice.len());
             self.stream.memcpy_dtod(&a.slice, &mut first)?;
@@ -466,7 +486,7 @@ impl CudaKernels {
 
     pub fn silu(&self, input: &CudaDeviceBuffer) -> Result<CudaDeviceBuffer, CudaError> {
         let n = input.slice.len() as u64;
-        let mut out_dev = self.stream.alloc_zeros::<f32>(input.slice.len())?;
+        let mut out_dev = self.alloc_output(input.slice.len())?;
         let func = self.function("silu_kernel")?;
         let mut args = self.stream.launch_builder(&func);
         args.arg(&input.slice).arg(&mut out_dev).arg(&n);
@@ -557,7 +577,7 @@ impl CudaKernels {
                 "RMSNorm epsilon must be positive",
             ));
         }
-        let mut out_dev = self.stream.alloc_zeros::<f32>(input.slice.len())?;
+        let mut out_dev = self.alloc_output(input.slice.len())?;
         let func = self.function("rmsnorm_kernel")?;
         let mut args = self.stream.launch_builder(&func);
         args.arg(&input.slice)
@@ -740,7 +760,7 @@ impl CudaKernels {
         } else {
             (b_cols, 1u64)
         };
-        let mut out_dev = self.stream.alloc_zeros::<f32>((m * n) as usize)?;
+        let mut out_dev = self.alloc_output((m * n) as usize)?;
         if b_col_stride == 1 && m <= MATMUL_SPLIT_K_MAX_ROWS {
             let func = self.function("matmul_split_k_kernel")?;
             let mut args = self.stream.launch_builder(&func);
