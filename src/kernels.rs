@@ -687,7 +687,15 @@ impl CudaKernels {
             CudaRopePairing::HalfSplit => 1,
         };
         let work_items = rope_launch_work_items(rows, head_count, half)?;
-        let mut out_dev = self.stream.clone_dtod(&input.slice)?;
+        // Each head's `dimension` leading columns are rotated pair by pair,
+        // the rest pass through unchanged. When the rotation covers the
+        // whole head (Qwen2, Llama) the Kernel writes every element, so the
+        // output needs no copy of the input first.
+        let mut out_dev = if dimension == head_width {
+            self.alloc_output(input.slice.len())?
+        } else {
+            self.stream.clone_dtod(&input.slice)?
+        };
         let func = self.function("rope_kernel")?;
         let mut args = self.stream.launch_builder(&func);
         args.arg(&input.slice)
