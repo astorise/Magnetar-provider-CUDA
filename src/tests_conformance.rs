@@ -568,6 +568,31 @@ fn grouped_query_sliding_window_attention_matches_reference_cpu() {
     assert_close(&download(&kernels, &actual_dev), &expected);
 }
 
+/// An offered output buffer (the previous value of the resource being
+/// overwritten) is reused by a Kernel of the same output length and fully
+/// rewritten; one of another length is left unused.
+#[test]
+fn offered_output_buffer_is_reused_and_fully_rewritten() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let a = HostTensor::new([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+    let b = HostTensor::new([2, 3], [6.0, 5.0, 4.0, 3.0, 2.0, 1.0]).unwrap();
+    let expected = magnetar_provider_cpu::add(&a, &b).unwrap();
+    let garbage = HostTensor::new([2, 3], [f32::NAN; 6]).unwrap();
+    for (offered_shape, offered_len) in [([2u64, 3u64], 6usize), ([1, 4], 4)] {
+        let offered = upload(
+            &kernels,
+            &HostTensor::new(offered_shape, garbage.data[..offered_len].to_vec()).unwrap(),
+        );
+        let _offer = kernels.offer_output(Some(offered.slice));
+        let actual = kernels
+            .add(&upload(&kernels, &a), &upload(&kernels, &b))
+            .unwrap();
+        assert_close(&download(&kernels, &actual), &expected);
+    }
+}
+
 /// Deterministic pseudo-random values in [-0.5, 0.5).
 fn attention_values(len: usize, seed: usize) -> Vec<f32> {
     (0..len)

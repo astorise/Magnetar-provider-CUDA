@@ -563,6 +563,46 @@ impl CudaExecutor {
     }
 
     fn run_invocation(&self, invocation: &KernelInvocation) -> Result<KernelResult, KernelError> {
+        // The resource this invocation overwrites: its previous buffer is
+        // dropped once the new output is stored anyway, so it is offered
+        // to the Kernel as its output allocation (a fresh allocation and a
+        // free per dispatched node otherwise). Never when the invocation
+        // also reads that resource. A dispatch that fails before a Kernel
+        // takes the buffer puts it back, so the resource keeps its value.
+        let previous_output = invocation.outputs.first().and_then(|output| {
+            let id = &output.resource.id;
+            if invocation
+                .inputs
+                .iter()
+                .any(|input| &input.resource.id == id)
+            {
+                return None;
+            }
+            let buffer = self.storage.lock().unwrap().remove(id)?;
+            Some((id.clone(), buffer))
+        });
+        let (restore, offered_slice) = match previous_output {
+            Some((id, buffer)) => (Some((id, buffer.shape)), Some(buffer.slice)),
+            None => (None, None),
+        };
+        let offered = self.kernels.offer_output(offered_slice);
+        let result = self.run_invocation_with_offer(invocation);
+        if result.is_err()
+            && let Some((id, shape)) = restore
+            && let Some(slice) = offered.reclaim()
+        {
+            self.storage
+                .lock()
+                .unwrap()
+                .insert(id, CudaDeviceBuffer { slice, shape });
+        }
+        result
+    }
+
+    fn run_invocation_with_offer(
+        &self,
+        invocation: &KernelInvocation,
+    ) -> Result<KernelResult, KernelError> {
         let name = invocation.kernel.name.as_str();
         let mut result = KernelResult::success(invocation.id.clone());
         // One storage lock for every input this invocation reads: each

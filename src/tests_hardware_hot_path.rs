@@ -241,6 +241,81 @@ fn dispatch(
         .unwrap_or_else(|| panic!("{step_name}: produced no readable output for '{output_id}'"))
 }
 
+/// A dispatch that fails before its Kernel runs (here an input that was
+/// never materialized) leaves the resource it would have overwritten with
+/// its previous value: the executor offers that resource's buffer to the
+/// Kernel as its output allocation, and puts it back when no Kernel took it.
+#[test]
+fn failed_dispatch_keeps_the_overwritten_resource_value_on_real_hardware() {
+    let Some(mut fixture) = chain_fixture_or_skip() else {
+        return;
+    };
+    let a = TensorResourceId::new("offer.a");
+    let missing = TensorResourceId::new("offer.missing");
+    let out = TensorResourceId::new("offer.out");
+    let previous = HostTensor::new([1, 3], [7.0, 8.0, 9.0]).unwrap();
+    stage_weight(
+        &mut fixture,
+        &a,
+        HostTensor::new([1, 3], [1.0, 2.0, 3.0]).unwrap(),
+    );
+    stage_weight(&mut fixture, &out, previous.clone());
+
+    let mut request = KernelSelectionRequest::new(
+        "offer-add",
+        OperatorId::magnetar("add", 1, OperatorFamily::Tensor),
+        fixture.affinity.clone(),
+    );
+    for id in [&a, &missing] {
+        request = request.with_input(KernelResource::new(
+            TensorResourceDescriptor::new(id.clone(), descriptor(1, 3), fixture.affinity.clone()),
+            KernelMemoryClass::Device,
+        ));
+    }
+    request = request.with_output(KernelResource::new(
+        TensorResourceDescriptor::new(out.clone(), descriptor(1, 3), fixture.affinity.clone()),
+        KernelMemoryClass::Device,
+    ));
+    let candidate = fixture
+        .runtime
+        .kernel_registry()
+        .select(&request)
+        .unwrap()
+        .selected
+        .unwrap();
+    let advertisement = fixture
+        .runtime
+        .kernel_registry()
+        .active_advertisement(&candidate.kernel)
+        .unwrap()
+        .clone();
+    let plan = KernelDispatchPlan::from_selection(
+        KernelDispatchPlanId::new("offer-add-dispatch"),
+        &request,
+        &candidate,
+        &advertisement,
+        KernelInvocationId::new("offer-add-invocation"),
+    )
+    .unwrap();
+    let catalog = initial_operator_catalog();
+    let handle = fixture
+        .executor
+        .submit_kernel(
+            &advertisement,
+            catalog.get(&advertisement.implemented_operator).unwrap(),
+            &plan.invocation,
+            fixture.runtime.memory_mut(),
+        )
+        .unwrap();
+    let result = fixture.executor.complete_kernel(&handle).unwrap();
+    assert_ne!(result.status, KernelResultStatus::Succeeded);
+    let kept = fixture
+        .executor
+        .read_tensor(&out)
+        .expect("the previous value is still stored");
+    assert_eq!(kept.data, previous.data);
+}
+
 /// The full chain, run entirely on real CUDA hardware: `weight -> MatMul ->
 /// RMSNorm -> RoPE -> a projection`. Every step's `ResourceAffinity` is the
 /// same CUDA/GPU0 affinity throughout (`fixture.affinity`, reused
