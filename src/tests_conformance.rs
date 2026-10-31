@@ -282,6 +282,60 @@ fn matmul_transposed_matches_reference_cpu() {
     assert_close(&download(&kernels, &actual_dev), &expected);
 }
 
+/// `matmul_bias` (the Runtime's fused `matmul-bias`) against providers/cpu,
+/// and bit-identical to this Provider's own `matmul` followed by `add`, on
+/// the split-K path and the transposed fallback path.
+#[test]
+fn matmul_bias_matches_reference_cpu_and_unfused_device_result() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let values = |count: u64, seed: u64| -> Vec<f32> {
+        (0..count)
+            .map(|i| (((i * 7919 + seed * 104_729) % 2001) as f32 - 1000.0) * 1e-4)
+            .collect()
+    };
+    for (m, k, n, transpose_a) in [(1, 1000, 70, false), (3, 129, 65, false), (4, 50, 40, true)] {
+        let a = if transpose_a {
+            HostTensor::new([k, m], values(m * k, 1)).unwrap()
+        } else {
+            HostTensor::new([m, k], values(m * k, 1)).unwrap()
+        };
+        let b = HostTensor::new([k, n], values(k * n, 2)).unwrap();
+        let bias = HostTensor::new([n], values(n, 3)).unwrap();
+        let expected = magnetar_provider_cpu::add(
+            &magnetar_provider_cpu::matmul(&a, &b, transpose_a, false).unwrap(),
+            &bias,
+        )
+        .unwrap();
+        let (a_dev, b_dev, bias_dev) = (
+            upload(&kernels, &a),
+            upload(&kernels, &b),
+            upload(&kernels, &bias),
+        );
+        let fused = download(
+            &kernels,
+            &kernels
+                .matmul_bias(&a_dev, &b_dev, &bias_dev, transpose_a, false)
+                .unwrap(),
+        );
+        assert_close(&fused, &expected);
+        let unfused = download(
+            &kernels,
+            &kernels
+                .add(
+                    &kernels.matmul(&a_dev, &b_dev, transpose_a, false).unwrap(),
+                    &bias_dev,
+                )
+                .unwrap(),
+        );
+        assert_eq!(
+            fused.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            unfused.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+    }
+}
+
 /// The block-per-row `rmsnorm_kernel` on a width that is not a multiple of
 /// its thread count, with a broadcast and a per-row weight.
 #[test]

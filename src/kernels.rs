@@ -732,6 +732,31 @@ impl CudaKernels {
         transpose_a: bool,
         transpose_b: bool,
     ) -> Result<CudaDeviceBuffer, CudaError> {
+        self.matmul_with_bias(a, b, None, transpose_a, transpose_b)
+    }
+
+    /// `matmul(a, b) + bias`, `bias` a `[n]` (or `[1, n]`) row added to
+    /// every output row: the Runtime's fused `matmul-bias` Operator,
+    /// bit-identical to `matmul` followed by `add`.
+    pub fn matmul_bias(
+        &self,
+        a: &CudaDeviceBuffer,
+        b: &CudaDeviceBuffer,
+        bias: &CudaDeviceBuffer,
+        transpose_a: bool,
+        transpose_b: bool,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        self.matmul_with_bias(a, b, Some(bias), transpose_a, transpose_b)
+    }
+
+    fn matmul_with_bias(
+        &self,
+        a: &CudaDeviceBuffer,
+        b: &CudaDeviceBuffer,
+        bias: Option<&CudaDeviceBuffer>,
+        transpose_a: bool,
+        transpose_b: bool,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
         let (a_rows, a_cols) = rows_cols_buf(a)?;
         let (b_rows, b_cols) = rows_cols_buf(b)?;
         let (m, k) = if transpose_a {
@@ -760,6 +785,18 @@ impl CudaKernels {
         } else {
             (b_cols, 1u64)
         };
+        if let Some(bias) = bias
+            && bias.shape != [n]
+            && bias.shape != [1, n]
+        {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!(
+                    "matmul-bias bias shape must be [{n}] or [1, {n}], got {:?}",
+                    bias.shape
+                ),
+            ));
+        }
         let mut out_dev = self.alloc_output((m * n) as usize)?;
         if b_col_stride == 1 && m <= MATMUL_SPLIT_K_MAX_ROWS {
             let func = self.function("matmul_split_k_kernel")?;
@@ -773,6 +810,10 @@ impl CudaKernels {
                 .arg(&a_row_stride)
                 .arg(&a_inner_stride)
                 .arg(&b_inner_stride);
+            // Without a bias the kernel never reads `bias`; any valid
+            // device pointer will do.
+            let has_bias = i32::from(bias.is_some());
+            args.arg(&bias.unwrap_or(b).slice).arg(&has_bias);
             let config = LaunchConfig {
                 grid_dim: (n.div_ceil(32) as u32, m as u32, 1),
                 block_dim: (32, MATMUL_SPLIT_K, 1),
@@ -797,10 +838,14 @@ impl CudaKernels {
             .arg(&b_inner_stride)
             .arg(&b_col_stride);
         unsafe { args.launch(LaunchConfig::for_num_elems((m * n) as u32)) }?;
-        Ok(CudaDeviceBuffer {
+        let product = CudaDeviceBuffer {
             slice: out_dev,
             shape: vec![m, n],
-        })
+        };
+        match bias {
+            Some(bias) => self.add(&product, bias),
+            None => Ok(product),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

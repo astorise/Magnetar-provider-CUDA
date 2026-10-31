@@ -247,6 +247,9 @@ extern "C" __global__ void matmul_kernel(
 // result is deterministic. Every warp reads 32 consecutive columns of `b`
 // at a time (coalesced), and a decode step's one-row projections get
 // MATMUL_SPLIT_K times more threads than `matmul_kernel` gives them.
+// With `has_bias`, `bias[col]` is added to the finished sum: the same two
+// operations, in the same order, as this kernel followed by
+// `bias_add_kernel`, so a fused `matmul-bias` is bit-identical to them.
 #define MATMUL_SPLIT_K 16
 extern "C" __global__ void matmul_split_k_kernel(
     const float* a,
@@ -257,7 +260,9 @@ extern "C" __global__ void matmul_split_k_kernel(
     unsigned long long n,
     unsigned long long a_row_stride,
     unsigned long long a_inner_stride,
-    unsigned long long b_inner_stride
+    unsigned long long b_inner_stride,
+    const float* bias,
+    int has_bias
 ) {
     __shared__ float partial[MATMUL_SPLIT_K][32];
     unsigned long long row = blockIdx.y;
@@ -276,7 +281,7 @@ extern "C" __global__ void matmul_split_k_kernel(
         for (unsigned int s = 0; s < MATMUL_SPLIT_K; s++) {
             sum += partial[s][threadIdx.x];
         }
-        out[row * n + col] = sum;
+        out[row * n + col] = has_bias ? sum + bias[col] : sum;
     }
 }
 

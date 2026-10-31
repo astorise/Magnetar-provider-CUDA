@@ -578,6 +578,19 @@ impl CudaExecutor {
                         .matmul(a, b, transpose_a, transpose_b)
                         .map_err(KernelError::from)?
                 }
+                // The Runtime's fused `matmul(a, b) + bias` (`graph_fusion`).
+                "matmul-bias" => {
+                    let a = get(0)?;
+                    let b = get(1)?;
+                    let bias = get(2)?;
+                    let transpose_a =
+                        Self::attribute_bool(&invocation.attributes, "transpose_a", false);
+                    let transpose_b =
+                        Self::attribute_bool(&invocation.attributes, "transpose_b", false);
+                    self.kernels
+                        .matmul_bias(a, b, bias, transpose_a, transpose_b)
+                        .map_err(KernelError::from)?
+                }
                 "embedding" => {
                     let table = get(0)?;
                     let ids = get(1)?;
