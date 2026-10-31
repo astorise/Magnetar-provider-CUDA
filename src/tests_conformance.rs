@@ -282,6 +282,79 @@ fn matmul_transposed_matches_reference_cpu() {
     assert_close(&download(&kernels, &actual_dev), &expected);
 }
 
+/// The block-per-row `rmsnorm_kernel` on a width that is not a multiple of
+/// its thread count, with a broadcast and a per-row weight.
+#[test]
+fn block_rmsnorm_matches_reference_cpu_on_wide_rows() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let (rows, cols) = (3u64, 1000u64);
+    let data: Vec<f32> = (0..rows * cols)
+        .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.01)
+        .collect();
+    let input = HostTensor::new([rows, cols], data).unwrap();
+    for weight in [
+        HostTensor::new(
+            [cols],
+            (0..cols).map(|i| 0.5 + i as f32 * 1e-3).collect::<Vec<_>>(),
+        )
+        .unwrap(),
+        HostTensor::new(
+            [rows, cols],
+            (0..rows * cols)
+                .map(|i| 1.0 - (i % 17) as f32 * 0.01)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap(),
+    ] {
+        let expected = magnetar_provider_cpu::rmsnorm(&input, &weight, 1e-6).unwrap();
+        let actual_dev = kernels
+            .rmsnorm(&upload(&kernels, &input), &upload(&kernels, &weight), 1e-6)
+            .unwrap();
+        assert_close(&download(&kernels, &actual_dev), &expected);
+    }
+}
+
+/// `matmul_split_k_kernel`: column counts that are not a multiple of 32,
+/// an inner dimension that is not a multiple of the split, one-row (decode)
+/// and multi-row (prefill) shapes, and a transposed `a`.
+#[test]
+fn split_k_matmul_matches_reference_cpu_on_uneven_shapes() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let values = |count: u64, seed: u64| -> Vec<f32> {
+        (0..count)
+            .map(|i| (((i * 7919 + seed * 104_729) % 2001) as f32 - 1000.0) * 1e-4)
+            .collect()
+    };
+    for (m, k, n, transpose_a) in [
+        (1, 1000, 70, false),
+        (1, 37, 33, false),
+        (3, 129, 65, false),
+        (5, 64, 1, false),
+        (4, 50, 40, true),
+    ] {
+        let a = if transpose_a {
+            HostTensor::new([k, m], values(m * k, 1)).unwrap()
+        } else {
+            HostTensor::new([m, k], values(m * k, 1)).unwrap()
+        };
+        let b = HostTensor::new([k, n], values(k * n, 2)).unwrap();
+        let expected = magnetar_provider_cpu::matmul(&a, &b, transpose_a, false).unwrap();
+        let actual_dev = kernels
+            .matmul(
+                &upload(&kernels, &a),
+                &upload(&kernels, &b),
+                transpose_a,
+                false,
+            )
+            .unwrap();
+        assert_close(&download(&kernels, &actual_dev), &expected);
+    }
+}
+
 #[test]
 fn causal_attention_matches_reference_cpu() {
     let Some(kernels) = kernels_or_skip() else {

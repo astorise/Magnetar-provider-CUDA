@@ -93,9 +93,12 @@ extern "C" __global__ void bias_add_kernel(const float* a, const float* bias, fl
     }
 }
 
-// One thread per row. `weight_row_stride` is 0 for a single broadcast weight
-// row, or `cols` for a per-row weight -- mirrors providers/cpu::rmsnorm's
-// `row_weight_stride` exactly.
+// One block of RMSNORM_THREADS threads per row. `weight_row_stride` is 0
+// for a single broadcast weight row, or `cols` for a per-row weight --
+// mirrors providers/cpu::rmsnorm's `row_weight_stride` exactly. Each thread
+// sums a strided slice of the row's squares, then a fixed-order tree sum
+// combines the slices, so the result is deterministic.
+#define RMSNORM_THREADS 256
 extern "C" __global__ void rmsnorm_kernel(
     const float* input,
     const float* weight,
@@ -105,20 +108,28 @@ extern "C" __global__ void rmsnorm_kernel(
     unsigned long long weight_row_stride,
     float epsilon
 ) {
-    unsigned long long row = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    __shared__ float partial[RMSNORM_THREADS];
+    unsigned long long row = blockIdx.x;
     if (row >= rows) {
         return;
     }
     const float* in_row = input + row * cols;
     const float* w_row = weight + row * weight_row_stride;
-    float mean_square = 0.0f;
-    for (unsigned long long i = 0; i < cols; i++) {
-        mean_square += in_row[i] * in_row[i];
+    float sum = 0.0f;
+    for (unsigned long long i = threadIdx.x; i < cols; i += RMSNORM_THREADS) {
+        sum += in_row[i] * in_row[i];
     }
-    mean_square /= (float)cols;
-    float scale = 1.0f / sqrtf(mean_square + epsilon);
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (unsigned int stride = RMSNORM_THREADS / 2; stride > 0; stride /= 2) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] += partial[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    float scale = 1.0f / sqrtf(partial[0] / (float)cols + epsilon);
     float* out_row = out + row * cols;
-    for (unsigned long long i = 0; i < cols; i++) {
+    for (unsigned long long i = threadIdx.x; i < cols; i += RMSNORM_THREADS) {
         out_row[i] = in_row[i] * scale * w_row[i];
     }
 }
@@ -228,6 +239,45 @@ extern "C" __global__ void matmul_kernel(
         acc += a_value * b_value;
     }
     out[row * n + col] = acc;
+}
+
+// Split-K matmul for a `b` whose columns are contiguous (not transposed):
+// one block per (row, 32-column tile), MATMUL_SPLIT_K warps each summing an
+// interleaved slice of `k`, then a fixed-order sum of the slices, so the
+// result is deterministic. Every warp reads 32 consecutive columns of `b`
+// at a time (coalesced), and a decode step's one-row projections get
+// MATMUL_SPLIT_K times more threads than `matmul_kernel` gives them.
+#define MATMUL_SPLIT_K 16
+extern "C" __global__ void matmul_split_k_kernel(
+    const float* a,
+    const float* b,
+    float* out,
+    unsigned long long m,
+    unsigned long long k,
+    unsigned long long n,
+    unsigned long long a_row_stride,
+    unsigned long long a_inner_stride,
+    unsigned long long b_inner_stride
+) {
+    __shared__ float partial[MATMUL_SPLIT_K][32];
+    unsigned long long row = blockIdx.y;
+    unsigned long long col = (unsigned long long)blockIdx.x * 32 + threadIdx.x;
+    unsigned int slice = threadIdx.y;
+    float acc = 0.0f;
+    if (row < m && col < n) {
+        for (unsigned long long inner = slice; inner < k; inner += MATMUL_SPLIT_K) {
+            acc += a[row * a_row_stride + inner * a_inner_stride] * b[inner * b_inner_stride + col];
+        }
+    }
+    partial[slice][threadIdx.x] = acc;
+    __syncthreads();
+    if (slice == 0 && row < m && col < n) {
+        float sum = 0.0f;
+        for (unsigned int s = 0; s < MATMUL_SPLIT_K; s++) {
+            sum += partial[s][threadIdx.x];
+        }
+        out[row * n + col] = sum;
+    }
 }
 
 // One thread per (head, query_index). Recomputes each query/key dot product
