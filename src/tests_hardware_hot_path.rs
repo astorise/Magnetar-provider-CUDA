@@ -28,7 +28,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use magnetar_runtime::provider::Provider;
+use magnetar_runtime::provider::{Provider, StepCaptureRequest, StepReplayError};
 use magnetar_runtime::{
     ComputeDType, DTypeDescriptor, DeviceBinding, FallbackClass, HostTensor, KernelDispatchPlan,
     KernelDispatchPlanId, KernelInvocationId, KernelMemoryClass, KernelResource,
@@ -610,4 +610,147 @@ fn half_reference(a: &[f32], b: &[f32], dtype: ComputeDType, op: fn(f32, f32) ->
             decode(encode(op(x, y)))
         })
         .collect()
+}
+
+/// `capture-and-replay-cuda-graphs`: a captured `rope -> add` step replays
+/// with its RoPE position advanced by the replay offset and its input
+/// rewritten in place, matching uncaptured dispatches exactly; a replaced
+/// input invalidates the capture, and a host upload while capturing fails
+/// the capture without leaving the stream capturing.
+#[test]
+fn a_captured_step_replays_with_an_advanced_position_on_real_hardware() {
+    let Some(mut fixture) = chain_fixture_or_skip() else {
+        return;
+    };
+    let x = TensorResourceId::new("replay.x");
+    let bias = TensorResourceId::new("replay.bias");
+    let rotated = TensorResourceId::new("replay.rope.out");
+    let sum = TensorResourceId::new("replay.sum.out");
+    let first = HostTensor::new([2, 4], vec![0.5, -1.0, 2.0, 0.25, 1.5, 3.0, -0.75, 1.0]).unwrap();
+    let second = HostTensor::new([2, 4], vec![-2.0, 0.5, 1.0, 4.0, 0.0, -1.5, 2.5, 0.75]).unwrap();
+    stage_weight(
+        &mut fixture,
+        &bias,
+        HostTensor::new([2, 4], vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]).unwrap(),
+    );
+    let step = |fixture: &mut ChainFixture, position: i64| {
+        dispatch(
+            fixture,
+            "replay-rope",
+            "rope",
+            vec![(x.clone(), descriptor(2, 4))],
+            rotated.clone(),
+            descriptor(2, 4),
+            BTreeMap::from([
+                ("base".to_string(), OperatorAttributeValue::Float(10000.0)),
+                ("dimension".to_string(), OperatorAttributeValue::Integer(4)),
+                (
+                    "position_offset".to_string(),
+                    OperatorAttributeValue::Integer(position),
+                ),
+            ]),
+        );
+        dispatch(
+            fixture,
+            "replay-add",
+            "add",
+            vec![
+                (rotated.clone(), descriptor(2, 4)),
+                (bias.clone(), descriptor(2, 4)),
+            ],
+            sum.clone(),
+            descriptor(2, 4),
+            BTreeMap::new(),
+        );
+        fixture.executor.read_tensor(&sum).unwrap().data
+    };
+    stage_weight(&mut fixture, &x, second.clone());
+    let second_at_7 = step(&mut fixture, 7);
+    stage_weight(&mut fixture, &x, first.clone());
+    let first_at_3 = step(&mut fixture, 3);
+    assert_ne!(first_at_3, second_at_7);
+
+    let request = StepCaptureRequest {
+        advancing_attributes: vec!["position_offset".into()],
+    };
+    fixture.executor.begin_step_capture(&request).unwrap();
+    step_without_reading(&mut fixture, &x, &rotated, &bias, &sum, 3);
+    let capture = fixture.executor.end_step_capture().unwrap();
+    assert_eq!(fixture.executor.read_tensor(&sum).unwrap().data, first_at_3);
+
+    fixture
+        .executor
+        .replay_step(&capture, 4, vec![(x.clone(), second.clone())])
+        .unwrap();
+    assert_eq!(
+        fixture.executor.read_tensor(&sum).unwrap().data,
+        second_at_7
+    );
+    fixture
+        .executor
+        .replay_step(&capture, 0, vec![(x.clone(), first.clone())])
+        .unwrap();
+    assert_eq!(fixture.executor.read_tensor(&sum).unwrap().data, first_at_3);
+
+    // A fresh upload gives the input another buffer.
+    stage_weight(&mut fixture, &x, first.clone());
+    assert!(matches!(
+        fixture
+            .executor
+            .replay_step(&capture, 0, vec![(x.clone(), first.clone())]),
+        Err(StepReplayError::Invalidated { .. })
+    ));
+    fixture.executor.release_step_capture(&capture);
+
+    fixture.executor.begin_step_capture(&request).unwrap();
+    assert!(
+        fixture
+            .executor
+            .write_tensor_value(x.clone(), TensorValue::Host(first.clone()))
+            .is_err(),
+        "a host upload cannot be captured"
+    );
+    assert!(fixture.executor.end_step_capture().is_err());
+    // The stream is usable again.
+    assert_eq!(step(&mut fixture, 3), first_at_3);
+}
+
+/// The captured dispatches of [`a_captured_step_replays_with_an_advanced_position_on_real_hardware`]:
+/// nothing may be downloaded while capturing.
+fn step_without_reading(
+    fixture: &mut ChainFixture,
+    x: &TensorResourceId,
+    rotated: &TensorResourceId,
+    bias: &TensorResourceId,
+    sum: &TensorResourceId,
+    position: i64,
+) {
+    dispatch(
+        fixture,
+        "replay-rope",
+        "rope",
+        vec![(x.clone(), descriptor(2, 4))],
+        rotated.clone(),
+        descriptor(2, 4),
+        BTreeMap::from([
+            ("base".to_string(), OperatorAttributeValue::Float(10000.0)),
+            ("dimension".to_string(), OperatorAttributeValue::Integer(4)),
+            (
+                "position_offset".to_string(),
+                OperatorAttributeValue::Integer(position),
+            ),
+        ]),
+    );
+    dispatch(
+        fixture,
+        "replay-add",
+        "add",
+        vec![
+            (rotated.clone(), descriptor(2, 4)),
+            (bias.clone(), descriptor(2, 4)),
+        ],
+        sum.clone(),
+        descriptor(2, 4),
+        BTreeMap::new(),
+    );
 }

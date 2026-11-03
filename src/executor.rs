@@ -38,7 +38,10 @@ use magnetar_runtime::memory::{
     MemoryError, MemoryManager, MemoryPlacement, TensorResidency,
 };
 use magnetar_runtime::operator::{OperatorAttributeValue, OperatorSpec};
-use magnetar_runtime::provider::{ProviderExecutionApi, TensorValue, TensorValueAdmissionError};
+use magnetar_runtime::provider::{
+    ProviderExecutionApi, StepCaptureId, StepCaptureRequest, StepReplayError, TensorValue,
+    TensorValueAdmissionError,
+};
 use magnetar_runtime::scheduler::{
     ProviderCancellationOutcome, ProviderExecutionError, ProviderExecutionErrorCode,
     ProviderExecutionHandle, ProviderExecutionId, ProviderExecutionPhase, ProviderExecutionRequest,
@@ -47,7 +50,7 @@ use magnetar_runtime::scheduler::{
 use magnetar_runtime::{ExecutionPlanId, HostTensor};
 
 use crate::error::CudaError;
-use crate::kernels::{CudaDeviceBuffer, CudaHalfDType, CudaKernels, CudaRopePairing};
+use crate::kernels::{CapturedStep, CudaDeviceBuffer, CudaHalfDType, CudaKernels, CudaRopePairing};
 
 /// Reads which half-precision format an `add-half`/`mul-half` invocation
 /// was selected for from its own declared input dtype -- the Kernel
@@ -85,6 +88,26 @@ pub struct CudaExecutor {
     kernel_executions: Mutex<BTreeMap<ProviderExecutionId, KernelResult>>,
     resource_allocations: Mutex<BTreeMap<TensorResourceId, MemoryAllocationId>>,
     next_execution_ordinal: AtomicU64,
+    /// Decode-step capture and replay (`capture-and-replay-cuda-graphs`).
+    step_capture: Mutex<StepCaptureState>,
+}
+
+/// The device address and length (in floats) of a resource's buffer, as a
+/// step capture recorded it.
+type CapturedResources = BTreeMap<TensorResourceId, (u64, usize)>;
+
+#[derive(Default)]
+struct StepCaptureState {
+    /// The resources the capture in progress touched so far.
+    recording: Option<CapturedResources>,
+    captures: BTreeMap<StepCaptureId, CapturedExecutorStep>,
+    next_capture: u64,
+}
+
+/// One captured step: its graph, and the exact buffers it reads and writes.
+struct CapturedExecutorStep {
+    step: CapturedStep,
+    resources: CapturedResources,
 }
 
 impl CudaExecutor {
@@ -103,6 +126,180 @@ impl CudaExecutor {
             kernel_executions: Mutex::new(BTreeMap::new()),
             resource_allocations: Mutex::new(BTreeMap::new()),
             next_execution_ordinal: AtomicU64::new(0),
+            step_capture: Mutex::new(StepCaptureState::default()),
+        }
+    }
+
+    fn step_capture_error(
+        &self,
+        phase: ProviderExecutionPhase,
+        detail: String,
+    ) -> ProviderExecutionError {
+        ProviderExecutionError::new(
+            ProviderExecutionErrorCode::ExecutionFailed,
+            phase,
+            self.provider_binding(),
+            Some(self.device_binding()),
+            detail,
+        )
+    }
+
+    /// See [`ProviderExecutionApi::begin_step_capture`]: the invocations up
+    /// to [`Self::end_step_capture`] are captured into a CUDA graph instead
+    /// of running.
+    pub fn begin_step_capture(
+        &self,
+        request: &StepCaptureRequest,
+    ) -> Result<(), ProviderExecutionError> {
+        let mut state = self.step_capture.lock().unwrap();
+        if state.recording.is_some() {
+            return Err(self.step_capture_error(
+                ProviderExecutionPhase::Submit,
+                "a step capture is already in progress".into(),
+            ));
+        }
+        self.kernels
+            .begin_capture(request.advancing_attributes.iter().cloned().collect())
+            .map_err(|error| {
+                self.step_capture_error(ProviderExecutionPhase::Submit, error.to_string())
+            })?;
+        state.recording = Some(BTreeMap::new());
+        Ok(())
+    }
+
+    /// See [`ProviderExecutionApi::end_step_capture`]: instantiates the
+    /// captured graph and runs it once, so the captured step's results are
+    /// available.
+    pub fn end_step_capture(&self) -> Result<StepCaptureId, ProviderExecutionError> {
+        let mut state = self.step_capture.lock().unwrap();
+        let Some(resources) = state.recording.take() else {
+            return Err(self.step_capture_error(
+                ProviderExecutionPhase::Complete,
+                "no step capture is in progress".into(),
+            ));
+        };
+        let complete = |error: CudaError| {
+            self.step_capture_error(ProviderExecutionPhase::Complete, error.to_string())
+        };
+        let mut step = self.kernels.end_capture().map_err(complete)?;
+        self.kernels
+            .launch_captured(&mut step, 0)
+            .map_err(complete)?;
+        if step.embedding_vocab.is_some() {
+            self.kernels.check_embedding_flag().map_err(complete)?;
+        }
+        let id = StepCaptureId::new(format!(
+            "{}:step-capture:{}",
+            self.provider_name, state.next_capture
+        ));
+        state.next_capture += 1;
+        state
+            .captures
+            .insert(id.clone(), CapturedExecutorStep { step, resources });
+        Ok(id)
+    }
+
+    /// See [`ProviderExecutionApi::abort_step_capture`].
+    pub fn abort_step_capture(&self) {
+        self.step_capture.lock().unwrap().recording = None;
+        self.kernels.abort_capture();
+    }
+
+    /// See [`ProviderExecutionApi::replay_step`].
+    pub fn replay_step(
+        &self,
+        id: &StepCaptureId,
+        offset: u64,
+        inputs: Vec<(TensorResourceId, HostTensor)>,
+    ) -> Result<(), StepReplayError> {
+        let invalidated = |reason: String| StepReplayError::Invalidated { reason };
+        let mut state = self.step_capture.lock().unwrap();
+        let captured = state
+            .captures
+            .get_mut(id)
+            .ok_or_else(|| invalidated(format!("no step capture '{id}'")))?;
+        if offset > captured.step.max_offset {
+            return Err(invalidated(format!(
+                "offset {offset} leaves the captured bounds (at most {})",
+                captured.step.max_offset
+            )));
+        }
+        let mut storage = self.storage.lock().unwrap();
+        for (resource, (address, len)) in &captured.resources {
+            let current = storage
+                .get(resource)
+                .map(|buffer| (self.kernels.address(buffer), buffer.slice.len()));
+            if current != Some((*address, *len)) {
+                return Err(invalidated(format!(
+                    "resource '{resource}' no longer has its captured storage"
+                )));
+            }
+        }
+        for (resource, tensor) in &inputs {
+            if !captured.resources.contains_key(resource) {
+                return Err(invalidated(format!(
+                    "input '{resource}' was not read by the captured step"
+                )));
+            }
+            if let Some(vocab) = captured.step.embedding_vocab
+                && tensor.data.iter().any(|&value| {
+                    !(value >= 0.0 && value == value.floor() && (value as u64) < vocab)
+                })
+            {
+                return Err(StepReplayError::Failed(self.step_capture_error(
+                    ProviderExecutionPhase::Submit,
+                    "embedding lookup id is not a valid in-range non-negative integer".into(),
+                )));
+            }
+        }
+        let failed = |error: CudaError| {
+            StepReplayError::Failed(
+                self.step_capture_error(ProviderExecutionPhase::Submit, error.to_string()),
+            )
+        };
+        for (resource, tensor) in inputs {
+            let buffer = storage
+                .get_mut(&resource)
+                .expect("every input was checked above");
+            self.kernels
+                .write_into(buffer, &tensor.data)
+                .map_err(failed)?;
+        }
+        drop(storage);
+        self.kernels
+            .launch_captured(&mut captured.step, offset)
+            .map_err(failed)
+    }
+
+    /// See [`ProviderExecutionApi::release_step_capture`].
+    pub fn release_step_capture(&self, id: &StepCaptureId) {
+        self.step_capture.lock().unwrap().captures.remove(id);
+    }
+
+    /// Records the buffers `invocation` read and wrote, while capturing.
+    fn record_captured_resources(&self, invocation: &KernelInvocation) {
+        if self.step_capture.lock().unwrap().recording.is_none() {
+            return;
+        }
+        let touched: Vec<(TensorResourceId, (u64, usize))> = {
+            let storage = self.storage.lock().unwrap();
+            invocation
+                .inputs
+                .iter()
+                .chain(&invocation.outputs)
+                .filter_map(|resource| {
+                    let id = &resource.resource.id;
+                    storage.get(id).map(|buffer| {
+                        (
+                            id.clone(),
+                            (self.kernels.address(buffer), buffer.slice.len()),
+                        )
+                    })
+                })
+                .collect()
+        };
+        if let Some(recording) = self.step_capture.lock().unwrap().recording.as_mut() {
+            recording.extend(touched);
         }
     }
 
@@ -563,6 +760,17 @@ impl CudaExecutor {
     }
 
     fn run_invocation(&self, invocation: &KernelInvocation) -> Result<KernelResult, KernelError> {
+        let result = self.run_invocation_uncaptured(invocation);
+        if result.is_ok() {
+            self.record_captured_resources(invocation);
+        }
+        result
+    }
+
+    fn run_invocation_uncaptured(
+        &self,
+        invocation: &KernelInvocation,
+    ) -> Result<KernelResult, KernelError> {
         if invocation.kernel.name == "kv-write" {
             return self.run_kv_write(invocation);
         }
@@ -1347,6 +1555,38 @@ impl ProviderExecutionApi for CudaExecutor {
 
     fn observations(&self) -> Vec<KernelObservation> {
         CudaExecutor::observations(self)
+    }
+
+    fn supports_step_capture(&self) -> bool {
+        true
+    }
+
+    fn begin_step_capture(
+        &self,
+        request: &StepCaptureRequest,
+    ) -> Result<(), ProviderExecutionError> {
+        CudaExecutor::begin_step_capture(self, request)
+    }
+
+    fn end_step_capture(&self) -> Result<StepCaptureId, ProviderExecutionError> {
+        CudaExecutor::end_step_capture(self)
+    }
+
+    fn abort_step_capture(&self) {
+        CudaExecutor::abort_step_capture(self)
+    }
+
+    fn replay_step(
+        &self,
+        id: &StepCaptureId,
+        offset: u64,
+        inputs: Vec<(TensorResourceId, HostTensor)>,
+    ) -> Result<(), StepReplayError> {
+        CudaExecutor::replay_step(self, id, offset, inputs)
+    }
+
+    fn release_step_capture(&self, id: &StepCaptureId) {
+        CudaExecutor::release_step_capture(self, id)
     }
 }
 

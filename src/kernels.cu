@@ -163,7 +163,10 @@ extern "C" __global__ void rope_kernel(
     unsigned long long dimension,
     unsigned long long position_offset,
     unsigned long long head_count,
-    unsigned int half_split
+    unsigned int half_split,
+    // A captured step's replay offset (`capture-and-replay-cuda-graphs`),
+    // added to `position_offset`; null outside a capture.
+    const unsigned long long* step_offset
 ) {
     unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     unsigned long long per_row = head_count * half;
@@ -176,6 +179,9 @@ extern "C" __global__ void rope_kernel(
     unsigned long long rem = idx % per_row;
     unsigned long long head = rem / half;
     unsigned long long pair = rem % half;
+    if (step_offset) {
+        position_offset += *step_offset;
+    }
     float position = (float)(position_offset + row) * scale;
     float frequency = powf(base, -2.0f * (float)pair / (float)dimension);
     float angle = position * frequency;
@@ -412,9 +418,16 @@ extern "C" __global__ void attention_block_kernel(
     unsigned long long kv_model_dim,
     int causal,
     long long window_size, // -1 means "no window"
-    unsigned long long query_position_offset
+    unsigned long long query_position_offset,
+    // A captured step's replay offset, added to the key count and the
+    // query position; null outside a capture.
+    const unsigned long long* step_offset
 ) {
     extern __shared__ float shared[];
+    if (step_offset) {
+        kv_seq_len += *step_offset;
+        query_position_offset += *step_offset;
+    }
     float* q_shared = shared;
     float* reduce = shared + head_dimension;
     float* scores = reduce + ATTENTION_THREADS;
@@ -661,4 +674,23 @@ extern "C" __global__ void mul_bf16_kernel(const unsigned short* a, const unsign
     if (i < n) {
         out[i] = float_to_bf16_bits(bf16_bits_to_float(a[i]) * bf16_bits_to_float(b[i]));
     }
+}
+
+// `kv-write` (`append-kv-history-in-place`): copies `n` floats of new rows
+// into the store at `row_offset` rows of `width`, plus a captured step's
+// replay offset when `step_offset` is not null.
+extern "C" __global__ void kv_write_kernel(
+    const float* rows,
+    float* store,
+    unsigned long long n,
+    unsigned long long width,
+    unsigned long long row_offset,
+    const unsigned long long* step_offset
+) {
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    unsigned long long offset = row_offset + (step_offset ? *step_offset : 0);
+    store[offset * width + i] = rows[i];
 }

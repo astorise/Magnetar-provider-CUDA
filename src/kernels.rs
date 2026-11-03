@@ -19,10 +19,12 @@
 //! [`CudaDeviceBuffer`] directly instead of downloading and re-uploading it.
 
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
+    CudaContext, CudaFunction, CudaGraph, CudaModule, CudaSlice, CudaStream, DevicePtr,
+    LaunchConfig, PushKernelArg, sys,
 };
 use cudarc::nvrtc::compile_ptx;
 use magnetar_runtime::HostTensor;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -179,7 +181,49 @@ pub struct CudaKernels {
     /// taken by the next [`Self::alloc_output`] of the same length instead
     /// of a fresh device allocation. See [`Self::offer_output`].
     offered_output: std::sync::Mutex<Option<CudaSlice<f32>>>,
+    /// The step capture in progress on this stream, if any
+    /// (`capture-and-replay-cuda-graphs`).
+    capture: std::sync::Mutex<Option<KernelCapture>>,
+    /// The embedding lookup's invalid-id flag, allocated once.
+    embedding_flag: std::sync::Mutex<Option<CudaSlice<i32>>>,
 }
+
+/// A step capture in progress: what the captured launches need, and what
+/// a replay must check.
+struct KernelCapture {
+    /// Integer attributes that advance by the replay offset.
+    advancing: BTreeSet<String>,
+    /// The replay offset, read by every captured launch whose attribute
+    /// advances.
+    offset: CudaSlice<u64>,
+    /// The largest offset every captured launch stays within bounds for.
+    max_offset: u64,
+    /// Why the capture cannot be used, once something unsupported happened.
+    failure: Option<String>,
+    /// The vocabulary size of a captured embedding lookup, whose replayed
+    /// token ids are checked on the host.
+    embedding_vocab: Option<u64>,
+}
+
+/// A captured step's CUDA graph and what replaying it needs.
+pub struct CapturedStep {
+    graph: CapturedGraph,
+    offset: CudaSlice<u64>,
+    /// The largest replay offset every captured launch stays within bounds
+    /// for.
+    pub max_offset: u64,
+    /// The vocabulary size of a captured embedding lookup.
+    pub embedding_vocab: Option<u64>,
+}
+
+/// A `CudaGraph`, which holds raw driver handles.
+struct CapturedGraph(CudaGraph);
+
+// SAFETY: a captured graph is only ever launched or dropped by the
+// executor that owns it, under that executor's capture lock, so no two
+// threads touch its handles at once (CUDA graphs require external
+// serialization, which the lock provides).
+unsafe impl Send for CapturedGraph {}
 
 /// Drops an [`CudaKernels::offer_output`] buffer that the invocation did
 /// not take.
@@ -202,20 +246,23 @@ impl Drop for OfferedOutput<'_> {
 
 impl CudaKernels {
     pub fn compile_and_load(context: &Arc<CudaContext>) -> Result<Self, CudaError> {
-        // cudarc only synchronizes through per-buffer events once a context
-        // has more than its default stream, and this Provider never creates
-        // one: every buffer is allocated, used and freed on the context's
-        // default stream. Event tracking would still create and destroy two
-        // events with every allocation (one per Kernel output, hundreds per
-        // decode step) without ever waiting on them.
+        // cudarc synchronizes buffers across streams through per-buffer
+        // events. This Provider uses exactly one stream (created below):
+        // every buffer is allocated, used and freed on it. Event tracking
+        // would still create and destroy two events with every allocation
+        // (one per Kernel output, hundreds per decode step) without the
+        // ordering ever needing them.
         //
-        // SAFETY: nothing here creates a second stream, so no buffer is used
-        // across streams of this context; turning tracking off changes no
-        // synchronization cudarc actually performs.
+        // SAFETY: every buffer of this Provider lives on its one stream, so
+        // no buffer is used across streams; single-stream ordering is all
+        // the synchronization its work needs.
         unsafe { context.disable_event_tracking() };
         let ptx = compile_ptx(KERNEL_SOURCE)?;
         let module = context.load_module(ptx)?;
-        let stream = context.default_stream();
+        // A stream of its own: CUDA cannot capture the legacy default
+        // stream (`capture-and-replay-cuda-graphs`). Every buffer and
+        // launch of this Provider still uses this one stream.
+        let stream = context.new_stream()?;
         Ok(Self {
             stream,
             module,
@@ -223,7 +270,142 @@ impl CudaKernels {
             download_count: AtomicU64::new(0),
             functions: std::sync::Mutex::new(std::collections::HashMap::new()),
             offered_output: std::sync::Mutex::new(None),
+            capture: std::sync::Mutex::new(None),
+            embedding_flag: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Starts capturing this stream's work into a CUDA graph. Every later
+    /// launch whose attribute is named in `advancing` reads the replay
+    /// offset from the Device.
+    pub fn begin_capture(&self, advancing: BTreeSet<String>) -> Result<(), CudaError> {
+        let mut capture = self.capture.lock().unwrap();
+        if capture.is_some() {
+            return Err(CudaError::new(
+                CudaErrorCode::CaptureUnsupported,
+                "a step capture is already in progress",
+            ));
+        }
+        // Allocated before the capture starts: nothing allocates while
+        // capturing.
+        let offset = self.stream.alloc_zeros::<u64>(1)?;
+        self.stream
+            .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+        *capture = Some(KernelCapture {
+            advancing,
+            offset,
+            max_offset: u64::MAX,
+            failure: None,
+            embedding_vocab: None,
+        });
+        Ok(())
+    }
+
+    /// Ends the capture and instantiates its graph. Fails when anything
+    /// the capture cannot replay happened while capturing.
+    pub fn end_capture(&self) -> Result<CapturedStep, CudaError> {
+        let capture = self.capture.lock().unwrap().take().ok_or_else(|| {
+            CudaError::new(
+                CudaErrorCode::CaptureUnsupported,
+                "no step capture is in progress",
+            )
+        })?;
+        let graph = self.stream.end_capture(
+            sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+        );
+        if let Some(failure) = capture.failure {
+            return Err(CudaError::new(CudaErrorCode::CaptureUnsupported, failure));
+        }
+        let graph = graph?.ok_or_else(|| {
+            CudaError::new(
+                CudaErrorCode::CaptureUnsupported,
+                "the step capture recorded no work",
+            )
+        })?;
+        Ok(CapturedStep {
+            graph: CapturedGraph(graph),
+            offset: capture.offset,
+            max_offset: capture.max_offset,
+            embedding_vocab: capture.embedding_vocab,
+        })
+    }
+
+    /// Ends the capture in progress, if any, and discards it.
+    pub fn abort_capture(&self) {
+        if self.capture.lock().unwrap().take().is_some() {
+            let _ = self.stream.end_capture(
+                sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+            );
+        }
+    }
+
+    /// Launches a captured step with every advancing attribute increased by
+    /// `offset`. The caller checks `offset` against `step.max_offset`.
+    pub fn launch_captured(&self, step: &mut CapturedStep, offset: u64) -> Result<(), CudaError> {
+        self.stream.memcpy_htod(&[offset], &mut step.offset)?;
+        step.graph.0.launch()?;
+        Ok(())
+    }
+
+    /// The device address of `buffer`'s allocation, as a capture records it.
+    pub fn address(&self, buffer: &CudaDeviceBuffer) -> u64 {
+        let (address, _sync) = buffer.slice.device_ptr(&self.stream);
+        address
+    }
+
+    /// Writes `values` into `buffer`'s existing allocation.
+    pub fn write_into(
+        &self,
+        buffer: &mut CudaDeviceBuffer,
+        values: &[f32],
+    ) -> Result<(), CudaError> {
+        if values.len() != buffer.slice.len() {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!(
+                    "{} values cannot overwrite a buffer of {}",
+                    values.len(),
+                    buffer.slice.len()
+                ),
+            ));
+        }
+        self.stream.memcpy_htod(values, &mut buffer.slice)?;
+        self.upload_count.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Fails the capture in progress, if any, because of `what`: nothing
+    /// that allocates, transfers or synchronizes can be captured.
+    fn forbid_in_capture(&self, what: &str) -> Result<(), CudaError> {
+        let mut capture = self.capture.lock().unwrap();
+        match capture.as_mut() {
+            Some(capture) => {
+                let reason = format!("{what} cannot be captured");
+                capture.failure.get_or_insert(reason.clone());
+                Err(CudaError::new(CudaErrorCode::CaptureUnsupported, reason))
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// While capturing, the device address of the replay offset for a
+    /// launch whose `attribute` advances, after recording that the launch
+    /// stays within bounds for offsets up to `max_offset`. Zero (no offset)
+    /// outside a capture or for an attribute that does not advance.
+    fn advancing_offset(&self, attribute: &str, max_offset: u64) -> u64 {
+        let mut capture = self.capture.lock().unwrap();
+        match capture.as_mut() {
+            Some(capture) if capture.advancing.contains(attribute) => {
+                capture.max_offset = capture.max_offset.min(max_offset);
+                let (address, _sync) = capture.offset.device_ptr(&self.stream);
+                address
+            }
+            _ => 0,
+        }
+    }
+
+    fn is_capturing(&self) -> bool {
+        self.capture.lock().unwrap().is_some()
     }
 
     /// Test/diagnostic-only: number of real host-to-device uploads
@@ -256,6 +438,7 @@ impl CudaKernels {
     /// executor's device allocation table) invoke this only when a
     /// resource does not already have a live device buffer.
     pub fn upload(&self, tensor: &HostTensor) -> Result<CudaDeviceBuffer, CudaError> {
+        self.forbid_in_capture("a host-to-device upload")?;
         let slice = self.stream.clone_htod(&tensor.data)?;
         self.upload_count.fetch_add(1, Ordering::Relaxed);
         Ok(CudaDeviceBuffer {
@@ -270,6 +453,7 @@ impl CudaKernels {
     /// or `TensorValue::into_host` at a real materialization boundary), not
     /// as an automatic step of every Kernel invocation.
     pub fn download(&self, buffer: &CudaDeviceBuffer) -> Result<HostTensor, CudaError> {
+        self.forbid_in_capture("a device-to-host download")?;
         let data = self.stream.clone_dtoh(&buffer.slice)?;
         self.stream.synchronize()?;
         self.download_count.fetch_add(1, Ordering::Relaxed);
@@ -287,6 +471,7 @@ impl CudaKernels {
         tensor: &HostTensor,
         dtype: CudaHalfDType,
     ) -> Result<CudaHalfBuffer, CudaError> {
+        self.forbid_in_capture("a host-to-device upload")?;
         let bits: Vec<u16> = match dtype {
             CudaHalfDType::Float16 => tensor
                 .data
@@ -313,6 +498,7 @@ impl CudaKernels {
     /// `half_precision::f16_to_f32`/`bf16_to_f32` -- the inverse of
     /// [`Self::upload_half`].
     pub fn download_half(&self, buffer: &CudaHalfBuffer) -> Result<HostTensor, CudaError> {
+        self.forbid_in_capture("a device-to-host download")?;
         let bits = self.stream.clone_dtoh(&buffer.slice)?;
         self.stream.synchronize()?;
         self.download_count.fetch_add(1, Ordering::Relaxed);
@@ -341,6 +527,7 @@ impl CudaKernels {
         b: &CudaHalfBuffer,
     ) -> Result<CudaHalfBuffer, CudaError> {
         same_shape_half(a, b)?;
+        self.forbid_in_capture("a half-precision Kernel")?;
         let n = a.slice.len() as u64;
         let mut out_dev = self.stream.alloc_zeros::<u16>(a.slice.len())?;
         let func = self.function(half_kernel_name("add", a.dtype))?;
@@ -361,6 +548,7 @@ impl CudaKernels {
         b: &CudaHalfBuffer,
     ) -> Result<CudaHalfBuffer, CudaError> {
         same_shape_half(a, b)?;
+        self.forbid_in_capture("a half-precision Kernel")?;
         let n = a.slice.len() as u64;
         let mut out_dev = self.stream.alloc_zeros::<u16>(a.slice.len())?;
         let func = self.function(half_kernel_name("mul", a.dtype))?;
@@ -409,9 +597,23 @@ impl CudaKernels {
                 ),
             ));
         }
-        let start = (row_offset * width) as usize;
-        let mut destination = store.slice.slice_mut(start..start + rows.slice.len());
-        self.stream.memcpy_dtod(&rows.slice, &mut destination)?;
+        // A Kernel rather than a copy: a captured copy's destination is
+        // fixed, while a captured `kv-write` writes at its row offset plus
+        // the replay offset.
+        let step_offset = self.advancing_offset("row_offset", capacity - (row_offset + count));
+        let n = rows.slice.len() as u64;
+        if n == 0 {
+            return Ok(());
+        }
+        let func = self.function("kv_write_kernel")?;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(&rows.slice)
+            .arg(&mut store.slice)
+            .arg(&n)
+            .arg(&width)
+            .arg(&row_offset)
+            .arg(&step_offset);
+        unsafe { args.launch(LaunchConfig::for_num_elems(n as u32)) }?;
         Ok(())
     }
 
@@ -439,12 +641,14 @@ impl CudaKernels {
                 return Ok(offered.take().expect("checked above"));
             }
         }
+        self.forbid_in_capture("a device allocation")?;
         // SAFETY: every caller launches a Kernel or copy that writes all
         // `len` elements on this same stream before the buffer is read.
         Ok(unsafe { self.stream.alloc::<f32>(len) }?)
     }
 
     pub fn clone_buffer(&self, buffer: &CudaDeviceBuffer) -> Result<CudaDeviceBuffer, CudaError> {
+        self.forbid_in_capture("a buffer copy")?;
         let slice = self.stream.clone_dtod(&buffer.slice)?;
         Ok(CudaDeviceBuffer {
             slice,
@@ -609,10 +813,17 @@ impl CudaKernels {
     ) -> Result<CudaDeviceBuffer, CudaError> {
         let (vocab, dim) = rows_cols_buf(table)?;
         let num_ids = ids.slice.len() as u64;
-        let mut out_dev = self
-            .stream
-            .alloc_zeros::<f32>(ids.slice.len() * dim as usize)?;
-        let mut invalid_id_flag = self.stream.alloc_zeros::<i32>(1)?;
+        // Rows of invalid ids stay unwritten, but those fail the lookup.
+        let mut out_dev = self.alloc_output(ids.slice.len() * dim as usize)?;
+        let mut flag_slot = self.embedding_flag.lock().unwrap();
+        let mut invalid_id_flag = match flag_slot.take() {
+            Some(flag) => flag,
+            None => {
+                self.forbid_in_capture("a device allocation")?;
+                self.stream.alloc_zeros::<i32>(1)?
+            }
+        };
+        self.stream.memset_zeros(&mut invalid_id_flag)?;
         let func = self.function("embedding_lookup_kernel")?;
         let mut args = self.stream.launch_builder(&func);
         args.arg(&table.slice)
@@ -622,12 +833,38 @@ impl CudaKernels {
             .arg(&num_ids)
             .arg(&vocab)
             .arg(&mut invalid_id_flag);
-        unsafe { args.launch(LaunchConfig::for_num_elems(num_ids as u32)) }?;
+        let launched = unsafe { args.launch(LaunchConfig::for_num_elems(num_ids as u32)) };
+        *flag_slot = Some(invalid_id_flag);
+        drop(flag_slot);
+        launched?;
+        // A captured lookup's flag is checked once the captured step has
+        // run (`Self::check_embedding_flag`), and every replay checks its
+        // ids on the host.
+        if let Some(capture) = self.capture.lock().unwrap().as_mut() {
+            capture.embedding_vocab = Some(vocab);
+            return Ok(CudaDeviceBuffer {
+                slice: out_dev,
+                shape: vec![num_ids, dim],
+            });
+        }
         // Data-dependent failure (an out-of-range or non-integer token id)
         // can only be observed by downloading this one-element flag -- the
         // same device-computed-flag pattern `softmax_rows` already uses
         // below, not a blanket per-kernel host round-trip.
-        let flag = self.stream.clone_dtoh(&invalid_id_flag)?;
+        self.check_embedding_flag()?;
+        Ok(CudaDeviceBuffer {
+            slice: out_dev,
+            shape: vec![num_ids, dim],
+        })
+    }
+
+    /// Fails when the last embedding lookup met an invalid id. Waits for
+    /// the Device.
+    pub fn check_embedding_flag(&self) -> Result<(), CudaError> {
+        let flag = match self.embedding_flag.lock().unwrap().as_ref() {
+            Some(flag) => self.stream.clone_dtoh(flag)?,
+            None => return Ok(()),
+        };
         self.stream.synchronize()?;
         if flag[0] != 0 {
             return Err(CudaError::new(
@@ -635,10 +872,7 @@ impl CudaKernels {
                 "embedding lookup id is not a valid in-range non-negative integer",
             ));
         }
-        Ok(CudaDeviceBuffer {
-            slice: out_dev,
-            shape: vec![num_ids, dim],
-        })
+        Ok(())
     }
 
     pub fn rmsnorm(
@@ -790,8 +1024,10 @@ impl CudaKernels {
         let mut out_dev = if dimension == head_width {
             self.alloc_output(input.slice.len())?
         } else {
+            self.forbid_in_capture("a buffer copy")?;
             self.stream.clone_dtod(&input.slice)?
         };
+        let step_offset = self.advancing_offset("position_offset", u64::MAX);
         let func = self.function("rope_kernel")?;
         let mut args = self.stream.launch_builder(&func);
         args.arg(&input.slice)
@@ -804,7 +1040,8 @@ impl CudaKernels {
             .arg(&dimension)
             .arg(&position_offset)
             .arg(&head_count)
-            .arg(&half_split);
+            .arg(&half_split)
+            .arg(&step_offset);
         unsafe { args.launch(LaunchConfig::for_num_elems(work_items)) }?;
         Ok(CudaDeviceBuffer {
             slice: out_dev,
@@ -814,6 +1051,7 @@ impl CudaKernels {
 
     pub fn softmax_rows(&self, input: &CudaDeviceBuffer) -> Result<CudaDeviceBuffer, CudaError> {
         let (rows, cols) = rows_cols_buf(input)?;
+        self.forbid_in_capture("softmax")?;
         let mut out_dev = self.stream.alloc_zeros::<f32>(input.slice.len())?;
         let mut flag_dev = self.stream.alloc_zeros::<i32>(1)?;
         let func = self.function("softmax_rows_kernel")?;
@@ -1142,7 +1380,18 @@ impl CudaKernels {
         // `attention_block_kernel` keeps q, its reduction slots and every
         // score of one (head, query) in shared memory; longer histories
         // than that fits use the one-thread-per-(head, query) kernel.
-        let block_shared_bytes = (head_dimension + ATTENTION_THREADS as u64 + kv_seq_len)
+        // A captured, bounded attention reads its key count from the
+        // replay offset, so its shared memory must hold every row of K.
+        let step_offset = match key_count {
+            Some(_) => self.advancing_offset("key_count", kv_rows - kv_seq_len),
+            None => 0,
+        };
+        let score_rows = if step_offset != 0 {
+            kv_rows
+        } else {
+            kv_seq_len
+        };
+        let block_shared_bytes = (head_dimension + ATTENTION_THREADS as u64 + score_rows)
             * std::mem::size_of::<f32>() as u64;
         if block_shared_bytes <= ATTENTION_MAX_SHARED_BYTES {
             let blocks = u32::try_from(head_count * seq_len).map_err(|_| {
@@ -1168,7 +1417,8 @@ impl CudaKernels {
                 .arg(&kv_model_dim)
                 .arg(&causal_flag)
                 .arg(&window_arg)
-                .arg(&query_position_offset);
+                .arg(&query_position_offset)
+                .arg(&step_offset);
             let config = LaunchConfig {
                 grid_dim: (blocks, 1, 1),
                 block_dim: (ATTENTION_THREADS, 1, 1),
@@ -1179,6 +1429,10 @@ impl CudaKernels {
                 slice: out_dev,
                 shape: q.shape.clone(),
             });
+        }
+        if self.is_capturing() {
+            // The one-thread-per-(head, query) Kernel has no replay offset.
+            self.forbid_in_capture("attention over a history this long")?;
         }
         let mut out_dev = self.stream.alloc_zeros::<f32>(q.slice.len())?;
         let func = self.function("attention_kernel")?;
