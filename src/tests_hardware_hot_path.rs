@@ -612,7 +612,7 @@ fn half_reference(a: &[f32], b: &[f32], dtype: ComputeDType, op: fn(f32, f32) ->
         .collect()
 }
 
-/// `capture-and-replay-cuda-graphs`: a captured `rope -> add` step replays
+/// `capture-and-replay-cuda-graphs`: a captured `rope -> rmsnorm` step replays
 /// with its RoPE position advanced by the replay offset and its input
 /// rewritten in place, matching uncaptured dispatches exactly; a replaced
 /// input invalidates the capture, and a host upload while capturing fails
@@ -623,7 +623,7 @@ fn a_captured_step_replays_with_an_advanced_position_on_real_hardware() {
         return;
     };
     let x = TensorResourceId::new("replay.x");
-    let bias = TensorResourceId::new("replay.bias");
+    let bias = TensorResourceId::new("replay.norm.weight");
     let rotated = TensorResourceId::new("replay.rope.out");
     let sum = TensorResourceId::new("replay.sum.out");
     let first = HostTensor::new([2, 4], vec![0.5, -1.0, 2.0, 0.25, 1.5, 3.0, -0.75, 1.0]).unwrap();
@@ -631,7 +631,7 @@ fn a_captured_step_replays_with_an_advanced_position_on_real_hardware() {
     stage_weight(
         &mut fixture,
         &bias,
-        HostTensor::new([2, 4], vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]).unwrap(),
+        HostTensor::new([4], vec![0.5, 1.0, 1.5, 2.0]).unwrap(),
     );
     let step = |fixture: &mut ChainFixture, position: i64| {
         dispatch(
@@ -652,15 +652,15 @@ fn a_captured_step_replays_with_an_advanced_position_on_real_hardware() {
         );
         dispatch(
             fixture,
-            "replay-add",
-            "add",
+            "replay-rmsnorm",
+            "rmsnorm",
             vec![
                 (rotated.clone(), descriptor(2, 4)),
-                (bias.clone(), descriptor(2, 4)),
+                (bias.clone(), descriptor_1d(4)),
             ],
             sum.clone(),
             descriptor(2, 4),
-            BTreeMap::new(),
+            BTreeMap::from([("epsilon".to_string(), OperatorAttributeValue::Float(1e-6))]),
         );
         fixture.executor.read_tensor(&sum).unwrap().data
     };
@@ -743,14 +743,14 @@ fn step_without_reading(
     );
     dispatch(
         fixture,
-        "replay-add",
-        "add",
+        "replay-rmsnorm",
+        "rmsnorm",
         vec![
             (rotated.clone(), descriptor(2, 4)),
-            (bias.clone(), descriptor(2, 4)),
+            (bias.clone(), descriptor_1d(4)),
         ],
         sum.clone(),
         descriptor(2, 4),
-        BTreeMap::new(),
+        BTreeMap::from([("epsilon".to_string(), OperatorAttributeValue::Float(1e-6))]),
     );
 }
