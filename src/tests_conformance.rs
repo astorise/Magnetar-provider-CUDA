@@ -955,11 +955,6 @@ fn compact_bf16_weights_give_bit_identical_results() {
     // [k, n] = [96, 1000]: n is not a multiple of the 32-column tiles.
     let (m, k, n) = (3u64, 96u64, 1000u64);
     let weight = HostTensor::new([k, n], bf16_exact_values((k * n) as usize, 7)).unwrap();
-    // Every compact matmul below takes the vectorized Kernel when its row
-    // length is a multiple of 8.
-    kernels
-        .vectorized_min_columns
-        .store(0, std::sync::atomic::Ordering::Relaxed);
     let compact = kernels.upload_weight(&weight).unwrap();
     assert!(compact.is_compact());
     let full = upload(&kernels, &weight);
@@ -1009,17 +1004,6 @@ fn compact_bf16_weights_give_bit_identical_results() {
             .matmul_residual(&a, &full, &residual, false, false)
             .unwrap(),
     );
-    // A row length that is not a multiple of 8 takes the one-value-per-
-    // thread compact path.
-    let odd = HostTensor::new([k, n + 1], bf16_exact_values((k * (n + 1)) as usize, 5)).unwrap();
-    same(
-        &kernels
-            .matmul(&a, &kernels.upload_weight(&odd).unwrap(), false, false)
-            .unwrap(),
-        &kernels
-            .matmul(&a, &upload(&kernels, &odd), false, false)
-            .unwrap(),
-    );
     // Transposed `b` takes the one-thread-per-output Kernel.
     let transposed = HostTensor::new([n, k], bf16_exact_values((k * n) as usize, 11)).unwrap();
     let compact_t = kernels.upload_weight(&transposed).unwrap();
@@ -1054,9 +1038,10 @@ fn compact_bf16_weights_give_bit_identical_results() {
 }
 
 /// Diagnostic, not a gate: the Device time of one decode-step matmul of
-/// each Qwen2.5-0.5B projection shape, f32 and compact, with and without
-/// the vectorized compact Kernel, and the bandwidth it reaches. Run with
-/// `--ignored --nocapture` on a GPU.
+/// each Qwen2.5-0.5B projection shape, f32 and compact, and the bandwidth
+/// it reaches. 200 back-to-back launches are timed, so a shape whose
+/// Kernel is shorter than its host launch cost reads as that cost. Run
+/// with `--ignored --nocapture` on a GPU.
 #[test]
 #[ignore = "GPU timing diagnostic"]
 fn decode_matmul_bandwidth() {
@@ -1080,10 +1065,7 @@ fn decode_matmul_bandwidth() {
         );
         let full = upload(&kernels, &weight);
         let compact = kernels.upload_weight(&weight).unwrap();
-        let time = |b: &CudaDeviceBuffer, min_columns: u64| -> f32 {
-            kernels
-                .vectorized_min_columns
-                .store(min_columns, std::sync::atomic::Ordering::Relaxed);
+        let time = |b: &CudaDeviceBuffer| -> f32 {
             // Warm the function cache and the allocation.
             kernels.matmul(&a, b, false, false).unwrap();
             let start = context.new_event(timing).unwrap();
@@ -1095,19 +1077,15 @@ fn decode_matmul_bandwidth() {
             end.record(kernels.stream()).unwrap();
             start.elapsed_ms(&end).unwrap() / repeats as f32
         };
-        let f32_ms = time(&full, u64::MAX);
-        let bf16_ms = time(&compact, u64::MAX);
-        let bf16x8_ms = time(&compact, 0);
+        let f32_ms = time(&full);
+        let bf16_ms = time(&compact);
         let gb = |bytes: u64, ms: f32| bytes as f32 / ms / 1e6;
         eprintln!(
-            "matmul [1, {k}] x [{k}, {n}]: f32 {:.1} us ({:.0} GB/s), bf16 {:.1} us ({:.0} GB/s), \
-             bf16x8 {:.1} us ({:.0} GB/s)",
+            "matmul [1, {k}] x [{k}, {n}]: f32 {:.1} us ({:.0} GB/s), bf16 {:.1} us ({:.0} GB/s)",
             f32_ms * 1e3,
             gb(k * n * 4, f32_ms),
             bf16_ms * 1e3,
             gb(k * n * 2, bf16_ms),
-            bf16x8_ms * 1e3,
-            gb(k * n * 2, bf16x8_ms),
         );
     }
 }
