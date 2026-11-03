@@ -926,3 +926,113 @@ fn rope_half_split_matches_reference_cpu() {
         assert_close(&download(&kernels, &actual_dev), &expected);
     }
 }
+
+/// Exactly bfloat16 values (`execute-native-half-precision`): f32 values
+/// whose low 16 bits are zero.
+fn bf16_exact_values(len: usize, seed: u32) -> Vec<f32> {
+    (0..len as u32)
+        .map(|index| {
+            let value = ((index.wrapping_mul(2_654_435_761).wrapping_add(seed)) % 2001) as f32
+                / 997.0
+                - 1.0;
+            f32::from_bits(value.to_bits() & 0xFFFF_0000)
+        })
+        .collect()
+}
+
+fn bits(tensor: &HostTensor) -> Vec<u32> {
+    tensor.data.iter().map(|value| value.to_bits()).collect()
+}
+
+/// A compact weight gives bit-identical matmul, fused matmul and embedding
+/// results to the same weight stored as f32, on the split-K, transposed
+/// and row-tail paths; non-exact or small weights stay f32.
+#[test]
+fn compact_bf16_weights_give_bit_identical_results() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    // [k, n] = [96, 1000]: n is not a multiple of the 32-column tiles.
+    let (m, k, n) = (3u64, 96u64, 1000u64);
+    let weight = HostTensor::new([k, n], bf16_exact_values((k * n) as usize, 7)).unwrap();
+    let compact = kernels.upload_weight(&weight).unwrap();
+    assert!(compact.is_compact());
+    let full = upload(&kernels, &weight);
+    assert_eq!(bits(&download(&kernels, &compact)), bits(&weight));
+
+    let a_host = HostTensor::new(
+        [m, k],
+        (0..m * k)
+            .map(|index| (index as f32 * 0.37).sin())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let a = upload(&kernels, &a_host);
+    let bias = upload(
+        &kernels,
+        &HostTensor::new(
+            [n],
+            (0..n).map(|index| index as f32 * 1e-3).collect::<Vec<_>>(),
+        )
+        .unwrap(),
+    );
+    let residual = upload(
+        &kernels,
+        &HostTensor::new([m, n], vec![0.5; (m * n) as usize]).unwrap(),
+    );
+    let same = |left: &CudaDeviceBuffer, right: &CudaDeviceBuffer| {
+        assert_eq!(
+            bits(&download(&kernels, left)),
+            bits(&download(&kernels, right))
+        );
+    };
+    same(
+        &kernels.matmul(&a, &compact, false, false).unwrap(),
+        &kernels.matmul(&a, &full, false, false).unwrap(),
+    );
+    same(
+        &kernels
+            .matmul_bias(&a, &compact, &bias, false, false)
+            .unwrap(),
+        &kernels.matmul_bias(&a, &full, &bias, false, false).unwrap(),
+    );
+    same(
+        &kernels
+            .matmul_residual(&a, &compact, &residual, false, false)
+            .unwrap(),
+        &kernels
+            .matmul_residual(&a, &full, &residual, false, false)
+            .unwrap(),
+    );
+    // Transposed `b` takes the one-thread-per-output Kernel.
+    let transposed = HostTensor::new([n, k], bf16_exact_values((k * n) as usize, 11)).unwrap();
+    let compact_t = kernels.upload_weight(&transposed).unwrap();
+    let full_t = upload(&kernels, &transposed);
+    same(
+        &kernels.matmul(&a, &compact_t, false, true).unwrap(),
+        &kernels.matmul(&a, &full_t, false, true).unwrap(),
+    );
+    // An embedding table: rows of `n` values.
+    let ids = upload(
+        &kernels,
+        &HostTensor::new([3], vec![0.0, 95.0, 41.0]).unwrap(),
+    );
+    same(
+        &kernels.embedding_lookup(&compact, &ids).unwrap(),
+        &kernels.embedding_lookup(&full, &ids).unwrap(),
+    );
+    // A compact buffer is never an f32 operand.
+    assert!(kernels.matmul(&compact, &full_t, false, false).is_err());
+    assert!(kernels.add(&full, &compact).is_err());
+    assert!(kernels.silu(&compact).is_err());
+    let expanded = kernels.expand(&compact).unwrap();
+    assert!(!expanded.is_compact());
+    assert_eq!(bits(&download(&kernels, &expanded)), bits(&weight));
+
+    // Values with low bits set, or a small tensor, stay f32.
+    let mut inexact = weight.clone();
+    inexact.data[17] = 0.1;
+    assert!(!kernels.upload_weight(&inexact).unwrap().is_compact());
+    let small = HostTensor::new([4, 4], bf16_exact_values(16, 3)).unwrap();
+    assert!(!kernels.upload_weight(&small).unwrap().is_compact());
+}

@@ -21,6 +21,12 @@ __device__ __forceinline__ float neg_inf() {
     return __int_as_float(0xff800000);
 }
 
+// A compact weight's value (`execute-native-half-precision`): bfloat16
+// bits are the high half of the f32 they encode, so this is exact.
+__device__ __forceinline__ float bf16_bits_to_float(unsigned short bits) {
+    return __int_as_float((int)(((unsigned int)bits) << 16));
+}
+
 extern "C" __global__ void add_kernel(const float* a, const float* b, float* out, unsigned long long n) {
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
@@ -69,7 +75,9 @@ extern "C" __global__ void embedding_lookup_kernel(
     unsigned long long dim,
     unsigned long long num_ids,
     unsigned long long vocab,
-    int* invalid_id_flag
+    int* invalid_id_flag,
+    // The table's bfloat16 bits when it is compact; `table` is then unused.
+    const unsigned short* table16
 ) {
     unsigned long long row = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= num_ids) {
@@ -85,8 +93,15 @@ extern "C" __global__ void embedding_lookup_kernel(
         atomicExch(invalid_id_flag, 1);
         return;
     }
-    const float* src = table + id * dim;
     float* dst = out + row * dim;
+    if (table16) {
+        const unsigned short* src16 = table16 + id * dim;
+        for (unsigned long long i = 0; i < dim; i++) {
+            dst[i] = bf16_bits_to_float(src16[i]);
+        }
+        return;
+    }
+    const float* src = table + id * dim;
     for (unsigned long long i = 0; i < dim; i++) {
         dst[i] = src[i];
     }
@@ -240,7 +255,9 @@ extern "C" __global__ void matmul_kernel(
     unsigned long long a_row_stride,
     unsigned long long a_inner_stride,
     unsigned long long b_inner_stride,
-    unsigned long long b_col_stride
+    unsigned long long b_col_stride,
+    // `b`'s bfloat16 bits when it is compact; `b` is then unused.
+    const unsigned short* b16
 ) {
     unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     unsigned long long total = m * n;
@@ -252,7 +269,8 @@ extern "C" __global__ void matmul_kernel(
     float acc = 0.0f;
     for (unsigned long long inner = 0; inner < k; inner++) {
         float a_value = a[row * a_row_stride + inner * a_inner_stride];
-        float b_value = b[inner * b_inner_stride + col * b_col_stride];
+        unsigned long long b_index = inner * b_inner_stride + col * b_col_stride;
+        float b_value = b16 ? bf16_bits_to_float(b16[b_index]) : b[b_index];
         acc += a_value * b_value;
     }
     out[row * n + col] = acc;
@@ -281,7 +299,9 @@ extern "C" __global__ void matmul_split_k_kernel(
     unsigned long long a_inner_stride,
     unsigned long long b_inner_stride,
     const float* addend,
-    int addend_mode
+    int addend_mode,
+    // `b`'s bfloat16 bits when it is compact; `b` is then unused.
+    const unsigned short* b16
 ) {
     __shared__ float partial[MATMUL_SPLIT_K][32];
     unsigned long long row = blockIdx.y;
@@ -289,8 +309,15 @@ extern "C" __global__ void matmul_split_k_kernel(
     unsigned int slice = threadIdx.y;
     float acc = 0.0f;
     if (row < m && col < n) {
-        for (unsigned long long inner = slice; inner < k; inner += MATMUL_SPLIT_K) {
-            acc += a[row * a_row_stride + inner * a_inner_stride] * b[inner * b_inner_stride + col];
+        if (b16) {
+            for (unsigned long long inner = slice; inner < k; inner += MATMUL_SPLIT_K) {
+                acc += a[row * a_row_stride + inner * a_inner_stride]
+                    * bf16_bits_to_float(b16[inner * b_inner_stride + col]);
+            }
+        } else {
+            for (unsigned long long inner = slice; inner < k; inner += MATMUL_SPLIT_K) {
+                acc += a[row * a_row_stride + inner * a_inner_stride] * b[inner * b_inner_stride + col];
+            }
         }
     }
     partial[slice][threadIdx.x] = acc;
@@ -625,10 +652,6 @@ __device__ __forceinline__ unsigned short float_to_half_bits(float value) {
         return sign | (unsigned short)(new_exp << 10);
     }
     return sign | (unsigned short)((exp16 << 10) | mantissa10);
-}
-
-__device__ __forceinline__ float bf16_bits_to_float(unsigned short bits) {
-    return __int_as_float((int)(((unsigned int)bits) << 16));
 }
 
 __device__ __forceinline__ unsigned short float_to_bf16_bits(float value) {
