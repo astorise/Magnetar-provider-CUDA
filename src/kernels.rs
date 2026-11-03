@@ -170,6 +170,34 @@ pub struct CudaKernels {
     /// production decision.
     upload_count: AtomicU64,
     download_count: AtomicU64,
+    /// Kernel functions already looked up in `module`, by name: every
+    /// launch needs one, and `CudaModule::load_function` allocates a C
+    /// string and calls `cuModuleGetFunction` each time.
+    functions: std::sync::Mutex<std::collections::HashMap<&'static str, CudaFunction>>,
+    /// An output buffer the executor no longer needs (the previous value
+    /// of the resource the current invocation is about to overwrite),
+    /// taken by the next [`Self::alloc_output`] of the same length instead
+    /// of a fresh device allocation. See [`Self::offer_output`].
+    offered_output: std::sync::Mutex<Option<CudaSlice<f32>>>,
+}
+
+/// Drops an [`CudaKernels::offer_output`] buffer that the invocation did
+/// not take.
+pub struct OfferedOutput<'k> {
+    kernels: &'k CudaKernels,
+}
+
+impl OfferedOutput<'_> {
+    /// The offered buffer, if no Kernel took it.
+    pub fn reclaim(self) -> Option<CudaSlice<f32>> {
+        self.kernels.offered_output.lock().unwrap().take()
+    }
+}
+
+impl Drop for OfferedOutput<'_> {
+    fn drop(&mut self) {
+        self.kernels.offered_output.lock().unwrap().take();
+    }
 }
 
 impl CudaKernels {
@@ -193,6 +221,8 @@ impl CudaKernels {
             module,
             upload_count: AtomicU64::new(0),
             download_count: AtomicU64::new(0),
+            functions: std::sync::Mutex::new(std::collections::HashMap::new()),
+            offered_output: std::sync::Mutex::new(None),
         })
     }
 
@@ -212,7 +242,13 @@ impl CudaKernels {
     }
 
     fn function(&self, name: &'static str) -> Result<CudaFunction, CudaError> {
-        Ok(self.module.load_function(name)?)
+        let mut functions = self.functions.lock().unwrap();
+        if let Some(function) = functions.get(name) {
+            return Ok(function.clone());
+        }
+        let function = self.module.load_function(name)?;
+        functions.insert(name, function.clone());
+        Ok(function)
     }
 
     /// Uploads a host tensor into a fresh device allocation. The only
@@ -345,12 +381,64 @@ impl CudaKernels {
     /// give a Tensor Resource's bytes a second, independent identity
     /// (e.g. promoting a decode step's pending KV write to its committed
     /// identity) without a D2H+H2D round trip.
+    /// Writes `rows` over `store`'s rows `row_offset..row_offset + rows` in
+    /// place, with one device-to-device copy (`kv-write`,
+    /// `append-kv-history-in-place`). Rows outside that range are unchanged.
+    pub fn kv_write(
+        &self,
+        store: &mut CudaDeviceBuffer,
+        rows: &CudaDeviceBuffer,
+        row_offset: u64,
+    ) -> Result<(), CudaError> {
+        let (capacity, width) = rows_cols_buf(store)?;
+        let (count, row_width) = rows_cols_buf(rows)?;
+        if row_width != width {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!("kv-write rows have width {row_width}, the store {width}"),
+            ));
+        }
+        if row_offset
+            .checked_add(count)
+            .is_none_or(|end| end > capacity)
+        {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!(
+                    "kv-write of {count} rows at {row_offset} exceeds the store's {capacity} rows"
+                ),
+            ));
+        }
+        let start = (row_offset * width) as usize;
+        let mut destination = store.slice.slice_mut(start..start + rows.slice.len());
+        self.stream.memcpy_dtod(&rows.slice, &mut destination)?;
+        Ok(())
+    }
+
+    /// Offers `buffer` to the next [`Self::alloc_output`] of its length
+    /// until the returned guard drops. The caller must own `buffer`
+    /// exclusively (removed from its storage) and must not read it again:
+    /// a Kernel writing its output into it is ordered after every earlier
+    /// use on this Provider's single stream.
+    pub fn offer_output(&self, buffer: Option<CudaSlice<f32>>) -> OfferedOutput<'_> {
+        *self.offered_output.lock().unwrap() = buffer;
+        OfferedOutput { kernels: self }
+    }
+
     /// An output buffer of `len` floats left uninitialized, for a Kernel
     /// (or copy) that writes every one of its elements before anything
     /// reads it. Skips the memset `alloc_zeros` would queue for each of the
     /// hundreds of outputs a decode step produces. Callers whose Kernel may
     /// leave elements unwritten keep `alloc_zeros`.
     fn alloc_output(&self, len: usize) -> Result<CudaSlice<f32>, CudaError> {
+        {
+            let mut offered = self.offered_output.lock().unwrap();
+            if offered.as_ref().is_some_and(|slice| slice.len() == len) {
+                // Every queued use of the offered buffer precedes this
+                // Kernel on the one stream this Provider uses.
+                return Ok(offered.take().expect("checked above"));
+            }
+        }
         // SAFETY: every caller launches a Kernel or copy that writes all
         // `len` elements on this same stream before the buffer is read.
         Ok(unsafe { self.stream.alloc::<f32>(len) }?)
@@ -957,6 +1045,35 @@ impl CudaKernels {
         window_size: Option<u64>,
         causal: bool,
     ) -> Result<CudaDeviceBuffer, CudaError> {
+        self.attention_bounded(
+            q,
+            k,
+            v,
+            head_count,
+            head_dimension,
+            kv_head_count,
+            window_size,
+            causal,
+            None,
+        )
+    }
+
+    /// [`Self::attention`] over only the first `key_count` rows of K and V
+    /// (`append-kv-history-in-place`): an in-place KV store holds more rows
+    /// than the history, and the rows past `key_count` are never read.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_bounded(
+        &self,
+        q: &CudaDeviceBuffer,
+        k: &CudaDeviceBuffer,
+        v: &CudaDeviceBuffer,
+        head_count: u64,
+        head_dimension: u64,
+        kv_head_count: Option<u64>,
+        window_size: Option<u64>,
+        causal: bool,
+        key_count: Option<u64>,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
         same_shape_buf(k, v)?;
         let kv_head_count = kv_head_count.unwrap_or(head_count);
         if head_count == 0 || head_dimension == 0 || kv_head_count == 0 {
@@ -986,7 +1103,14 @@ impl CudaKernels {
             ));
         }
         let (seq_len, q_model_dim) = rows_cols_buf(q)?;
-        let (kv_seq_len, kv_model_dim) = rows_cols_buf(k)?;
+        let (kv_rows, kv_model_dim) = rows_cols_buf(k)?;
+        let kv_seq_len = key_count.unwrap_or(kv_rows);
+        if kv_seq_len > kv_rows {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!("key_count {kv_seq_len} exceeds the {kv_rows} rows of K/V"),
+            ));
+        }
         if seq_len > kv_seq_len {
             return Err(CudaError::new(
                 CudaErrorCode::ShapeUnsupported,

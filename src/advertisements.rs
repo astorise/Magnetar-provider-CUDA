@@ -10,6 +10,10 @@
 //! gelu/activation/dtype-conversion/layout-conversion are not implemented
 //! here and so are never advertised).
 
+/// The `attention` Kernel feature advertised when it honours the `key_count`
+/// attribute (`append-kv-history-in-place`).
+pub const KEY_COUNT_FEATURE: &str = "key-count";
+
 use magnetar_runtime::affinity::{DeviceBinding, ProviderBinding};
 use magnetar_runtime::capability::CapabilityVersion;
 use magnetar_runtime::compute::ComputeDType;
@@ -148,12 +152,17 @@ pub fn cuda_kernel_advertisements(
             device_id,
             provider_name,
         ),
-        baseline_advertisement(
-            "attention",
-            OperatorFamily::Attention,
-            device_id,
-            provider_name,
-        ),
+        {
+            // Honours `key_count` (`append-kv-history-in-place`).
+            let mut attention = baseline_advertisement(
+                "attention",
+                OperatorFamily::Attention,
+                device_id,
+                provider_name,
+            );
+            attention.id.features.insert(KEY_COUNT_FEATURE.to_string());
+            attention
+        },
         baseline_advertisement(
             "softmax",
             OperatorFamily::Activation,
@@ -164,6 +173,7 @@ pub fn cuda_kernel_advertisements(
         baseline_advertisement("add", OperatorFamily::Tensor, device_id, provider_name),
         baseline_advertisement("mul", OperatorFamily::Tensor, device_id, provider_name),
         baseline_advertisement("concat", OperatorFamily::Tensor, device_id, provider_name),
+        baseline_advertisement("kv-write", OperatorFamily::Tensor, device_id, provider_name),
         baseline_advertisement(
             "residual-add",
             OperatorFamily::Tensor,

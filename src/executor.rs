@@ -563,6 +563,105 @@ impl CudaExecutor {
     }
 
     fn run_invocation(&self, invocation: &KernelInvocation) -> Result<KernelResult, KernelError> {
+        if invocation.kernel.name == "kv-write" {
+            return self.run_kv_write(invocation);
+        }
+        // The resource this invocation overwrites: its previous buffer is
+        // dropped once the new output is stored anyway, so it is offered
+        // to the Kernel as its output allocation (a fresh allocation and a
+        // free per dispatched node otherwise). Never when the invocation
+        // also reads that resource. A dispatch that fails before a Kernel
+        // takes the buffer puts it back, so the resource keeps its value.
+        let previous_output = invocation.outputs.first().and_then(|output| {
+            let id = &output.resource.id;
+            if invocation
+                .inputs
+                .iter()
+                .any(|input| &input.resource.id == id)
+            {
+                return None;
+            }
+            let buffer = self.storage.lock().unwrap().remove(id)?;
+            Some((id.clone(), buffer))
+        });
+        let (restore, offered_slice) = match previous_output {
+            Some((id, buffer)) => (Some((id, buffer.shape)), Some(buffer.slice)),
+            None => (None, None),
+        };
+        let offered = self.kernels.offer_output(offered_slice);
+        let result = self.run_invocation_with_offer(invocation);
+        if result.is_err()
+            && let Some((id, shape)) = restore
+            && let Some(slice) = offered.reclaim()
+        {
+            self.storage
+                .lock()
+                .unwrap()
+                .insert(id, CudaDeviceBuffer { slice, shape });
+        }
+        result
+    }
+
+    /// `kv-write` (`append-kv-history-in-place`): writes the rows into the
+    /// store's own device buffer in place when the output is the store, as
+    /// it is for a KV history; otherwise into a copy stored under the output.
+    fn run_kv_write(&self, invocation: &KernelInvocation) -> Result<KernelResult, KernelError> {
+        let row_offset =
+            Self::attribute_integer(&invocation.attributes, "row_offset").ok_or_else(|| {
+                KernelError::KernelAttributeUnsupported {
+                    attribute: "row_offset".into(),
+                }
+            })?;
+        let store_id = Self::input_resource_id(invocation, 0)?;
+        let rows_id = Self::input_resource_id(invocation, 1)?;
+        let output =
+            invocation
+                .outputs
+                .first()
+                .ok_or_else(|| KernelError::KernelExecutionFailed {
+                    reason: "missing output at index 0".into(),
+                })?;
+        let mut storage = self.storage.lock().unwrap();
+        let mut store = if output.resource.id == *store_id {
+            storage.remove(store_id)
+        } else {
+            match storage.get(store_id) {
+                Some(store) => Some(
+                    self.kernels
+                        .clone_buffer(store)
+                        .map_err(KernelError::from)?,
+                ),
+                None => None,
+            }
+        }
+        .ok_or_else(|| KernelError::KernelExecutionFailed {
+            reason: format!("no materialized data for input resource {store_id}"),
+        })?;
+        let written = match storage.get(rows_id) {
+            Some(rows) => self
+                .kernels
+                .kv_write(&mut store, rows, row_offset)
+                .map_err(KernelError::from),
+            None => Err(KernelError::KernelExecutionFailed {
+                reason: format!("no materialized data for input resource {rows_id}"),
+            }),
+        };
+        // The store goes back under its id either way: a failed write
+        // leaves its previous rows.
+        storage.insert(output.resource.id.clone(), store);
+        written?;
+        let mut result = KernelResult::success(invocation.id.clone());
+        result
+            .output_readiness
+            .insert(output.resource.id.to_string(), true);
+        result.updated_resources.push(output.resource.clone());
+        Ok(result)
+    }
+
+    fn run_invocation_with_offer(
+        &self,
+        invocation: &KernelInvocation,
+    ) -> Result<KernelResult, KernelError> {
         let name = invocation.kernel.name.as_str();
         let mut result = KernelResult::success(invocation.id.clone());
         // One storage lock for every input this invocation reads: each
@@ -752,8 +851,9 @@ impl CudaExecutor {
                             });
                         }
                     }
+                    let key_count = Self::attribute_integer(&invocation.attributes, "key_count");
                     self.kernels
-                        .attention(
+                        .attention_bounded(
                             q,
                             k,
                             v,
@@ -762,6 +862,7 @@ impl CudaExecutor {
                             kv_head_count,
                             window_size,
                             causal,
+                            key_count,
                         )
                         .map_err(KernelError::from)?
                 }
