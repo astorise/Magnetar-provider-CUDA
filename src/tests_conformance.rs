@@ -1036,3 +1036,56 @@ fn compact_bf16_weights_give_bit_identical_results() {
     let small = HostTensor::new([4, 4], bf16_exact_values(16, 3)).unwrap();
     assert!(!kernels.upload_weight(&small).unwrap().is_compact());
 }
+
+/// Diagnostic, not a gate: the Device time of one decode-step matmul of
+/// each Qwen2.5-0.5B projection shape, f32 and compact, and the bandwidth
+/// it reaches. 200 back-to-back launches are timed, so a shape whose
+/// Kernel is shorter than its host launch cost reads as that cost. Run
+/// with `--ignored --nocapture` on a GPU.
+#[test]
+#[ignore = "GPU timing diagnostic"]
+fn decode_matmul_bandwidth() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let context = kernels.stream().context().clone();
+    let timing = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
+    let repeats = 200;
+    for (k, n) in [
+        (896u64, 896u64),
+        (896, 128),
+        (896, 4864),
+        (4864, 896),
+        (896, 151_936),
+    ] {
+        let weight = HostTensor::new([k, n], bf16_exact_values((k * n) as usize, 13)).unwrap();
+        let a = upload(
+            &kernels,
+            &HostTensor::new([1, k], vec![0.25; k as usize]).unwrap(),
+        );
+        let full = upload(&kernels, &weight);
+        let compact = kernels.upload_weight(&weight).unwrap();
+        let time = |b: &CudaDeviceBuffer| -> f32 {
+            // Warm the function cache and the allocation.
+            kernels.matmul(&a, b, false, false).unwrap();
+            let start = context.new_event(timing).unwrap();
+            let end = context.new_event(timing).unwrap();
+            start.record(kernels.stream()).unwrap();
+            for _ in 0..repeats {
+                kernels.matmul(&a, b, false, false).unwrap();
+            }
+            end.record(kernels.stream()).unwrap();
+            start.elapsed_ms(&end).unwrap() / repeats as f32
+        };
+        let f32_ms = time(&full);
+        let bf16_ms = time(&compact);
+        let gb = |bytes: u64, ms: f32| bytes as f32 / ms / 1e6;
+        eprintln!(
+            "matmul [1, {k}] x [{k}, {n}]: f32 {:.1} us ({:.0} GB/s), bf16 {:.1} us ({:.0} GB/s)",
+            f32_ms * 1e3,
+            gb(k * n * 4, f32_ms),
+            bf16_ms * 1e3,
+            gb(k * n * 2, bf16_ms),
+        );
+    }
+}

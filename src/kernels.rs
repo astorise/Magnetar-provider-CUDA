@@ -392,6 +392,11 @@ impl CudaKernels {
         Ok(())
     }
 
+    /// The stream every launch of these Kernels uses.
+    pub fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
+    }
+
     /// The device address of `buffer`'s allocation, as a capture records it.
     pub fn address(&self, buffer: &CudaDeviceBuffer) -> u64 {
         match &buffer.bf16 {
