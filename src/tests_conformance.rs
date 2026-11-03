@@ -955,6 +955,11 @@ fn compact_bf16_weights_give_bit_identical_results() {
     // [k, n] = [96, 1000]: n is not a multiple of the 32-column tiles.
     let (m, k, n) = (3u64, 96u64, 1000u64);
     let weight = HostTensor::new([k, n], bf16_exact_values((k * n) as usize, 7)).unwrap();
+    // Every compact matmul below takes the vectorized Kernel when its row
+    // length is a multiple of 8.
+    kernels
+        .vectorized_min_columns
+        .store(0, std::sync::atomic::Ordering::Relaxed);
     let compact = kernels.upload_weight(&weight).unwrap();
     assert!(compact.is_compact());
     let full = upload(&kernels, &weight);
@@ -1046,4 +1051,63 @@ fn compact_bf16_weights_give_bit_identical_results() {
     assert!(!kernels.upload_weight(&inexact).unwrap().is_compact());
     let small = HostTensor::new([4, 4], bf16_exact_values(16, 3)).unwrap();
     assert!(!kernels.upload_weight(&small).unwrap().is_compact());
+}
+
+/// Diagnostic, not a gate: the Device time of one decode-step matmul of
+/// each Qwen2.5-0.5B projection shape, f32 and compact, with and without
+/// the vectorized compact Kernel, and the bandwidth it reaches. Run with
+/// `--ignored --nocapture` on a GPU.
+#[test]
+#[ignore = "GPU timing diagnostic"]
+fn decode_matmul_bandwidth() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let context = kernels.stream().context().clone();
+    let timing = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
+    let repeats = 200;
+    for (k, n) in [
+        (896u64, 896u64),
+        (896, 128),
+        (896, 4864),
+        (4864, 896),
+        (896, 151_936),
+    ] {
+        let weight = HostTensor::new([k, n], bf16_exact_values((k * n) as usize, 13)).unwrap();
+        let a = upload(
+            &kernels,
+            &HostTensor::new([1, k], vec![0.25; k as usize]).unwrap(),
+        );
+        let full = upload(&kernels, &weight);
+        let compact = kernels.upload_weight(&weight).unwrap();
+        let time = |b: &CudaDeviceBuffer, min_columns: u64| -> f32 {
+            kernels
+                .vectorized_min_columns
+                .store(min_columns, std::sync::atomic::Ordering::Relaxed);
+            // Warm the function cache and the allocation.
+            kernels.matmul(&a, b, false, false).unwrap();
+            let start = context.new_event(timing).unwrap();
+            let end = context.new_event(timing).unwrap();
+            start.record(kernels.stream()).unwrap();
+            for _ in 0..repeats {
+                kernels.matmul(&a, b, false, false).unwrap();
+            }
+            end.record(kernels.stream()).unwrap();
+            start.elapsed_ms(&end).unwrap() / repeats as f32
+        };
+        let f32_ms = time(&full, u64::MAX);
+        let bf16_ms = time(&compact, u64::MAX);
+        let bf16x8_ms = time(&compact, 0);
+        let gb = |bytes: u64, ms: f32| bytes as f32 / ms / 1e6;
+        eprintln!(
+            "matmul [1, {k}] x [{k}, {n}]: f32 {:.1} us ({:.0} GB/s), bf16 {:.1} us ({:.0} GB/s), \
+             bf16x8 {:.1} us ({:.0} GB/s)",
+            f32_ms * 1e3,
+            gb(k * n * 4, f32_ms),
+            bf16_ms * 1e3,
+            gb(k * n * 2, bf16_ms),
+            bf16x8_ms * 1e3,
+            gb(k * n * 2, bf16x8_ms),
+        );
+    }
 }
