@@ -24,7 +24,7 @@ __device__ __forceinline__ float neg_inf() {
 // A compact weight's value (`execute-native-half-precision`): bfloat16
 // bits are the high half of the f32 they encode, so this is exact.
 __device__ __forceinline__ float bf16_bits_to_float(unsigned short bits) {
-    return __int_as_float(((int)bits) << 16);
+    return __int_as_float((int)(((unsigned int)bits) << 16));
 }
 
 extern "C" __global__ void add_kernel(const float* a, const float* b, float* out, unsigned long long n) {
@@ -652,10 +652,6 @@ __device__ __forceinline__ unsigned short float_to_half_bits(float value) {
         return sign | (unsigned short)(new_exp << 10);
     }
     return sign | (unsigned short)((exp16 << 10) | mantissa10);
-}
-
-__device__ __forceinline__ float bf16_bits_to_float(unsigned short bits) {
-    return __int_as_float((int)(((unsigned int)bits) << 16));
 }
 
 __device__ __forceinline__ unsigned short float_to_bf16_bits(float value) {
