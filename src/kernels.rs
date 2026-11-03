@@ -200,9 +200,10 @@ struct KernelCapture {
     max_offset: u64,
     /// Why the capture cannot be used, once something unsupported happened.
     failure: Option<String>,
-    /// The vocabulary size of a captured embedding lookup, whose replayed
-    /// token ids are checked on the host.
-    embedding_vocab: Option<u64>,
+    /// Whether the capture contains an embedding lookup, whose invalid-id
+    /// flag the capture resets once, at its start, so the flag accumulates
+    /// every captured lookup's failures.
+    has_embedding: bool,
 }
 
 /// A captured step's CUDA graph and what replaying it needs.
@@ -212,8 +213,8 @@ pub struct CapturedStep {
     /// The largest replay offset every captured launch stays within bounds
     /// for.
     pub max_offset: u64,
-    /// The vocabulary size of a captured embedding lookup.
-    pub embedding_vocab: Option<u64>,
+    /// Whether the captured step contains an embedding lookup.
+    pub has_embedding: bool,
 }
 
 /// A `CudaGraph`, which holds raw driver handles.
@@ -289,14 +290,28 @@ impl CudaKernels {
         // Allocated before the capture starts: nothing allocates while
         // capturing.
         let offset = self.stream.alloc_zeros::<u64>(1)?;
+        let mut flag_slot = self.embedding_flag.lock().unwrap();
+        let flag = match flag_slot.as_mut() {
+            Some(flag) => flag,
+            None => flag_slot.insert(self.stream.alloc_zeros::<i32>(1)?),
+        };
         self.stream
             .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+        // The captured step's first work: one reset of the invalid-id flag,
+        // which its embedding lookups then only ever set.
+        if let Err(error) = self.stream.memset_zeros(flag) {
+            let _ = self.stream.end_capture(
+                sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+            );
+            return Err(error.into());
+        }
+        drop(flag_slot);
         *capture = Some(KernelCapture {
             advancing,
             offset,
             max_offset: u64::MAX,
             failure: None,
-            embedding_vocab: None,
+            has_embedding: false,
         });
         Ok(())
     }
@@ -326,7 +341,7 @@ impl CudaKernels {
             graph: CapturedGraph(graph),
             offset: capture.offset,
             max_offset: capture.max_offset,
-            embedding_vocab: capture.embedding_vocab,
+            has_embedding: capture.has_embedding,
         })
     }
 
@@ -823,7 +838,10 @@ impl CudaKernels {
                 self.stream.alloc_zeros::<i32>(1)?
             }
         };
-        self.stream.memset_zeros(&mut invalid_id_flag)?;
+        // A captured step resets the flag once, at its start.
+        if !self.is_capturing() {
+            self.stream.memset_zeros(&mut invalid_id_flag)?;
+        }
         let func = self.function("embedding_lookup_kernel")?;
         let mut args = self.stream.launch_builder(&func);
         args.arg(&table.slice)
@@ -841,7 +859,7 @@ impl CudaKernels {
         // run (`Self::check_embedding_flag`), and every replay checks its
         // ids on the host.
         if let Some(capture) = self.capture.lock().unwrap().as_mut() {
-            capture.embedding_vocab = Some(vocab);
+            capture.has_embedding = true;
             return Ok(CudaDeviceBuffer {
                 slice: out_dev,
                 shape: vec![num_ids, dim],

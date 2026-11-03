@@ -98,16 +98,26 @@ type CapturedResources = BTreeMap<TensorResourceId, (u64, usize)>;
 
 #[derive(Default)]
 struct StepCaptureState {
-    /// The resources the capture in progress touched so far.
-    recording: Option<CapturedResources>,
+    /// What the capture in progress touched so far.
+    recording: Option<CaptureRecording>,
     captures: BTreeMap<StepCaptureId, CapturedExecutorStep>,
     next_capture: u64,
+}
+
+/// What a step capture records besides its graph.
+#[derive(Default)]
+struct CaptureRecording {
+    /// Every resource the captured work reads or writes.
+    resources: CapturedResources,
+    /// The token-id inputs of captured embedding lookups, with their table's
+    /// vocabulary size: replayed ids are checked on the host.
+    embedding_ids: BTreeMap<TensorResourceId, u64>,
 }
 
 /// One captured step: its graph, and the exact buffers it reads and writes.
 struct CapturedExecutorStep {
     step: CapturedStep,
-    resources: CapturedResources,
+    recording: CaptureRecording,
 }
 
 impl CudaExecutor {
@@ -163,7 +173,7 @@ impl CudaExecutor {
             .map_err(|error| {
                 self.step_capture_error(ProviderExecutionPhase::Submit, error.to_string())
             })?;
-        state.recording = Some(BTreeMap::new());
+        state.recording = Some(CaptureRecording::default());
         Ok(())
     }
 
@@ -172,7 +182,7 @@ impl CudaExecutor {
     /// available.
     pub fn end_step_capture(&self) -> Result<StepCaptureId, ProviderExecutionError> {
         let mut state = self.step_capture.lock().unwrap();
-        let Some(resources) = state.recording.take() else {
+        let Some(recording) = state.recording.take() else {
             return Err(self.step_capture_error(
                 ProviderExecutionPhase::Complete,
                 "no step capture is in progress".into(),
@@ -185,7 +195,7 @@ impl CudaExecutor {
         self.kernels
             .launch_captured(&mut step, 0)
             .map_err(complete)?;
-        if step.embedding_vocab.is_some() {
+        if step.has_embedding {
             self.kernels.check_embedding_flag().map_err(complete)?;
         }
         let id = StepCaptureId::new(format!(
@@ -195,7 +205,7 @@ impl CudaExecutor {
         state.next_capture += 1;
         state
             .captures
-            .insert(id.clone(), CapturedExecutorStep { step, resources });
+            .insert(id.clone(), CapturedExecutorStep { step, recording });
         Ok(id)
     }
 
@@ -225,7 +235,7 @@ impl CudaExecutor {
             )));
         }
         let mut storage = self.storage.lock().unwrap();
-        for (resource, (address, len)) in &captured.resources {
+        for (resource, (address, len)) in &captured.recording.resources {
             let current = storage
                 .get(resource)
                 .map(|buffer| (self.kernels.address(buffer), buffer.slice.len()));
@@ -236,12 +246,12 @@ impl CudaExecutor {
             }
         }
         for (resource, tensor) in &inputs {
-            if !captured.resources.contains_key(resource) {
+            if !captured.recording.resources.contains_key(resource) {
                 return Err(invalidated(format!(
                     "input '{resource}' was not read by the captured step"
                 )));
             }
-            if let Some(vocab) = captured.step.embedding_vocab
+            if let Some(&vocab) = captured.recording.embedding_ids.get(resource)
                 && tensor.data.iter().any(|&value| {
                     !(value >= 0.0 && value == value.floor() && (value as u64) < vocab)
                 })
@@ -281,9 +291,22 @@ impl CudaExecutor {
         if self.step_capture.lock().unwrap().recording.is_none() {
             return;
         }
-        let touched: Vec<(TensorResourceId, (u64, usize))> = {
+        let (touched, embedding_ids) = {
             let storage = self.storage.lock().unwrap();
-            invocation
+            // An embedding lookup reads its table (input 0) and its ids
+            // (input 1).
+            let embedding_ids = match (
+                invocation.kernel.name.as_str(),
+                invocation.inputs.first(),
+                invocation.inputs.get(1),
+            ) {
+                ("embedding", Some(table), Some(ids)) => storage
+                    .get(&table.resource.id)
+                    .and_then(|table| table.shape.first().copied())
+                    .map(|vocab| (ids.resource.id.clone(), vocab)),
+                _ => None,
+            };
+            let touched: Vec<(TensorResourceId, (u64, usize))> = invocation
                 .inputs
                 .iter()
                 .chain(&invocation.outputs)
@@ -296,10 +319,12 @@ impl CudaExecutor {
                         )
                     })
                 })
-                .collect()
+                .collect();
+            (touched, embedding_ids)
         };
         if let Some(recording) = self.step_capture.lock().unwrap().recording.as_mut() {
-            recording.extend(touched);
+            recording.resources.extend(touched);
+            recording.embedding_ids.extend(embedding_ids);
         }
     }
 
