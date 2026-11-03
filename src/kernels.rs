@@ -46,6 +46,10 @@ enum MatmulAddend<'a> {
 /// in `kernels.cu`.
 const MATMUL_SPLIT_K: u32 = 16;
 
+/// Columns per thread of `matmul_split_k_bf16x8_kernel`; must equal
+/// `MATMUL_BF16_COLUMNS` in `kernels.cu`.
+const MATMUL_BF16_COLUMNS: u64 = 8;
+
 /// Rows a split-K launch covers in its grid's y dimension (CUDA's limit).
 const MATMUL_SPLIT_K_MAX_ROWS: u64 = 65_535;
 
@@ -1379,6 +1383,41 @@ impl CudaKernels {
         }
         let b16 = self.bf16_address(b);
         let mut out_dev = self.alloc_output((m * n) as usize)?;
+        // A compact `b` whose rows split into 16-byte groups of 8 values.
+        if b_col_stride == 1
+            && m <= MATMUL_SPLIT_K_MAX_ROWS
+            && b16 != 0
+            && n.is_multiple_of(MATMUL_BF16_COLUMNS)
+        {
+            let func = self.function("matmul_split_k_bf16x8_kernel")?;
+            let mut args = self.stream.launch_builder(&func);
+            args.arg(&a.slice)
+                .arg(&b16)
+                .arg(&mut out_dev)
+                .arg(&m)
+                .arg(&k)
+                .arg(&n)
+                .arg(&a_row_stride)
+                .arg(&a_inner_stride)
+                .arg(&b_inner_stride);
+            let (addend_buffer, addend_mode) = match addend {
+                None => (a, 0i32),
+                Some(MatmulAddend::Row(bias)) => (bias, 1),
+                Some(MatmulAddend::Full(residual)) => (residual, 2),
+            };
+            args.arg(&addend_buffer.slice).arg(&addend_mode);
+            let config = LaunchConfig {
+                grid_dim: (n.div_ceil(32 * MATMUL_BF16_COLUMNS) as u32, m as u32, 1),
+                block_dim: (32, MATMUL_SPLIT_K, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe { args.launch(config) }?;
+            return Ok(CudaDeviceBuffer {
+                slice: out_dev,
+                shape: vec![m, n],
+                bf16: None,
+            });
+        }
         if b_col_stride == 1 && m <= MATMUL_SPLIT_K_MAX_ROWS {
             let func = self.function("matmul_split_k_kernel")?;
             let mut args = self.stream.launch_builder(&func);

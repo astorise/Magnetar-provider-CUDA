@@ -1004,6 +1004,17 @@ fn compact_bf16_weights_give_bit_identical_results() {
             .matmul_residual(&a, &full, &residual, false, false)
             .unwrap(),
     );
+    // A row length that is not a multiple of 8 takes the one-value-per-
+    // thread compact path.
+    let odd = HostTensor::new([k, n + 1], bf16_exact_values((k * (n + 1)) as usize, 5)).unwrap();
+    same(
+        &kernels
+            .matmul(&a, &kernels.upload_weight(&odd).unwrap(), false, false)
+            .unwrap(),
+        &kernels
+            .matmul(&a, &upload(&kernels, &odd), false, false)
+            .unwrap(),
+    );
     // Transposed `b` takes the one-thread-per-output Kernel.
     let transposed = HostTensor::new([n, k], bf16_exact_values((k * n) as usize, 11)).unwrap();
     let compact_t = kernels.upload_weight(&transposed).unwrap();

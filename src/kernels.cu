@@ -717,3 +717,64 @@ extern "C" __global__ void kv_write_kernel(
     unsigned long long offset = row_offset + (step_offset ? *step_offset : 0);
     store[offset * width + i] = rows[i];
 }
+
+// `matmul_split_k_kernel` for a compact (bfloat16) `b` whose row length `n`
+// is a multiple of 8 (`execute-native-half-precision`): each thread reads 8
+// consecutive values of a row of `b` in one 16-byte load and keeps 8
+// accumulators, so a warp reads 512 contiguous bytes per step instead of 64.
+// The same 16 interleaved slices of `k` and the same fixed-order sum of
+// slices as `matmul_split_k_kernel`, so every output is bit-identical to it.
+#define MATMUL_BF16_COLUMNS 8
+extern "C" __global__ void matmul_split_k_bf16x8_kernel(
+    const float* a,
+    const unsigned short* b16,
+    float* out,
+    unsigned long long m,
+    unsigned long long k,
+    unsigned long long n,
+    unsigned long long a_row_stride,
+    unsigned long long a_inner_stride,
+    unsigned long long b_inner_stride,
+    const float* addend,
+    int addend_mode
+) {
+    __shared__ float partial[MATMUL_SPLIT_K][32 * MATMUL_BF16_COLUMNS];
+    unsigned long long row = blockIdx.y;
+    unsigned long long col0 =
+        ((unsigned long long)blockIdx.x * 32 + threadIdx.x) * MATMUL_BF16_COLUMNS;
+    unsigned int slice = threadIdx.y;
+    float acc[MATMUL_BF16_COLUMNS];
+    for (int c = 0; c < MATMUL_BF16_COLUMNS; c++) {
+        acc[c] = 0.0f;
+    }
+    if (row < m && col0 < n) {
+        for (unsigned long long inner = slice; inner < k; inner += MATMUL_SPLIT_K) {
+            float a_value = a[row * a_row_stride + inner * a_inner_stride];
+            uint4 packed = *reinterpret_cast<const uint4*>(b16 + inner * b_inner_stride + col0);
+            unsigned int words[4] = {packed.x, packed.y, packed.z, packed.w};
+            for (int w = 0; w < 4; w++) {
+                acc[2 * w] += a_value * bf16_bits_to_float((unsigned short)(words[w] & 0xFFFFu));
+                acc[2 * w + 1] += a_value * bf16_bits_to_float((unsigned short)(words[w] >> 16));
+            }
+        }
+    }
+    for (int c = 0; c < MATMUL_BF16_COLUMNS; c++) {
+        partial[slice][threadIdx.x * MATMUL_BF16_COLUMNS + c] = acc[c];
+    }
+    __syncthreads();
+    if (slice == 0 && row < m && col0 < n) {
+        for (int c = 0; c < MATMUL_BF16_COLUMNS; c++) {
+            unsigned long long col = col0 + c;
+            float sum = 0.0f;
+            for (unsigned int s = 0; s < MATMUL_SPLIT_K; s++) {
+                sum += partial[s][threadIdx.x * MATMUL_BF16_COLUMNS + c];
+            }
+            if (addend_mode == 1) {
+                sum += addend[col];
+            } else if (addend_mode == 2) {
+                sum += addend[row * n + col];
+            }
+            out[row * n + col] = sum;
+        }
+    }
+}
