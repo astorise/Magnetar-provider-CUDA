@@ -381,6 +381,40 @@ impl CudaKernels {
     /// give a Tensor Resource's bytes a second, independent identity
     /// (e.g. promoting a decode step's pending KV write to its committed
     /// identity) without a D2H+H2D round trip.
+    /// Writes `rows` over `store`'s rows `row_offset..row_offset + rows` in
+    /// place, with one device-to-device copy (`kv-write`,
+    /// `append-kv-history-in-place`). Rows outside that range are unchanged.
+    pub fn kv_write(
+        &self,
+        store: &mut CudaDeviceBuffer,
+        rows: &CudaDeviceBuffer,
+        row_offset: u64,
+    ) -> Result<(), CudaError> {
+        let (capacity, width) = rows_cols_buf(store)?;
+        let (count, row_width) = rows_cols_buf(rows)?;
+        if row_width != width {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!("kv-write rows have width {row_width}, the store {width}"),
+            ));
+        }
+        if row_offset
+            .checked_add(count)
+            .is_none_or(|end| end > capacity)
+        {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!(
+                    "kv-write of {count} rows at {row_offset} exceeds the store's {capacity} rows"
+                ),
+            ));
+        }
+        let start = (row_offset * width) as usize;
+        let mut destination = store.slice.slice_mut(start..start + rows.slice.len());
+        self.stream.memcpy_dtod(&rows.slice, &mut destination)?;
+        Ok(())
+    }
+
     /// Offers `buffer` to the next [`Self::alloc_output`] of its length
     /// until the returned guard drops. The caller must own `buffer`
     /// exclusively (removed from its storage) and must not read it again:
@@ -1011,6 +1045,35 @@ impl CudaKernels {
         window_size: Option<u64>,
         causal: bool,
     ) -> Result<CudaDeviceBuffer, CudaError> {
+        self.attention_bounded(
+            q,
+            k,
+            v,
+            head_count,
+            head_dimension,
+            kv_head_count,
+            window_size,
+            causal,
+            None,
+        )
+    }
+
+    /// [`Self::attention`] over only the first `key_count` rows of K and V
+    /// (`append-kv-history-in-place`): an in-place KV store holds more rows
+    /// than the history, and the rows past `key_count` are never read.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_bounded(
+        &self,
+        q: &CudaDeviceBuffer,
+        k: &CudaDeviceBuffer,
+        v: &CudaDeviceBuffer,
+        head_count: u64,
+        head_dimension: u64,
+        kv_head_count: Option<u64>,
+        window_size: Option<u64>,
+        causal: bool,
+        key_count: Option<u64>,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
         same_shape_buf(k, v)?;
         let kv_head_count = kv_head_count.unwrap_or(head_count);
         if head_count == 0 || head_dimension == 0 || kv_head_count == 0 {
@@ -1040,7 +1103,14 @@ impl CudaKernels {
             ));
         }
         let (seq_len, q_model_dim) = rows_cols_buf(q)?;
-        let (kv_seq_len, kv_model_dim) = rows_cols_buf(k)?;
+        let (kv_rows, kv_model_dim) = rows_cols_buf(k)?;
+        let kv_seq_len = key_count.unwrap_or(kv_rows);
+        if kv_seq_len > kv_rows {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!("key_count {kv_seq_len} exceeds the {kv_rows} rows of K/V"),
+            ));
+        }
         if seq_len > kv_seq_len {
             return Err(CudaError::new(
                 CudaErrorCode::ShapeUnsupported,

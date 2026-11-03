@@ -593,6 +593,74 @@ fn offered_output_buffer_is_reused_and_fully_rewritten() {
     }
 }
 
+/// `append-kv-history-in-place`: `kv-write` writes rows into the store in
+/// place and rejects overruns; attention bounded by `key_count` over a store
+/// whose tail is NaN matches the CPU reference over exactly the history, on
+/// both the block kernel and its long-history fallback.
+#[test]
+fn kv_write_and_key_count_attention_ignore_the_store_tail() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let mut store = upload(&kernels, &HostTensor::new([4, 2], vec![0.0; 8]).unwrap());
+    let rows = upload(
+        &kernels,
+        &HostTensor::new([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
+    );
+    kernels.kv_write(&mut store, &rows, 1).unwrap();
+    assert_eq!(
+        download(&kernels, &store).data,
+        vec![0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 0.0, 0.0]
+    );
+    assert!(kernels.kv_write(&mut store, &rows, 3).is_err());
+
+    // (history rows, heads, kv heads, head dimension): the block kernel, and
+    // a history too long for its shared memory.
+    for (case, (history, heads, kv_heads, dim)) in [(300u64, 14u64, 2u64, 64u64), (12_500, 2, 1, 4)]
+        .into_iter()
+        .enumerate()
+    {
+        let capacity = history + 7;
+        let q = HostTensor::new(
+            [1, heads * dim],
+            attention_values((heads * dim) as usize, 10 * case + 1),
+        )
+        .unwrap();
+        let k = HostTensor::new(
+            [history, kv_heads * dim],
+            attention_values((history * kv_heads * dim) as usize, 10 * case + 2),
+        )
+        .unwrap();
+        let v = HostTensor::new(
+            [history, kv_heads * dim],
+            attention_values((history * kv_heads * dim) as usize, 10 * case + 3),
+        )
+        .unwrap();
+        let expected =
+            magnetar_provider_cpu::attention(&q, &k, &v, heads, dim, Some(kv_heads), None, true)
+                .unwrap();
+        let with_tail = |tensor: &HostTensor| {
+            let mut data = vec![f32::NAN; (capacity * kv_heads * dim) as usize];
+            data[..tensor.data.len()].copy_from_slice(&tensor.data);
+            HostTensor::new([capacity, kv_heads * dim], data).unwrap()
+        };
+        let actual = kernels
+            .attention_bounded(
+                &upload(&kernels, &q),
+                &upload(&kernels, &with_tail(&k)),
+                &upload(&kernels, &with_tail(&v)),
+                heads,
+                dim,
+                Some(kv_heads),
+                None,
+                true,
+                Some(history),
+            )
+            .unwrap();
+        assert_close(&download(&kernels, &actual), &expected);
+    }
+}
+
 /// Deterministic pseudo-random values in [-0.5, 0.5).
 fn attention_values(len: usize, seed: usize) -> Vec<f32> {
     (0..len)
