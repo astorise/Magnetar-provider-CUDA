@@ -426,6 +426,7 @@ impl CudaKernels {
         buffer: &mut CudaDeviceBuffer,
         values: &[f32],
     ) -> Result<(), CudaError> {
+        Self::require_f32(&[&*buffer], "a buffer write")?;
         if values.len() != buffer.slice.len() {
             return Err(CudaError::new(
                 CudaErrorCode::ShapeUnsupported,
@@ -524,23 +525,26 @@ impl CudaKernels {
         if tensor.shape.len() != 2 || tensor.data.len() < COMPACT_WEIGHT_MIN_ELEMENTS {
             return self.upload(tensor);
         }
+        // Checked before anything is allocated: a weight that is not exact
+        // is uploaded as f32 with no compact allocation alive alongside.
+        if !tensor
+            .data
+            .iter()
+            .all(|&value| exact_bf16_bits(value).is_some())
+        {
+            return self.upload(tensor);
+        }
         self.forbid_in_capture("a host-to-device upload")?;
         // Converted and uploaded a chunk at a time: a whole host copy of the
         // bits would add half of the largest weight to the peak host memory.
         const CHUNK: usize = 1 << 20;
         // SAFETY: every element is written by the chunk copies below before
-        // anything reads the buffer; a weight that turns out not to be exact
-        // drops it unread.
+        // anything reads the buffer.
         let mut bf16 = unsafe { self.stream.alloc::<u16>(tensor.data.len()) }?;
         let mut bits = Vec::with_capacity(CHUNK.min(tensor.data.len()));
         for (index, chunk) in tensor.data.chunks(CHUNK).enumerate() {
             bits.clear();
-            for &value in chunk {
-                match exact_bf16_bits(value) {
-                    Some(value_bits) => bits.push(value_bits),
-                    None => return self.upload(tensor),
-                }
-            }
+            bits.extend(chunk.iter().map(|&value| (value.to_bits() >> 16) as u16));
             let start = index * CHUNK;
             let mut destination = bf16.slice_mut(start..start + chunk.len());
             self.stream.memcpy_htod(&bits, &mut destination)?;
@@ -701,6 +705,7 @@ impl CudaKernels {
         rows: &CudaDeviceBuffer,
         row_offset: u64,
     ) -> Result<(), CudaError> {
+        Self::require_f32(&[&*store, rows], "kv-write")?;
         let (capacity, width) = rows_cols_buf(store)?;
         let (count, row_width) = rows_cols_buf(rows)?;
         if row_width != width {
@@ -795,6 +800,7 @@ impl CudaKernels {
         a: &CudaDeviceBuffer,
         b: &CudaDeviceBuffer,
     ) -> Result<CudaDeviceBuffer, CudaError> {
+        Self::require_f32(&[a, b], "add")?;
         if a.shape == b.shape {
             let n = a.slice.len() as u64;
             let mut out_dev = self.alloc_output(a.slice.len())?;
@@ -851,6 +857,7 @@ impl CudaKernels {
         a: &CudaDeviceBuffer,
         b: &CudaDeviceBuffer,
     ) -> Result<CudaDeviceBuffer, CudaError> {
+        Self::require_f32(&[a, b], "mul")?;
         same_shape_buf(a, b)?;
         let n = a.slice.len() as u64;
         let mut out_dev = self.alloc_output(a.slice.len())?;
@@ -870,6 +877,7 @@ impl CudaKernels {
         input: &CudaDeviceBuffer,
         residual: &CudaDeviceBuffer,
     ) -> Result<CudaDeviceBuffer, CudaError> {
+        Self::require_f32(&[input, residual], "residual-add")?;
         self.add(input, residual)
     }
 
@@ -888,6 +896,7 @@ impl CudaKernels {
         a: &CudaDeviceBuffer,
         b: &CudaDeviceBuffer,
     ) -> Result<CudaDeviceBuffer, CudaError> {
+        Self::require_f32(&[a, b], "concat")?;
         let Some((&a_rows, a_rest)) = a.shape.split_first() else {
             return Err(CudaError::new(
                 CudaErrorCode::ShapeUnsupported,
@@ -926,6 +935,7 @@ impl CudaKernels {
     }
 
     pub fn silu(&self, input: &CudaDeviceBuffer) -> Result<CudaDeviceBuffer, CudaError> {
+        Self::require_f32(&[input], "silu")?;
         let n = input.slice.len() as u64;
         let mut out_dev = self.alloc_output(input.slice.len())?;
         let func = self.function("silu_kernel")?;
@@ -1022,6 +1032,7 @@ impl CudaKernels {
         weight: &CudaDeviceBuffer,
         epsilon: f32,
     ) -> Result<CudaDeviceBuffer, CudaError> {
+        Self::require_f32(&[input, weight], "rmsnorm")?;
         let cols = *input.shape.last().ok_or_else(|| {
             CudaError::new(
                 CudaErrorCode::ShapeUnsupported,
@@ -1123,6 +1134,7 @@ impl CudaKernels {
         head_count: u64,
         pairing: CudaRopePairing,
     ) -> Result<CudaDeviceBuffer, CudaError> {
+        Self::require_f32(&[input], "rope")?;
         let (rows, cols) = rows_cols_buf(input)?;
         if head_count == 0 || !cols.is_multiple_of(head_count) {
             return Err(CudaError::new(
@@ -1193,6 +1205,7 @@ impl CudaKernels {
     }
 
     pub fn softmax_rows(&self, input: &CudaDeviceBuffer) -> Result<CudaDeviceBuffer, CudaError> {
+        Self::require_f32(&[input], "softmax")?;
         let (rows, cols) = rows_cols_buf(input)?;
         self.forbid_in_capture("softmax")?;
         let mut out_dev = self.stream.alloc_zeros::<f32>(input.slice.len())?;
@@ -1277,6 +1290,7 @@ impl CudaKernels {
         gate: &CudaDeviceBuffer,
         up: &CudaDeviceBuffer,
     ) -> Result<CudaDeviceBuffer, CudaError> {
+        Self::require_f32(&[gate, up], "silu-mul")?;
         if gate.shape != up.shape {
             return Err(CudaError::new(
                 CudaErrorCode::ShapeUnsupported,
@@ -1465,6 +1479,7 @@ impl CudaKernels {
         causal: bool,
         key_count: Option<u64>,
     ) -> Result<CudaDeviceBuffer, CudaError> {
+        Self::require_f32(&[q, k, v], "attention")?;
         same_shape_buf(k, v)?;
         let kv_head_count = kv_head_count.unwrap_or(head_count);
         if head_count == 0 || head_dimension == 0 || kv_head_count == 0 {

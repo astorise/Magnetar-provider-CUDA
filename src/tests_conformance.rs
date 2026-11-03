@@ -1023,6 +1023,8 @@ fn compact_bf16_weights_give_bit_identical_results() {
     );
     // A compact buffer is never an f32 operand.
     assert!(kernels.matmul(&compact, &full_t, false, false).is_err());
+    assert!(kernels.add(&full, &compact).is_err());
+    assert!(kernels.silu(&compact).is_err());
     let expanded = kernels.expand(&compact).unwrap();
     assert!(!expanded.is_compact());
     assert_eq!(bits(&download(&kernels, &expanded)), bits(&weight));
