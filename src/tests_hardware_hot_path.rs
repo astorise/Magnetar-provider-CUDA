@@ -754,3 +754,56 @@ fn step_without_reading(
         BTreeMap::from([("epsilon".to_string(), OperatorAttributeValue::Float(1e-6))]),
     );
 }
+
+/// `execute-native-half-precision`: a weight written as one is stored
+/// compact, and a Kernel argument that only reads f32 gets it expanded,
+/// with the same result as the weight written as an ordinary tensor.
+#[test]
+fn a_compact_weight_read_as_f32_is_expanded_on_real_hardware() {
+    let Some(mut fixture) = chain_fixture_or_skip() else {
+        return;
+    };
+    let (rows, cols) = (256u64, 256u64);
+    let values: Vec<f32> = (0..rows * cols)
+        .map(|index| f32::from_bits(((index as f32 * 0.01).sin()).to_bits() & 0xFFFF_0000))
+        .collect();
+    let weight = HostTensor::new([rows, cols], values).unwrap();
+    let compact = TensorResourceId::new("compact.weight");
+    let plain = TensorResourceId::new("plain.weight");
+    let x = TensorResourceId::new("compact.x");
+    fixture
+        .executor
+        .write_weight_tensor(compact.clone(), weight.clone())
+        .unwrap();
+    stage_weight(&mut fixture, &plain, weight);
+    stage_weight(
+        &mut fixture,
+        &x,
+        HostTensor::new(
+            [cols, 2],
+            (0..cols * 2).map(|i| i as f32 * 1e-3).collect::<Vec<_>>(),
+        )
+        .unwrap(),
+    );
+    let mut product = |a: &TensorResourceId, out: &str| {
+        let out = TensorResourceId::new(out);
+        dispatch(
+            &mut fixture,
+            out.as_str(),
+            "matmul",
+            vec![
+                (a.clone(), descriptor(rows, cols)),
+                (x.clone(), descriptor(cols, 2)),
+            ],
+            out.clone(),
+            descriptor(rows, 2),
+            BTreeMap::new(),
+        );
+        fixture.executor.read_tensor(&out).unwrap().data
+    };
+    // The weight is matmul's `a`, which only reads f32.
+    assert_eq!(
+        product(&compact, "compact.out"),
+        product(&plain, "plain.out")
+    );
+}

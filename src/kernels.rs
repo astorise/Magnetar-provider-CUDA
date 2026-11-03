@@ -128,18 +128,48 @@ fn same_shape_half(a: &CudaHalfBuffer, b: &CudaHalfBuffer) -> Result<(), CudaErr
 /// keyed by `TensorResourceId`" decision) instead of only for the duration
 /// of one upload-compute-download call.
 pub struct CudaDeviceBuffer {
+    /// The values, unless the buffer is compact (`bf16`), in which case
+    /// this is a one-element placeholder no Kernel reads.
     pub(crate) slice: CudaSlice<f32>,
     pub shape: Vec<u64>,
+    /// A compact weight (`execute-native-half-precision`): every value is
+    /// exactly representable in bfloat16 and is stored as its bfloat16
+    /// bits, half the bytes of f32. Only Kernels that read bfloat16
+    /// operands accept a compact buffer: the matmul family's `b` and the
+    /// embedding lookup's table. They convert each value back to the same
+    /// f32 exactly, so their results are unchanged.
+    pub(crate) bf16: Option<CudaSlice<u16>>,
 }
 
 impl CudaDeviceBuffer {
+    /// Elements, compact or not.
     pub fn len(&self) -> usize {
-        self.slice.len()
+        match &self.bf16 {
+            Some(bf16) => bf16.len(),
+            None => self.slice.len(),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.slice.is_empty()
+        self.len() == 0
     }
+
+    /// Whether the values are stored as bfloat16 bits.
+    pub fn is_compact(&self) -> bool {
+        self.bf16.is_some()
+    }
+}
+
+/// Weights at least this large are stored compact when every value is
+/// exactly a bfloat16 value; smaller tensors (biases, norm weights,
+/// activations) always stay f32.
+pub const COMPACT_WEIGHT_MIN_ELEMENTS: usize = 1 << 16;
+
+/// The bfloat16 bits of `value` when converting them back gives exactly
+/// `value` (the low 16 bits of its f32 encoding are zero).
+fn exact_bf16_bits(value: f32) -> Option<u16> {
+    let bits = value.to_bits();
+    (bits & 0xFFFF == 0).then_some((bits >> 16) as u16)
 }
 
 fn same_shape_buf(a: &CudaDeviceBuffer, b: &CudaDeviceBuffer) -> Result<(), CudaError> {
@@ -364,8 +394,30 @@ impl CudaKernels {
 
     /// The device address of `buffer`'s allocation, as a capture records it.
     pub fn address(&self, buffer: &CudaDeviceBuffer) -> u64 {
-        let (address, _sync) = buffer.slice.device_ptr(&self.stream);
-        address
+        match &buffer.bf16 {
+            Some(bf16) => bf16.device_ptr(&self.stream).0,
+            None => buffer.slice.device_ptr(&self.stream).0,
+        }
+    }
+
+    /// The device address of a compact buffer's bfloat16 bits, or zero (no
+    /// compact operand) for an f32 buffer.
+    fn bf16_address(&self, buffer: &CudaDeviceBuffer) -> u64 {
+        buffer
+            .bf16
+            .as_ref()
+            .map_or(0, |bf16| bf16.device_ptr(&self.stream).0)
+    }
+
+    /// Fails for a compact buffer: `what` reads its operands as f32.
+    fn require_f32(buffers: &[&CudaDeviceBuffer], what: &str) -> Result<(), CudaError> {
+        if buffers.iter().any(|buffer| buffer.is_compact()) {
+            return Err(CudaError::new(
+                CudaErrorCode::DTypeUnsupported,
+                format!("{what} does not read compact (bfloat16) operands"),
+            ));
+        }
+        Ok(())
     }
 
     /// Writes `values` into `buffer`'s existing allocation.
@@ -459,7 +511,45 @@ impl CudaKernels {
         Ok(CudaDeviceBuffer {
             slice,
             shape: tensor.shape.clone(),
+            bf16: None,
         })
+    }
+
+    /// Uploads a Model Instance weight (`execute-native-half-precision`):
+    /// compact, as bfloat16 bits, when it is a matrix of at least
+    /// [`COMPACT_WEIGHT_MIN_ELEMENTS`] values that are all exactly bfloat16
+    /// values (as every weight of a bfloat16 checkpoint is), otherwise as
+    /// [`Self::upload`] does. Lossless either way.
+    pub fn upload_weight(&self, tensor: &HostTensor) -> Result<CudaDeviceBuffer, CudaError> {
+        let bits = (tensor.shape.len() == 2 && tensor.data.len() >= COMPACT_WEIGHT_MIN_ELEMENTS)
+            .then(|| {
+                tensor
+                    .data
+                    .iter()
+                    .map(|&value| exact_bf16_bits(value))
+                    .collect::<Option<Vec<u16>>>()
+            })
+            .flatten();
+        let Some(bits) = bits else {
+            return self.upload(tensor);
+        };
+        self.forbid_in_capture("a host-to-device upload")?;
+        let bf16 = self.stream.clone_htod(&bits)?;
+        // The f32 placeholder no Kernel reads.
+        let slice = self.stream.alloc_zeros::<f32>(1)?;
+        self.upload_count.fetch_add(1, Ordering::Relaxed);
+        Ok(CudaDeviceBuffer {
+            slice,
+            shape: tensor.shape.clone(),
+            bf16: Some(bf16),
+        })
+    }
+
+    /// The same values as a compact `buffer`, stored as f32: for a Kernel
+    /// that only reads f32 operands.
+    pub fn expand(&self, buffer: &CudaDeviceBuffer) -> Result<CudaDeviceBuffer, CudaError> {
+        let tensor = self.download(buffer)?;
+        self.upload(&tensor)
     }
 
     /// Downloads a device buffer to host-visible bytes. The only
@@ -469,7 +559,15 @@ impl CudaKernels {
     /// as an automatic step of every Kernel invocation.
     pub fn download(&self, buffer: &CudaDeviceBuffer) -> Result<HostTensor, CudaError> {
         self.forbid_in_capture("a device-to-host download")?;
-        let data = self.stream.clone_dtoh(&buffer.slice)?;
+        let data = match &buffer.bf16 {
+            Some(bf16) => {
+                let bits = self.stream.clone_dtoh(bf16)?;
+                bits.iter()
+                    .map(|&bits| f32::from_bits(u32::from(bits) << 16))
+                    .collect()
+            }
+            None => self.stream.clone_dtoh(&buffer.slice)?,
+        };
         self.stream.synchronize()?;
         self.download_count.fetch_add(1, Ordering::Relaxed);
         HostTensor::new(buffer.shape.clone(), data).map_err(host_error)
@@ -665,9 +763,14 @@ impl CudaKernels {
     pub fn clone_buffer(&self, buffer: &CudaDeviceBuffer) -> Result<CudaDeviceBuffer, CudaError> {
         self.forbid_in_capture("a buffer copy")?;
         let slice = self.stream.clone_dtod(&buffer.slice)?;
+        let bf16 = match &buffer.bf16 {
+            Some(bf16) => Some(self.stream.clone_dtod(bf16)?),
+            None => None,
+        };
         Ok(CudaDeviceBuffer {
             slice,
             shape: buffer.shape.clone(),
+            bf16,
         })
     }
 
@@ -692,6 +795,7 @@ impl CudaKernels {
             return Ok(CudaDeviceBuffer {
                 slice: out_dev,
                 shape: a.shape.clone(),
+                bf16: None,
             });
         }
         let cols = *a.shape.last().ok_or_else(|| {
@@ -728,6 +832,7 @@ impl CudaKernels {
         Ok(CudaDeviceBuffer {
             slice: out_dev,
             shape: a.shape.clone(),
+            bf16: None,
         })
     }
 
@@ -746,6 +851,7 @@ impl CudaKernels {
         Ok(CudaDeviceBuffer {
             slice: out_dev,
             shape: a.shape.clone(),
+            bf16: None,
         })
     }
 
@@ -805,6 +911,7 @@ impl CudaKernels {
         Ok(CudaDeviceBuffer {
             slice: out_dev,
             shape,
+            bf16: None,
         })
     }
 
@@ -818,6 +925,7 @@ impl CudaKernels {
         Ok(CudaDeviceBuffer {
             slice: out_dev,
             shape: input.shape.clone(),
+            bf16: None,
         })
     }
 
@@ -827,6 +935,8 @@ impl CudaKernels {
         ids: &CudaDeviceBuffer,
     ) -> Result<CudaDeviceBuffer, CudaError> {
         let (vocab, dim) = rows_cols_buf(table)?;
+        Self::require_f32(&[ids], "the embedding lookup's ids")?;
+        let table16 = self.bf16_address(table);
         let num_ids = ids.slice.len() as u64;
         // Rows of invalid ids stay unwritten, but those fail the lookup.
         let mut out_dev = self.alloc_output(ids.slice.len() * dim as usize)?;
@@ -850,7 +960,8 @@ impl CudaKernels {
             .arg(&dim)
             .arg(&num_ids)
             .arg(&vocab)
-            .arg(&mut invalid_id_flag);
+            .arg(&mut invalid_id_flag)
+            .arg(&table16);
         let launched = unsafe { args.launch(LaunchConfig::for_num_elems(num_ids as u32)) };
         *flag_slot = Some(invalid_id_flag);
         drop(flag_slot);
@@ -863,6 +974,7 @@ impl CudaKernels {
             return Ok(CudaDeviceBuffer {
                 slice: out_dev,
                 shape: vec![num_ids, dim],
+                bf16: None,
             });
         }
         // Data-dependent failure (an out-of-range or non-integer token id)
@@ -873,6 +985,7 @@ impl CudaKernels {
         Ok(CudaDeviceBuffer {
             slice: out_dev,
             shape: vec![num_ids, dim],
+            bf16: None,
         })
     }
 
@@ -953,6 +1066,7 @@ impl CudaKernels {
         Ok(CudaDeviceBuffer {
             slice: out_dev,
             shape: input.shape.clone(),
+            bf16: None,
         })
     }
 
@@ -1064,6 +1178,7 @@ impl CudaKernels {
         Ok(CudaDeviceBuffer {
             slice: out_dev,
             shape: input.shape.clone(),
+            bf16: None,
         })
     }
 
@@ -1091,6 +1206,7 @@ impl CudaKernels {
         Ok(CudaDeviceBuffer {
             slice: out_dev,
             shape: input.shape.clone(),
+            bf16: None,
         })
     }
 
@@ -1172,6 +1288,7 @@ impl CudaKernels {
         Ok(CudaDeviceBuffer {
             slice: out_dev,
             shape: gate.shape.clone(),
+            bf16: None,
         })
     }
 
@@ -1232,6 +1349,11 @@ impl CudaKernels {
             }
             _ => {}
         }
+        Self::require_f32(&[a], "matmul's a")?;
+        if let Some(MatmulAddend::Row(addend) | MatmulAddend::Full(addend)) = addend {
+            Self::require_f32(&[addend], "a fused matmul's addend")?;
+        }
+        let b16 = self.bf16_address(b);
         let mut out_dev = self.alloc_output((m * n) as usize)?;
         if b_col_stride == 1 && m <= MATMUL_SPLIT_K_MAX_ROWS {
             let func = self.function("matmul_split_k_kernel")?;
@@ -1252,7 +1374,7 @@ impl CudaKernels {
                 Some(MatmulAddend::Row(bias)) => (bias, 1),
                 Some(MatmulAddend::Full(residual)) => (residual, 2),
             };
-            args.arg(&addend_buffer.slice).arg(&addend_mode);
+            args.arg(&addend_buffer.slice).arg(&addend_mode).arg(&b16);
             let config = LaunchConfig {
                 grid_dim: (n.div_ceil(32) as u32, m as u32, 1),
                 block_dim: (32, MATMUL_SPLIT_K, 1),
@@ -1262,6 +1384,7 @@ impl CudaKernels {
             return Ok(CudaDeviceBuffer {
                 slice: out_dev,
                 shape: vec![m, n],
+                bf16: None,
             });
         }
         let func = self.function("matmul_kernel")?;
@@ -1275,11 +1398,13 @@ impl CudaKernels {
             .arg(&a_row_stride)
             .arg(&a_inner_stride)
             .arg(&b_inner_stride)
-            .arg(&b_col_stride);
+            .arg(&b_col_stride)
+            .arg(&b16);
         unsafe { args.launch(LaunchConfig::for_num_elems((m * n) as u32)) }?;
         let product = CudaDeviceBuffer {
             slice: out_dev,
             shape: vec![m, n],
+            bf16: None,
         };
         match addend {
             Some(MatmulAddend::Row(addend) | MatmulAddend::Full(addend)) => {
@@ -1446,6 +1571,7 @@ impl CudaKernels {
             return Ok(CudaDeviceBuffer {
                 slice: out_dev,
                 shape: q.shape.clone(),
+                bf16: None,
             });
         }
         if self.is_capturing() {
@@ -1473,6 +1599,7 @@ impl CudaKernels {
         Ok(CudaDeviceBuffer {
             slice: out_dev,
             shape: q.shape.clone(),
+            bf16: None,
         })
     }
 }

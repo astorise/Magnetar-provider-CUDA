@@ -238,7 +238,7 @@ impl CudaExecutor {
         for (resource, (address, len)) in &captured.recording.resources {
             let current = storage
                 .get(resource)
-                .map(|buffer| (self.kernels.address(buffer), buffer.slice.len()));
+                .map(|buffer| (self.kernels.address(buffer), buffer.len()));
             if current != Some((*address, *len)) {
                 return Err(invalidated(format!(
                     "resource '{resource}' no longer has its captured storage"
@@ -312,12 +312,9 @@ impl CudaExecutor {
                 .chain(&invocation.outputs)
                 .filter_map(|resource| {
                     let id = &resource.resource.id;
-                    storage.get(id).map(|buffer| {
-                        (
-                            id.clone(),
-                            (self.kernels.address(buffer), buffer.slice.len()),
-                        )
-                    })
+                    storage
+                        .get(id)
+                        .map(|buffer| (id.clone(), (self.kernels.address(buffer), buffer.len())))
                 })
                 .collect();
             (touched, embedding_ids)
@@ -342,6 +339,19 @@ impl CudaExecutor {
     /// [`CudaDeviceBuffer`] drops). A real host-to-device crossing --
     /// callers that already have a same-Provider device-resident value
     /// should never reach this; see [`Self::write_tensor_value`].
+    /// See [`ProviderExecutionApi::write_weight_tensor`]: a weight whose
+    /// values are all bfloat16 values is stored compact
+    /// ([`CudaKernels::upload_weight`]).
+    pub fn write_weight_tensor(
+        &self,
+        id: TensorResourceId,
+        tensor: HostTensor,
+    ) -> Result<(), CudaError> {
+        let buffer = self.kernels.upload_weight(&tensor)?;
+        self.storage.lock().unwrap().insert(id, buffer);
+        Ok(())
+    }
+
     pub fn write_tensor(&self, id: TensorResourceId, tensor: HostTensor) -> Result<(), CudaError> {
         let buffer = self.kernels.upload(&tensor)?;
         self.storage.lock().unwrap().insert(id, buffer);
@@ -796,6 +806,7 @@ impl CudaExecutor {
         &self,
         invocation: &KernelInvocation,
     ) -> Result<KernelResult, KernelError> {
+        self.expand_unsupported_compact_inputs(invocation)?;
         if invocation.kernel.name == "kv-write" {
             return self.run_kv_write(invocation);
         }
@@ -814,7 +825,12 @@ impl CudaExecutor {
             {
                 return None;
             }
-            let buffer = self.storage.lock().unwrap().remove(id)?;
+            let mut storage = self.storage.lock().unwrap();
+            // A compact buffer has no f32 allocation to offer.
+            if storage.get(id).is_none_or(CudaDeviceBuffer::is_compact) {
+                return None;
+            }
+            let buffer = storage.remove(id)?;
             Some((id.clone(), buffer))
         });
         let (restore, offered_slice) = match previous_output {
@@ -827,12 +843,44 @@ impl CudaExecutor {
             && let Some((id, shape)) = restore
             && let Some(slice) = offered.reclaim()
         {
-            self.storage
-                .lock()
-                .unwrap()
-                .insert(id, CudaDeviceBuffer { slice, shape });
+            self.storage.lock().unwrap().insert(
+                id,
+                CudaDeviceBuffer {
+                    slice,
+                    shape,
+                    bf16: None,
+                },
+            );
         }
         result
+    }
+
+    /// Stores as f32, for good, every compact input `invocation` reads
+    /// through a Kernel argument that only reads f32: only the matmul
+    /// family's `b` (input 1) and the embedding lookup's table (input 0) read
+    /// compact weights (`execute-native-half-precision`).
+    fn expand_unsupported_compact_inputs(
+        &self,
+        invocation: &KernelInvocation,
+    ) -> Result<(), KernelError> {
+        let reads_compact = |index: usize| match invocation.kernel.name.as_str() {
+            "matmul" | "matmul-bias" | "matmul-residual" => index == 1,
+            "embedding" => index == 0,
+            _ => false,
+        };
+        let mut storage = self.storage.lock().unwrap();
+        for (index, input) in invocation.inputs.iter().enumerate() {
+            let id = &input.resource.id;
+            if reads_compact(index) || !storage.get(id).is_some_and(CudaDeviceBuffer::is_compact) {
+                continue;
+            }
+            let expanded = self
+                .kernels
+                .expand(&storage[id])
+                .map_err(KernelError::from)?;
+            storage.insert(id.clone(), expanded);
+        }
+        Ok(())
     }
 
     /// `kv-write` (`append-kv-history-in-place`): writes the rows into the
@@ -1503,6 +1551,22 @@ impl ProviderExecutionApi for CudaExecutor {
         tensor: HostTensor,
     ) -> Result<(), ProviderExecutionError> {
         CudaExecutor::write_tensor(self, id, tensor).map_err(|error| {
+            ProviderExecutionError::new(
+                ProviderExecutionErrorCode::MaterializationFailed,
+                ProviderExecutionPhase::Submit,
+                self.provider_binding(),
+                Some(self.device_binding()),
+                format!("CUDA device upload failed: {error}"),
+            )
+        })
+    }
+
+    fn write_weight_tensor(
+        &self,
+        id: TensorResourceId,
+        tensor: HostTensor,
+    ) -> Result<(), ProviderExecutionError> {
+        CudaExecutor::write_weight_tensor(self, id, tensor).map_err(|error| {
             ProviderExecutionError::new(
                 ProviderExecutionErrorCode::MaterializationFailed,
                 ProviderExecutionPhase::Submit,
