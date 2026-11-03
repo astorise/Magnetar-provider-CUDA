@@ -36,6 +36,9 @@ pub enum CudaErrorCode {
     /// attempted (mirrors [`crate::provider::CudaProvider::is_available`]
     /// being `false`).
     DeviceUnavailable,
+    /// A step capture (`capture-and-replay-cuda-graphs`) met work it cannot
+    /// replay, or was used out of order.
+    CaptureUnsupported,
 }
 
 /// A structured CUDA Provider error. `detail` carries a redacted diagnostic
@@ -122,7 +125,8 @@ impl From<CudaError> for magnetar_runtime::kernel::KernelError {
             // something else (unlike the categories above).
             CudaErrorCode::ExecutionFailed
             | CudaErrorCode::CompilationFailed
-            | CudaErrorCode::DriverFailed => KernelError::KernelExecutionFailed {
+            | CudaErrorCode::DriverFailed
+            | CudaErrorCode::CaptureUnsupported => KernelError::KernelExecutionFailed {
                 reason: error.detail,
             },
         }
