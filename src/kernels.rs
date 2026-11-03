@@ -521,20 +521,30 @@ impl CudaKernels {
     /// values (as every weight of a bfloat16 checkpoint is), otherwise as
     /// [`Self::upload`] does. Lossless either way.
     pub fn upload_weight(&self, tensor: &HostTensor) -> Result<CudaDeviceBuffer, CudaError> {
-        let bits = (tensor.shape.len() == 2 && tensor.data.len() >= COMPACT_WEIGHT_MIN_ELEMENTS)
-            .then(|| {
-                tensor
-                    .data
-                    .iter()
-                    .map(|&value| exact_bf16_bits(value))
-                    .collect::<Option<Vec<u16>>>()
-            })
-            .flatten();
-        let Some(bits) = bits else {
+        if tensor.shape.len() != 2 || tensor.data.len() < COMPACT_WEIGHT_MIN_ELEMENTS {
             return self.upload(tensor);
-        };
+        }
         self.forbid_in_capture("a host-to-device upload")?;
-        let bf16 = self.stream.clone_htod(&bits)?;
+        // Converted and uploaded a chunk at a time: a whole host copy of the
+        // bits would add half of the largest weight to the peak host memory.
+        const CHUNK: usize = 1 << 20;
+        // SAFETY: every element is written by the chunk copies below before
+        // anything reads the buffer; a weight that turns out not to be exact
+        // drops it unread.
+        let mut bf16 = unsafe { self.stream.alloc::<u16>(tensor.data.len()) }?;
+        let mut bits = Vec::with_capacity(CHUNK.min(tensor.data.len()));
+        for (index, chunk) in tensor.data.chunks(CHUNK).enumerate() {
+            bits.clear();
+            for &value in chunk {
+                match exact_bf16_bits(value) {
+                    Some(value_bits) => bits.push(value_bits),
+                    None => return self.upload(tensor),
+                }
+            }
+            let start = index * CHUNK;
+            let mut destination = bf16.slice_mut(start..start + chunk.len());
+            self.stream.memcpy_htod(&bits, &mut destination)?;
+        }
         // The f32 placeholder no Kernel reads.
         let slice = self.stream.alloc_zeros::<f32>(1)?;
         self.upload_count.fetch_add(1, Ordering::Relaxed);
