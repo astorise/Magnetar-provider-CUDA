@@ -536,6 +536,28 @@ impl CudaKernels {
         })
     }
 
+    /// A fresh f32 buffer of `shape` whose values are all zero, set on the
+    /// Device: nothing is built on the host or transferred.
+    pub fn zeros(&self, shape: &[u64]) -> Result<CudaDeviceBuffer, CudaError> {
+        self.forbid_in_capture("a device allocation")?;
+        let len = shape.iter().try_fold(1usize, |len, &dimension| {
+            usize::try_from(dimension)
+                .ok()
+                .and_then(|dimension| len.checked_mul(dimension))
+        });
+        let len = len.ok_or_else(|| {
+            CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!("a zeroed tensor of shape {shape:?} does not fit in memory"),
+            )
+        })?;
+        Ok(CudaDeviceBuffer {
+            slice: self.stream.alloc_zeros::<f32>(len)?,
+            shape: shape.to_vec(),
+            bf16: None,
+        })
+    }
+
     /// Uploads a Model Instance weight (`execute-native-half-precision`):
     /// compact, as bfloat16 bits, when it is a matrix of at least
     /// [`COMPACT_WEIGHT_MIN_ELEMENTS`] values that are all exactly bfloat16
