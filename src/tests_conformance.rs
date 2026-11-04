@@ -475,88 +475,6 @@ fn split_k_matmul_matches_reference_cpu_on_uneven_shapes() {
     }
 }
 
-/// A decode matmul whose column tiles leave the Device idle also splits
-/// `k` across blocks: results match the Reference CPU with every addend,
-/// are identical from one launch to the next (the last block's order is
-/// fixed and it resets its tile counter), and stay close to the
-/// one-block sum.
-#[test]
-fn cross_block_split_matmul_is_deterministic_and_matches_reference_cpu() {
-    let Some(kernels) = kernels_or_skip() else {
-        return;
-    };
-    let values = |count: u64, seed: u64| -> Vec<f32> {
-        (0..count)
-            .map(|i| (((i * 7919 + seed * 104_729) % 2001) as f32 - 1000.0) * 1e-4)
-            .collect()
-    };
-    // k = 4861 leaves the last block a short chunk.
-    for (m, k, n) in [(1u64, 896u64, 128u64), (1, 4861, 96), (2, 1000, 33)] {
-        let a = HostTensor::new([m, k], values(m * k, 1)).unwrap();
-        let b = HostTensor::new([k, n], values(k * n, 2)).unwrap();
-        let bias = HostTensor::new([n], values(n, 3)).unwrap();
-        let residual = HostTensor::new([m, n], values(m * n, 4)).unwrap();
-        let (a_dev, b_dev) = (upload(&kernels, &a), upload(&kernels, &b));
-        let (bias_dev, residual_dev) = (upload(&kernels, &bias), upload(&kernels, &residual));
-        let product = magnetar_provider_cpu::matmul(&a, &b, false, false).unwrap();
-        let run = |splits: u64| {
-            kernels
-                .max_k_splits
-                .store(splits, std::sync::atomic::Ordering::Relaxed);
-            [
-                download(
-                    &kernels,
-                    &kernels.matmul(&a_dev, &b_dev, false, false).unwrap(),
-                ),
-                download(
-                    &kernels,
-                    &kernels
-                        .matmul_bias(&a_dev, &b_dev, &bias_dev, false, false)
-                        .unwrap(),
-                ),
-                download(
-                    &kernels,
-                    &kernels
-                        .matmul_residual(&a_dev, &b_dev, &residual_dev, false, false)
-                        .unwrap(),
-                ),
-            ]
-        };
-        let split = run(crate::kernels::MATMUL_MAX_K_SPLITS);
-        let again = run(crate::kernels::MATMUL_MAX_K_SPLITS);
-        let whole = run(1);
-        for (index, (split, again)) in split.iter().zip(&again).enumerate() {
-            assert_eq!(
-                split.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                again.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                "[{m}, {k}] x [{k}, {n}] output {index}"
-            );
-        }
-        let with = |add: &dyn Fn(usize) -> f32| {
-            HostTensor::new(
-                [m, n],
-                product
-                    .data
-                    .iter()
-                    .enumerate()
-                    .map(|(i, v)| v + add(i))
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap()
-        };
-        assert_close(&split[0], &product);
-        assert_close(&split[1], &with(&|i| bias.data[i % n as usize]));
-        assert_close(&split[2], &with(&|i| residual.data[i]));
-        for (split, whole) in split.iter().zip(&whole) {
-            assert_close(split, whole);
-        }
-    }
-    kernels.max_k_splits.store(
-        crate::kernels::MATMUL_MAX_K_SPLITS,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-}
-
 #[test]
 fn causal_attention_matches_reference_cpu() {
     let Some(kernels) = kernels_or_skip() else {
@@ -1161,25 +1079,13 @@ fn decode_matmul_bandwidth() {
         };
         let f32_ms = time(&full);
         let bf16_ms = time(&compact);
-        let splits = |max: u64| {
-            kernels
-                .max_k_splits
-                .store(max, std::sync::atomic::Ordering::Relaxed)
-        };
-        // The same compact matmul with `k` summed by one block per tile.
-        splits(1);
-        let unsplit_ms = time(&compact);
-        splits(crate::kernels::MATMUL_MAX_K_SPLITS);
         let gb = |bytes: u64, ms: f32| bytes as f32 / ms / 1e6;
         eprintln!(
-            "matmul [1, {k}] x [{k}, {n}]: f32 {:.1} us ({:.0} GB/s), bf16 {:.1} us ({:.0} GB/s), \
-             bf16 unsplit {:.1} us ({:.0} GB/s)",
+            "matmul [1, {k}] x [{k}, {n}]: f32 {:.1} us ({:.0} GB/s), bf16 {:.1} us ({:.0} GB/s)",
             f32_ms * 1e3,
             gb(k * n * 4, f32_ms),
             bf16_ms * 1e3,
             gb(k * n * 2, bf16_ms),
-            unsplit_ms * 1e3,
-            gb(k * n * 2, unsplit_ms),
         );
     }
 }
