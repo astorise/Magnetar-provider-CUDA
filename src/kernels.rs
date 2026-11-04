@@ -1321,6 +1321,76 @@ impl CudaKernels {
         })
     }
 
+    /// `silu(a x gate) * (a x up)`: the Runtime's fused `gated-matmul`,
+    /// bit-identical to both matmuls followed by [`Self::silu_mul`]. One
+    /// launch reads both weights when they are not transposed; otherwise
+    /// it runs exactly those three operations.
+    pub fn gated_matmul(
+        &self,
+        a: &CudaDeviceBuffer,
+        gate: &CudaDeviceBuffer,
+        up: &CudaDeviceBuffer,
+        transpose_a: bool,
+        transpose_b: bool,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        if gate.shape != up.shape {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!(
+                    "gated-matmul expects gate and up weights of one shape, got {:?} and {:?}",
+                    gate.shape, up.shape
+                ),
+            ));
+        }
+        let (a_rows, a_cols) = rows_cols_buf(a)?;
+        let (b_rows, b_cols) = rows_cols_buf(gate)?;
+        let (m, k) = if transpose_a {
+            (a_cols, a_rows)
+        } else {
+            (a_rows, a_cols)
+        };
+        if transpose_b || m > MATMUL_SPLIT_K_MAX_ROWS || k != b_rows {
+            let gate_out = self.matmul(a, gate, transpose_a, transpose_b)?;
+            let up_out = self.matmul(a, up, transpose_a, transpose_b)?;
+            return self.silu_mul(&gate_out, &up_out);
+        }
+        Self::require_f32(&[a], "gated-matmul's input")?;
+        let n = b_cols;
+        let (a_row_stride, a_inner_stride) = if transpose_a {
+            (1, a_cols)
+        } else {
+            (a_cols, 1)
+        };
+        let b_inner_stride = n;
+        let (gate16, up16) = (self.bf16_address(gate), self.bf16_address(up));
+        let mut out_dev = self.alloc_output((m * n) as usize)?;
+        let func = self.function("gated_matmul_split_k_kernel")?;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(&a.slice)
+            .arg(&gate.slice)
+            .arg(&gate16)
+            .arg(&up.slice)
+            .arg(&up16)
+            .arg(&mut out_dev)
+            .arg(&m)
+            .arg(&k)
+            .arg(&n)
+            .arg(&a_row_stride)
+            .arg(&a_inner_stride)
+            .arg(&b_inner_stride);
+        let config = LaunchConfig {
+            grid_dim: (n.div_ceil(32) as u32, m as u32, 1),
+            block_dim: (32, MATMUL_SPLIT_K, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { args.launch(config) }?;
+        Ok(CudaDeviceBuffer {
+            slice: out_dev,
+            shape: vec![m, n],
+            bf16: None,
+        })
+    }
+
     fn matmul_with_addend(
         &self,
         a: &CudaDeviceBuffer,

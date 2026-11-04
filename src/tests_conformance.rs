@@ -475,6 +475,86 @@ fn split_k_matmul_matches_reference_cpu_on_uneven_shapes() {
     }
 }
 
+/// `gated-matmul` (the Runtime's fused SwiGLU projection) is bit-identical
+/// to its two matmuls followed by `silu-mul`, with full and compact
+/// weights, one- and multi-row inputs, and on its transposed fallback.
+#[test]
+fn gated_matmul_is_bit_identical_to_two_matmuls_and_silu_mul() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let bits = |tensor: &HostTensor| tensor.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    for (m, k, n) in [(1u64, 896u64, 4864u64), (3, 96, 1000), (2, 37, 33)] {
+        let a = upload(
+            &kernels,
+            &HostTensor::new([m, k], bf16_exact_values((m * k) as usize, 1)).unwrap(),
+        );
+        let gate = HostTensor::new([k, n], bf16_exact_values((k * n) as usize, 2)).unwrap();
+        let up = HostTensor::new([k, n], bf16_exact_values((k * n) as usize, 3)).unwrap();
+        let unfused = |gate: &CudaDeviceBuffer, up: &CudaDeviceBuffer| {
+            let gate = kernels.matmul(&a, gate, false, false).unwrap();
+            let up = kernels.matmul(&a, up, false, false).unwrap();
+            download(&kernels, &kernels.silu_mul(&gate, &up).unwrap())
+        };
+        let (full_gate, full_up) = (upload(&kernels, &gate), upload(&kernels, &up));
+        let fused = kernels
+            .gated_matmul(&a, &full_gate, &full_up, false, false)
+            .unwrap();
+        assert_eq!(fused.shape, vec![m, n]);
+        assert_eq!(
+            bits(&download(&kernels, &fused)),
+            bits(&unfused(&full_gate, &full_up)),
+            "[{m}, {k}] x [{k}, {n}], f32 weights"
+        );
+        let (compact_gate, compact_up) = (
+            kernels.upload_weight(&gate).unwrap(),
+            kernels.upload_weight(&up).unwrap(),
+        );
+        let fused = kernels
+            .gated_matmul(&a, &compact_gate, &compact_up, false, false)
+            .unwrap();
+        assert_eq!(
+            bits(&download(&kernels, &fused)),
+            bits(&unfused(&compact_gate, &compact_up)),
+            "[{m}, {k}] x [{k}, {n}], compact weights"
+        );
+    }
+    // Transposed weights take the three-launch fallback.
+    let a = upload(
+        &kernels,
+        &HostTensor::new([2, 8], bf16_exact_values(16, 4)).unwrap(),
+    );
+    let gate = upload(
+        &kernels,
+        &HostTensor::new([5, 8], bf16_exact_values(40, 5)).unwrap(),
+    );
+    let up = upload(
+        &kernels,
+        &HostTensor::new([5, 8], bf16_exact_values(40, 6)).unwrap(),
+    );
+    let fused = kernels.gated_matmul(&a, &gate, &up, false, true).unwrap();
+    let expected = kernels
+        .silu_mul(
+            &kernels.matmul(&a, &gate, false, true).unwrap(),
+            &kernels.matmul(&a, &up, false, true).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        bits(&download(&kernels, &fused)),
+        bits(&download(&kernels, &expected))
+    );
+    // Weights of different shapes are refused.
+    let other = upload(
+        &kernels,
+        &HostTensor::new([8, 4], bf16_exact_values(32, 7)).unwrap(),
+    );
+    assert!(
+        kernels
+            .gated_matmul(&a, &gate, &other, false, true)
+            .is_err()
+    );
+}
+
 #[test]
 fn causal_attention_matches_reference_cpu() {
     let Some(kernels) = kernels_or_skip() else {
