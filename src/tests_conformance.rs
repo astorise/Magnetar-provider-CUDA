@@ -802,8 +802,7 @@ fn tensor_core_matmul_keeps_f32_activation_precision() {
     let Some(kernels) = kernels_or_skip() else {
         return;
     };
-    // The opt-in one-term profile deliberately drops the low term.
-    if !kernels.has_tensor_cores() || !kernels.tensor_core_split_activations() {
+    if !kernels.has_tensor_cores() {
         return;
     }
     let (m, k, n) = (70u64, 900u64, 130u64);
