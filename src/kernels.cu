@@ -1063,7 +1063,8 @@ extern "C" __global__ void attention_block_kernel(
 // ATTENTION_TILE_QUERIES queries of one head with 4 threads each (thread
 // `part` of a query owns head dimensions part, part + 4, ...). K and V rows
 // are staged through shared memory one tile of `key_tile` keys at a time,
-// and each query keeps a running max, sum and output (online softmax), so
+// and each query keeps a running max, sum and weighted mean of V (online
+// softmax, the mean never leaving the V rows' range), so
 // every K/V tile is read once per query tile instead of once per query.
 // A query's 4 partial dot products are added with a fixed butterfly, and
 // its keys are visited in order, so the result is deterministic.
@@ -1156,27 +1157,28 @@ extern "C" __global__ void attention_tiled_kernel(
                 continue;
             }
             float score = dot * scale;
+            // `acc` is the weighted mean of the V rows seen so far (not
+            // their weighted sum), so it stays within their range and
+            // large finite values cannot overflow.
+            float kept = sum;
             if (score > max_value) {
-                float correction = expf(max_value - score);
-                sum *= correction;
-                for (unsigned long long i = 0; i < part_dims; i++) {
-                    acc[i] *= correction;
-                }
+                kept = sum * expf(max_value - score);
                 max_value = score;
             }
             float weight = expf(score - max_value);
-            sum += weight;
+            sum = kept + weight;
+            float keep = kept / sum;
+            float take = weight / sum;
             const float* v_row = v_tile + j * head_dimension;
             for (unsigned long long i = 0; i < part_dims; i++) {
-                acc[i] += weight * v_row[part + 4 * i];
+                acc[i] = acc[i] * keep + v_row[part + 4 * i] * take;
             }
         }
     }
     if (active) {
         // No key admitted (an empty window) leaves the output zero.
         for (unsigned long long i = 0; i < part_dims; i++) {
-            out[query_index * q_model_dim + q_offset + part + 4 * i] =
-                sum > 0.0f ? acc[i] / sum : 0.0f;
+            out[query_index * q_model_dim + q_offset + part + 4 * i] = sum > 0.0f ? acc[i] : 0.0f;
         }
     }
 }
@@ -1306,15 +1308,20 @@ extern "C" __global__ void attention_split_kernel(
         __syncthreads();
     }
     float sum = reduce[0];
+    // Weights normalized before they weight V, as `attention_block_kernel`:
+    // a chunk's output is then a weighted mean of V rows, which cannot
+    // overflow where the result is representable.
+    for (unsigned long long j = tid; j < count; j += ATTENTION_SPLIT_THREADS) {
+        scores[j] = scores[j] / sum;
+    }
+    __syncthreads();
 
-    // Normalized within the chunk, so a chunk's output is a weighted mean
-    // of V rows and cannot overflow where the result is representable.
     for (unsigned long long d = tid; d < head_dimension; d += ATTENTION_SPLIT_THREADS) {
         float acc = 0.0f;
         for (unsigned long long j = 0; j < count; j++) {
             acc += scores[j] * v[(first + j) * kv_model_dim + kv_offset + d];
         }
-        out[d] = acc / sum;
+        out[d] = acc;
     }
     if (tid == 0) {
         out[head_dimension] = max_value;

@@ -1078,6 +1078,40 @@ fn block_attention_keeps_large_finite_values_finite() {
     }
 }
 
+/// The same for a prefill (the tiled Kernel): each query's running
+/// output is a weighted mean of V rows, never their weighted sum.
+#[test]
+fn tiled_prefill_attention_keeps_large_finite_values_finite() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let rows = 70u64;
+    let q = HostTensor::new([rows, 8], vec![0.0; 8 * rows as usize]).unwrap();
+    let k = HostTensor::new([rows, 8], vec![0.0; 8 * rows as usize]).unwrap();
+    let v = HostTensor::new([rows, 8], vec![1e38; 8 * rows as usize]).unwrap();
+    let actual = download(
+        &kernels,
+        &kernels
+            .attention(
+                &upload(&kernels, &q),
+                &upload(&kernels, &k),
+                &upload(&kernels, &v),
+                2,
+                4,
+                None,
+                None,
+                true,
+            )
+            .unwrap(),
+    );
+    for value in &actual.data {
+        assert!(
+            value.is_finite() && (value / 1e38 - 1.0).abs() < 1e-5,
+            "{value}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Native half-precision compute (`add-native-cuda-half-precision-compute`
 // Phase 2)
