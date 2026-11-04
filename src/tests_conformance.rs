@@ -761,6 +761,22 @@ fn multi_row_split_k_rows_are_bit_identical_to_single_row_matmuls() {
     }
 }
 
+/// `download_rows` returns exactly the requested rows of a rank-2 buffer.
+#[test]
+fn download_rows_returns_only_the_requested_rows() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let tensor = HostTensor::new([4, 3], (0..12).map(|v| v as f32).collect::<Vec<_>>()).unwrap();
+    let buffer = upload(&kernels, &tensor);
+    let last = kernels.download_rows(&buffer, 3, 1).unwrap().unwrap();
+    assert_eq!(last.shape, vec![1, 3]);
+    assert_eq!(last.data, vec![9.0, 10.0, 11.0]);
+    let middle = kernels.download_rows(&buffer, 1, 2).unwrap().unwrap();
+    assert_eq!(middle.data, vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+    assert!(kernels.download_rows(&buffer, 3, 2).unwrap().is_none());
+}
+
 #[test]
 fn causal_attention_matches_reference_cpu() {
     let Some(kernels) = kernels_or_skip() else {

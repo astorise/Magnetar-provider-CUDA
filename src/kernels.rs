@@ -607,6 +607,32 @@ impl CudaKernels {
         HostTensor::new(buffer.shape.clone(), data).map_err(host_error)
     }
 
+    /// Rows `first_row..first_row + rows` of a rank-2 f32 buffer, shaped
+    /// `[rows, columns]`: only those rows cross to the host. `None` for a
+    /// compact buffer, another rank or a range past its end.
+    pub fn download_rows(
+        &self,
+        buffer: &CudaDeviceBuffer,
+        first_row: u64,
+        rows: u64,
+    ) -> Result<Option<HostTensor>, CudaError> {
+        self.forbid_in_capture("a device-to-host download")?;
+        let [total_rows, columns] = buffer.shape[..] else {
+            return Ok(None);
+        };
+        if buffer.is_compact() || first_row.saturating_add(rows) > total_rows {
+            return Ok(None);
+        }
+        let start = (first_row * columns) as usize;
+        let end = ((first_row + rows) * columns) as usize;
+        let data = self.stream.clone_dtoh(&buffer.slice.slice(start..end))?;
+        self.stream.synchronize()?;
+        self.download_count.fetch_add(1, Ordering::Relaxed);
+        HostTensor::new([rows, columns], data)
+            .map(Some)
+            .map_err(host_error)
+    }
+
     /// Uploads a host tensor into a fresh device allocation as real
     /// half-precision bytes, converting each `f32` value on the host via
     /// this crate's `half_precision::f32_to_f16`/`f32_to_bf16` before the

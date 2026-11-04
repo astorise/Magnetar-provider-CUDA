@@ -1593,6 +1593,31 @@ impl ProviderExecutionApi for CudaExecutor {
         CudaExecutor::read_tensor(self, id)
     }
 
+    /// Downloads only the requested rows (a prefill's last logits row).
+    fn read_tensor_rows(
+        &self,
+        id: &TensorResourceId,
+        first_row: u64,
+        rows: u64,
+    ) -> Option<HostTensor> {
+        let storage = self.storage.lock().unwrap();
+        let buffer = storage.get(id)?;
+        match self.kernels.download_rows(buffer, first_row, rows) {
+            Ok(Some(tensor)) => Some(tensor),
+            // A compact or other-rank buffer: the whole tensor, sliced.
+            Ok(None) => {
+                let whole = self.kernels.download(buffer).ok()?;
+                let [_, columns] = whole.shape[..] else {
+                    return None;
+                };
+                let start = (first_row * columns) as usize;
+                let end = ((first_row + rows) * columns) as usize;
+                HostTensor::new([rows, columns], whole.data.get(start..end)?.to_vec()).ok()
+            }
+            Err(_) => None,
+        }
+    }
+
     fn release_tensor(&self, id: &TensorResourceId) -> Result<bool, ProviderExecutionError> {
         Ok(CudaExecutor::release_tensor(self, id))
     }
