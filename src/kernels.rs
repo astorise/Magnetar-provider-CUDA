@@ -238,8 +238,11 @@ pub struct CudaKernels {
     /// The split-key attention's per-chunk partials: the current buffer,
     /// then every buffer it outgrew. A captured step may still read an
     /// outgrown one, so none is freed before this Provider.
-    attention_scratch: std::sync::Mutex<(Option<CudaSlice<f32>>, Vec<CudaSlice<f32>>)>,
+    attention_scratch: std::sync::Mutex<AttentionScratch>,
 }
+
+/// The current split-attention scratch buffer and the ones it outgrew.
+type AttentionScratch = (Option<CudaSlice<f32>>, Vec<CudaSlice<f32>>);
 
 /// A step capture in progress: what the captured launches need, and what
 /// a replay must check.
