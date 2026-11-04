@@ -373,6 +373,58 @@ extern "C" __global__ void matmul_split_k_kernel(
     }
 }
 
+// `silu(a x gate) * (a x up)` for the Runtime's fused `gated-matmul`: the
+// split-K matmul's sums for both weights, in its order, then
+// `silu_mul_kernel`'s arithmetic, so the result is bit-identical to two
+// `matmul_split_k_kernel` launches and a `silu_mul_kernel` one. Reading
+// both weights in one launch gives each block twice the work.
+extern "C" __global__ void gated_matmul_split_k_kernel(
+    const float* a,
+    const float* gate,
+    const unsigned short* gate16,
+    const float* up,
+    const unsigned short* up16,
+    float* out,
+    unsigned long long m,
+    unsigned long long k,
+    unsigned long long n,
+    unsigned long long a_row_stride,
+    unsigned long long a_inner_stride,
+    unsigned long long b_inner_stride
+) {
+    __shared__ float gate_partial[MATMUL_SPLIT_K][32];
+    __shared__ float up_partial[MATMUL_SPLIT_K][32];
+    unsigned long long row = blockIdx.y;
+    unsigned long long col = (unsigned long long)blockIdx.x * 32 + threadIdx.x;
+    unsigned int slice = threadIdx.y;
+    float gate_acc = 0.0f;
+    float up_acc = 0.0f;
+    if (row < m && col < n) {
+        const float* a_row = a + row * a_row_stride;
+        gate_acc = gate16
+            ? matmul_slice_sum(a_row, a_inner_stride, gate16 + col, b_inner_stride, slice, k)
+            : matmul_slice_sum(a_row, a_inner_stride, gate + col, b_inner_stride, slice, k);
+        up_acc = up16
+            ? matmul_slice_sum(a_row, a_inner_stride, up16 + col, b_inner_stride, slice, k)
+            : matmul_slice_sum(a_row, a_inner_stride, up + col, b_inner_stride, slice, k);
+    }
+    gate_partial[slice][threadIdx.x] = gate_acc;
+    up_partial[slice][threadIdx.x] = up_acc;
+    __syncthreads();
+    if (slice == 0 && row < m && col < n) {
+        float gate_sum = 0.0f;
+        float up_sum = 0.0f;
+        for (unsigned int s = 0; s < MATMUL_SPLIT_K; s++) {
+            gate_sum += gate_partial[s][threadIdx.x];
+        }
+        for (unsigned int s = 0; s < MATMUL_SPLIT_K; s++) {
+            up_sum += up_partial[s][threadIdx.x];
+        }
+        float activated = gate_sum * (1.0f / (1.0f + expf(-gate_sum)));
+        out[row * n + col] = activated * up_sum;
+    }
+}
+
 // One thread per (head, query_index). Recomputes each query/key dot product
 // up to three times (max pass, sum-of-exp pass, output pass) instead of
 // materializing a per-thread scores buffer -- correctness-first, matching

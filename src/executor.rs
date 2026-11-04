@@ -865,6 +865,7 @@ impl CudaExecutor {
     ) -> Result<(), KernelError> {
         let reads_compact = |index: usize| match invocation.kernel.name.as_str() {
             "matmul" | "matmul-bias" | "matmul-residual" => index == 1,
+            "gated-matmul" => index == 1 || index == 2,
             "embedding" => index == 0,
             _ => false,
         };
@@ -1001,6 +1002,17 @@ impl CudaExecutor {
                     Self::require_f32_accumulation(&invocation.attributes)?;
                     self.kernels
                         .matmul_residual(a, b, residual, transpose_a, transpose_b)
+                        .map_err(KernelError::from)?
+                }
+                // The Runtime's fused `silu(a x gate) * (a x up)`.
+                "gated-matmul" => {
+                    let transpose_a =
+                        Self::attribute_bool(&invocation.attributes, "transpose_a", false);
+                    let transpose_b =
+                        Self::attribute_bool(&invocation.attributes, "transpose_b", false);
+                    Self::require_f32_accumulation(&invocation.attributes)?;
+                    self.kernels
+                        .gated_matmul(get(0)?, get(1)?, get(2)?, transpose_a, transpose_b)
                         .map_err(KernelError::from)?
                 }
                 // The Runtime's fused `silu(gate) * up`.
