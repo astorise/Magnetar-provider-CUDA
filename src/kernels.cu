@@ -331,6 +331,11 @@ __device__ __forceinline__ float matmul_slice_sum(
     }
     return acc;
 }
+// With gridDim.z > 1, `k` is also split across blocks: block z sums
+// `k_chunk` terms from z * k_chunk on, writes its 32 column sums to
+// `partials`, and the last of a tile's blocks to arrive (counted in
+// `counters`, which it resets) adds the gridDim.z sums in order of z, so
+// the result does not depend on which block finished last.
 extern "C" __global__ void matmul_split_k_kernel(
     const float* a,
     const float* b,
@@ -344,26 +349,60 @@ extern "C" __global__ void matmul_split_k_kernel(
     const float* addend,
     int addend_mode,
     // `b`'s bfloat16 bits when it is compact; `b` is then unused.
-    const unsigned short* b16
+    const unsigned short* b16,
+    unsigned long long k_chunk,
+    float* partials,
+    unsigned int* counters
 ) {
     __shared__ float partial[MATMUL_SPLIT_K][32];
+    __shared__ bool last_block;
     unsigned long long row = blockIdx.y;
     unsigned long long col = (unsigned long long)blockIdx.x * 32 + threadIdx.x;
     unsigned int slice = threadIdx.y;
+    unsigned long long k_start = (unsigned long long)blockIdx.z * k_chunk;
+    unsigned long long k_len = k_start < k ? min(k_chunk, k - k_start) : 0;
     float acc = 0.0f;
     if (row < m && col < n) {
-        const float* a_row = a + row * a_row_stride;
+        const float* a_row = a + row * a_row_stride + k_start * a_inner_stride;
+        unsigned long long b_start = k_start * b_inner_stride + col;
         acc = b16
-            ? matmul_slice_sum(a_row, a_inner_stride, b16 + col, b_inner_stride, slice, k)
-            : matmul_slice_sum(a_row, a_inner_stride, b + col, b_inner_stride, slice, k);
+            ? matmul_slice_sum(a_row, a_inner_stride, b16 + b_start, b_inner_stride, slice, k_len)
+            : matmul_slice_sum(a_row, a_inner_stride, b + b_start, b_inner_stride, slice, k_len);
     }
     partial[slice][threadIdx.x] = acc;
     __syncthreads();
-    if (slice == 0 && row < m && col < n) {
-        float sum = 0.0f;
+    float sum = 0.0f;
+    if (slice == 0) {
         for (unsigned int s = 0; s < MATMUL_SPLIT_K; s++) {
             sum += partial[s][threadIdx.x];
         }
+    }
+    if (gridDim.z > 1) {
+        if (slice == 0 && row < m && col < n) {
+            partials[((unsigned long long)blockIdx.z * m + row) * n + col] = sum;
+        }
+        __threadfence();
+        __syncthreads();
+        unsigned int* counter = counters + row * gridDim.x + blockIdx.x;
+        if (slice == 0 && threadIdx.x == 0) {
+            last_block = atomicAdd(counter, 1u) == gridDim.z - 1;
+        }
+        __syncthreads();
+        if (!last_block) {
+            return;
+        }
+        __threadfence();
+        if (slice == 0 && row < m && col < n) {
+            sum = 0.0f;
+            for (unsigned int z = 0; z < gridDim.z; z++) {
+                sum += __ldcg(&partials[((unsigned long long)z * m + row) * n + col]);
+            }
+        }
+        if (slice == 0 && threadIdx.x == 0) {
+            *counter = 0;
+        }
+    }
+    if (slice == 0 && row < m && col < n) {
         if (addend_mode == 1) {
             sum += addend[col];
         } else if (addend_mode == 2) {

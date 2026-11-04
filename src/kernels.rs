@@ -49,6 +49,23 @@ const MATMUL_SPLIT_K: u32 = 16;
 /// Rows a split-K launch covers in its grid's y dimension (CUDA's limit).
 const MATMUL_SPLIT_K_MAX_ROWS: u64 = 65_535;
 
+/// Blocks per SM a split-K matmul aims for before it also splits `k`
+/// across blocks.
+const MATMUL_BLOCKS_PER_SM: u64 = 4;
+
+/// The fewest terms of `k` one block of a cross-block split sums.
+const MATMUL_MIN_K_CHUNK: u64 = 128;
+
+/// The most blocks one tile's `k` is split across.
+pub const MATMUL_MAX_K_SPLITS: u64 = 16;
+
+/// Partial sums the cross-block split can hold: a matmul whose
+/// `splits * m * n` exceeds it is not split.
+const MATMUL_PARTIALS_CAPACITY: usize = 1 << 20;
+
+/// Tile counters the cross-block split can hold (`m * n / 32`).
+const MATMUL_COUNTERS_CAPACITY: usize = 1 << 16;
+
 /// Threads per row of `rmsnorm_kernel`; must equal `RMSNORM_THREADS` in
 /// `kernels.cu`.
 const RMSNORM_THREADS: u32 = 256;
@@ -216,6 +233,18 @@ pub struct CudaKernels {
     capture: std::sync::Mutex<Option<KernelCapture>>,
     /// The embedding lookup's invalid-id flag, allocated once.
     embedding_flag: std::sync::Mutex<Option<CudaSlice<i32>>>,
+    /// The Device's SM count.
+    sm_count: u64,
+    /// Partial sums and per-tile arrival counters of a matmul split across
+    /// blocks along `k`, allocated once so a captured step's launches
+    /// always reference the same buffers. Every launch is ordered on the
+    /// one stream, so consecutive matmuls share them; the last block of a
+    /// tile resets its counter to zero.
+    matmul_partials: CudaSlice<f32>,
+    matmul_counters: CudaSlice<u32>,
+    /// The most blocks a matmul's `k` may be split across
+    /// (MATMUL_MAX_K_SPLITS); tests lower it to compare splits.
+    pub(crate) max_k_splits: AtomicU64,
 }
 
 /// A step capture in progress: what the captured launches need, and what
@@ -294,6 +323,11 @@ impl CudaKernels {
         // stream (`capture-and-replay-cuda-graphs`). Every buffer and
         // launch of this Provider still uses this one stream.
         let stream = context.new_stream()?;
+        let sm_count = context
+            .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?
+            as u64;
+        let matmul_partials = stream.alloc_zeros::<f32>(MATMUL_PARTIALS_CAPACITY)?;
+        let matmul_counters = stream.alloc_zeros::<u32>(MATMUL_COUNTERS_CAPACITY)?;
         Ok(Self {
             stream,
             module,
@@ -303,7 +337,32 @@ impl CudaKernels {
             offered_output: std::sync::Mutex::new(None),
             capture: std::sync::Mutex::new(None),
             embedding_flag: std::sync::Mutex::new(None),
+            sm_count,
+            matmul_partials,
+            matmul_counters,
+            max_k_splits: AtomicU64::new(MATMUL_MAX_K_SPLITS),
         })
+    }
+
+    /// How many blocks a split-K matmul's `k` is split across: enough for
+    /// MATMUL_BLOCKS_PER_SM blocks per SM, each summing at least
+    /// MATMUL_MIN_K_CHUNK terms, within the scratch buffers. 1 when the
+    /// column tiles alone fill the Device.
+    fn matmul_k_splits(&self, m: u64, k: u64, n: u64) -> u64 {
+        let tiles = m * n.div_ceil(32);
+        let wanted = (self.sm_count * MATMUL_BLOCKS_PER_SM).div_ceil(tiles.max(1));
+        let splits = wanted
+            .min(k / MATMUL_MIN_K_CHUNK)
+            .min(self.max_k_splits.load(Ordering::Relaxed))
+            .max(1);
+        if splits > 1
+            && (splits * m * n) as usize <= MATMUL_PARTIALS_CAPACITY
+            && tiles as usize <= MATMUL_COUNTERS_CAPACITY
+        {
+            splits
+        } else {
+            1
+        }
     }
 
     /// Starts capturing this stream's work into a CUDA graph. Every later
@@ -1403,9 +1462,19 @@ impl CudaKernels {
                 Some(MatmulAddend::Row(bias)) => (bias, 1),
                 Some(MatmulAddend::Full(residual)) => (residual, 2),
             };
-            args.arg(&addend_buffer.slice).arg(&addend_mode).arg(&b16);
+            let splits = self.matmul_k_splits(m, k, n);
+            // A multiple of the slice count, so every block's slices sum
+            // equally many terms.
+            let k_chunk =
+                k.div_ceil(splits).div_ceil(u64::from(MATMUL_SPLIT_K)) * u64::from(MATMUL_SPLIT_K);
+            args.arg(&addend_buffer.slice)
+                .arg(&addend_mode)
+                .arg(&b16)
+                .arg(&k_chunk)
+                .arg(&self.matmul_partials)
+                .arg(&self.matmul_counters);
             let config = LaunchConfig {
-                grid_dim: (n.div_ceil(32) as u32, m as u32, 1),
+                grid_dim: (n.div_ceil(32) as u32, m as u32, splits as u32),
                 block_dim: (32, MATMUL_SPLIT_K, 1),
                 shared_mem_bytes: 0,
             };
