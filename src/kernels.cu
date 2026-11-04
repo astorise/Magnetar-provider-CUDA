@@ -882,6 +882,191 @@ extern "C" __global__ void attention_block_kernel(
     }
 }
 
+// Split-key attention for one query row (a decode step). The keys a query
+// admits are cut into chunks of ATTENTION_CHUNK_KEYS from its first admitted
+// key; block (chunk, head) computes that chunk's softmax max, its sum of
+// exponentials and its normalized weighted sum of V into `partial`
+// (head_dimension + 2 floats per (head, chunk)). A chunk past the admitted
+// keys writes an empty partial. `attention_combine_kernel` then merges the
+// chunks of each head in chunk order, so the result does not depend on
+// block scheduling. Each warp scores one key at a time, its lanes reading
+// consecutive elements of the K row and adding their products with a
+// fixed butterfly.
+#define ATTENTION_CHUNK_KEYS 128
+#define ATTENTION_SPLIT_THREADS 128
+extern "C" __global__ void attention_split_kernel(
+    const float* q,
+    const float* k,
+    const float* v,
+    float* partial,
+    unsigned long long kv_seq_len,
+    unsigned long long head_count,
+    unsigned long long kv_head_count,
+    unsigned long long head_dimension,
+    unsigned long long q_model_dim,
+    unsigned long long kv_model_dim,
+    int causal,
+    long long window_size, // -1 means "no window"
+    unsigned long long query_position_offset,
+    unsigned long long chunks,
+    const unsigned long long* step_offset
+) {
+    __shared__ float scores[ATTENTION_CHUNK_KEYS];
+    __shared__ float reduce[ATTENTION_SPLIT_THREADS];
+    extern __shared__ float q_shared[];
+    if (step_offset) {
+        kv_seq_len += *step_offset;
+        query_position_offset += *step_offset;
+    }
+    unsigned long long chunk = blockIdx.x;
+    unsigned long long head = blockIdx.y;
+    unsigned int tid = threadIdx.x;
+    unsigned int lane = tid & 31;
+    unsigned int warp = tid >> 5;
+    unsigned long long group_size = head_count / kv_head_count;
+    unsigned long long kv_offset = (head / group_size) * head_dimension;
+    float scale = 1.0f / sqrtf((float)head_dimension);
+
+    unsigned long long query_position = query_position_offset;
+    unsigned long long key_upper = causal ? (query_position + 1) : kv_seq_len;
+    unsigned long long key_lower = 0;
+    if (window_size >= 0) {
+        unsigned long long window = (unsigned long long)window_size;
+        unsigned long long back = window > 0 ? window - 1 : 0;
+        key_lower = query_position > back ? query_position - back : 0;
+        if (key_lower > key_upper) {
+            key_lower = key_upper;
+        }
+    }
+    unsigned long long first = key_lower + chunk * ATTENTION_CHUNK_KEYS;
+    unsigned long long last = first + ATTENTION_CHUNK_KEYS;
+    if (last > key_upper) {
+        last = key_upper;
+    }
+    float* out = partial + (head * chunks + chunk) * (head_dimension + 2);
+    if (first >= last) {
+        for (unsigned long long d = tid; d < head_dimension; d += ATTENTION_SPLIT_THREADS) {
+            out[d] = 0.0f;
+        }
+        if (tid == 0) {
+            out[head_dimension] = neg_inf();
+            out[head_dimension + 1] = 0.0f;
+        }
+        return;
+    }
+    unsigned long long count = last - first;
+
+    const float* q_row = q + head * head_dimension;
+    for (unsigned long long d = tid; d < head_dimension; d += ATTENTION_SPLIT_THREADS) {
+        q_shared[d] = q_row[d];
+    }
+    __syncthreads();
+
+    for (unsigned long long j = warp; j < count; j += ATTENTION_SPLIT_THREADS / 32) {
+        const float* k_row = k + (first + j) * kv_model_dim + kv_offset;
+        float dot = 0.0f;
+        for (unsigned long long d = lane; d < head_dimension; d += 32) {
+            dot += q_shared[d] * k_row[d];
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            dot += __shfl_xor_sync(0xffffffffu, dot, offset);
+        }
+        if (lane == 0) {
+            scores[j] = dot * scale;
+        }
+    }
+    __syncthreads();
+
+    float local_max = neg_inf();
+    for (unsigned long long j = tid; j < count; j += ATTENTION_SPLIT_THREADS) {
+        local_max = fmaxf(local_max, scores[j]);
+    }
+    reduce[tid] = local_max;
+    __syncthreads();
+    for (unsigned int stride = ATTENTION_SPLIT_THREADS / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            reduce[tid] = fmaxf(reduce[tid], reduce[tid + stride]);
+        }
+        __syncthreads();
+    }
+    float max_value = reduce[0];
+    __syncthreads();
+
+    float local_sum = 0.0f;
+    for (unsigned long long j = tid; j < count; j += ATTENTION_SPLIT_THREADS) {
+        float weight = expf(scores[j] - max_value);
+        scores[j] = weight;
+        local_sum += weight;
+    }
+    reduce[tid] = local_sum;
+    __syncthreads();
+    for (unsigned int stride = ATTENTION_SPLIT_THREADS / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            reduce[tid] += reduce[tid + stride];
+        }
+        __syncthreads();
+    }
+    float sum = reduce[0];
+
+    // Normalized within the chunk, so a chunk's output is a weighted mean
+    // of V rows and cannot overflow where the result is representable.
+    for (unsigned long long d = tid; d < head_dimension; d += ATTENTION_SPLIT_THREADS) {
+        float acc = 0.0f;
+        for (unsigned long long j = 0; j < count; j++) {
+            acc += scores[j] * v[(first + j) * kv_model_dim + kv_offset + d];
+        }
+        out[d] = acc / sum;
+    }
+    if (tid == 0) {
+        out[head_dimension] = max_value;
+        out[head_dimension + 1] = sum;
+    }
+}
+
+// Merges each head's chunks from `attention_split_kernel`, in chunk order:
+// out = sum_c o_c * (s_c * exp(m_c - M) / sum_c' s_c' * exp(m_c' - M)), with M the
+// largest chunk max. Empty chunks are skipped; a head with no admitted key
+// gets zeros.
+extern "C" __global__ void attention_combine_kernel(
+    const float* partial,
+    float* out,
+    unsigned long long head_count,
+    unsigned long long head_dimension,
+    unsigned long long chunks
+) {
+    unsigned long long head = blockIdx.x;
+    if (head >= head_count) {
+        return;
+    }
+    const float* head_partial = partial + head * chunks * (head_dimension + 2);
+    float max_value = neg_inf();
+    for (unsigned long long c = 0; c < chunks; c++) {
+        const float* p = head_partial + c * (head_dimension + 2);
+        if (p[head_dimension + 1] > 0.0f) {
+            max_value = fmaxf(max_value, p[head_dimension]);
+        }
+    }
+    float total = 0.0f;
+    for (unsigned long long c = 0; c < chunks; c++) {
+        const float* p = head_partial + c * (head_dimension + 2);
+        if (p[head_dimension + 1] > 0.0f) {
+            total += p[head_dimension + 1] * expf(p[head_dimension] - max_value);
+        }
+    }
+    for (unsigned long long d = threadIdx.x; d < head_dimension; d += blockDim.x) {
+        float acc = 0.0f;
+        for (unsigned long long c = 0; c < chunks; c++) {
+            const float* p = head_partial + c * (head_dimension + 2);
+            if (p[head_dimension + 1] > 0.0f) {
+                // Each chunk's share of the softmax mass, at most 1: the
+                // sum stays a weighted mean of V rows.
+                acc += p[d] * (p[head_dimension + 1] * expf(p[head_dimension] - max_value) / total);
+            }
+        }
+        out[head * head_dimension + d] = acc;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Native half-precision (F16/BF16) elementwise compute
 // (`add-native-cuda-half-precision-compute` Phase 2)

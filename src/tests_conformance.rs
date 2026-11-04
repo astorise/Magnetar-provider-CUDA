@@ -994,8 +994,9 @@ fn block_attention_matches_reference_cpu_on_decode_prefill_and_long_histories() 
         return;
     };
     // (seq_len, kv_seq_len, head_count, kv_head_count, head_dimension, window)
-    let cases: [(u64, u64, u64, u64, u64, Option<u64>); 4] = [
+    let cases: [(u64, u64, u64, u64, u64, Option<u64>); 5] = [
         (1, 300, 14, 2, 64, None),
+        (1, 1000, 14, 2, 64, Some(300)),
         (37, 37, 14, 2, 64, None),
         (23, 23, 4, 2, 8, Some(5)),
         (1, 12_500, 2, 1, 4, None),
