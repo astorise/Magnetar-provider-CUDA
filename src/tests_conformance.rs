@@ -752,8 +752,24 @@ fn multi_row_split_k_rows_are_bit_identical_to_single_row_matmuls() {
                             .unwrap(),
                     ),
                 ];
+                // A long prefill against compact weights runs on the
+                // Tensor Cores where the Device has them: same values to
+                // within the f32 accumulation order, not the same bits.
+                let tensor_cores = compact && m >= 64 && kernels.has_tensor_cores();
                 for (operator, (multi, single)) in outputs.iter().zip(&singles).enumerate() {
-                    let row_bits = &bits(multi)[row * n as usize..(row + 1) * n as usize];
+                    let range = row * n as usize..(row + 1) * n as usize;
+                    if tensor_cores {
+                        for (actual, expected) in multi.data[range].iter().zip(&single.data) {
+                            assert!(
+                                (actual - expected).abs()
+                                    <= 1e-5 * k as f32 * expected.abs().max(1.0),
+                                "operator {operator}, [{m}, {k}] x [{k}, {n}] row {row}: \
+                                 tensor cores {actual} vs one row {expected}"
+                            );
+                        }
+                        continue;
+                    }
+                    let row_bits = &bits(multi)[range];
                     assert_eq!(
                         row_bits,
                         bits(single).as_slice(),
@@ -762,6 +778,92 @@ fn multi_row_split_k_rows_are_bit_identical_to_single_row_matmuls() {
                 }
             }
         }
+    }
+}
+
+/// A Device of compute capability 8.0 or later loads the Tensor Core
+/// Kernels (unless they are turned off): a compilation failure must not
+/// silently leave long prefills on the CUDA cores.
+#[test]
+fn tensor_cores_load_on_ampere_and_later() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let (major, _) = kernels.stream().context().compute_capability().unwrap();
+    let allowed = std::env::var(crate::kernels::TENSOR_CORES_ENV).as_deref() != Ok("0");
+    assert_eq!(kernels.has_tensor_cores(), major >= 8 && allowed);
+}
+
+/// The Tensor Core matmul keeps f32 activations: each `a` value enters as
+/// two bfloat16 terms. With every `a` equal to 1 + 2^-12 (bfloat16 rounds
+/// it to 1), dropping the low term would be off by 2^-12 of every sum.
+#[test]
+fn tensor_core_matmul_keeps_f32_activation_precision() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    if !kernels.has_tensor_cores() {
+        return;
+    }
+    let (m, k, n) = (70u64, 900u64, 130u64);
+    let a_value = 1.0f32 + 2f32.powi(-12);
+    let a = upload(
+        &kernels,
+        &HostTensor::new([m, k], vec![a_value; (m * k) as usize]).unwrap(),
+    );
+    let weight: Vec<f32> = bf16_exact_values((k * n) as usize, 21)
+        .into_iter()
+        .map(f32::abs)
+        .collect();
+    let b = kernels
+        .upload_weight(&HostTensor::new([k, n], weight.clone()).unwrap())
+        .unwrap();
+    assert!(b.is_compact());
+    let actual = download(&kernels, &kernels.matmul(&a, &b, false, false).unwrap());
+    for row in 0..m as usize {
+        for col in 0..n as usize {
+            let column_sum: f64 = (0..k as usize)
+                .map(|inner| f64::from(weight[inner * n as usize + col]))
+                .sum();
+            let expected = f64::from(a_value) * column_sum;
+            let value = f64::from(actual.data[row * n as usize + col]);
+            assert!(
+                (value - expected).abs() <= 5e-5 * expected,
+                "row {row} col {col}: {value} vs {expected}"
+            );
+        }
+    }
+}
+
+/// A finite activation that bfloat16 rounding would turn into infinity
+/// stays finite on the Tensor Core path: `f32::MAX` times 2^-120, summed
+/// over 256 inners, is about 65536 (Codex review on
+/// astorise/Magnetar-provider-CUDA#25).
+#[test]
+fn tensor_core_matmul_keeps_activations_near_f32_max_finite() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    if !kernels.has_tensor_cores() {
+        return;
+    }
+    let (m, k, n) = (64u64, 256u64, 256u64);
+    let a = upload(
+        &kernels,
+        &HostTensor::new([m, k], vec![f32::MAX; (m * k) as usize]).unwrap(),
+    );
+    let small = 2f32.powi(-120);
+    let b = kernels
+        .upload_weight(&HostTensor::new([k, n], vec![small; (k * n) as usize]).unwrap())
+        .unwrap();
+    assert!(b.is_compact());
+    let expected = f64::from(f32::MAX) * f64::from(small) * k as f64;
+    let actual = download(&kernels, &kernels.matmul(&a, &b, false, false).unwrap());
+    for value in &actual.data {
+        assert!(
+            value.is_finite() && ((f64::from(*value) - expected) / expected).abs() < 1e-4,
+            "{value} vs {expected}"
+        );
     }
 }
 
