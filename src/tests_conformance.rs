@@ -555,6 +555,103 @@ fn gated_matmul_is_bit_identical_to_two_matmuls_and_silu_mul() {
     );
 }
 
+/// Greedy selection on the Device picks the column host greedy selection
+/// picks: the highest finite, non-excluded score after the temperature
+/// division, ties (including -0 against +0) going to the lowest column.
+#[test]
+fn greedy_select_matches_host_greedy_selection() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let host = |scores: &[f32], excluded: &[std::ops::Range<u64>], temperature: f32| {
+        let mut best: Option<(f32, u64)> = None;
+        for (column, &score) in scores.iter().enumerate() {
+            let column = column as u64;
+            if !score.is_finite() || excluded.iter().any(|range| range.contains(&column)) {
+                continue;
+            }
+            let score = if temperature == 0.0 {
+                score
+            } else {
+                score / temperature
+            };
+            if best.is_none_or(|(value, _)| score > value) {
+                best = Some((score, column));
+            }
+        }
+        best.map(|(_, column)| column)
+    };
+    let mut state = 0x9e37_79b9_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for round in 0..40 {
+        let cols = [151_936u64, 1000, 33, 7][round % 4];
+        let rows = 1 + (round as u64 % 3);
+        // Coarse values so ties are common.
+        let mut data: Vec<f32> = (0..rows * cols)
+            .map(|_| ((next() % 64) as f32 - 32.0) * 0.25)
+            .collect();
+        for _ in 0..4 {
+            let index = (next() % (rows * cols)) as usize;
+            data[index] = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.0][(next() % 4) as usize];
+        }
+        let excluded: Vec<std::ops::Range<u64>> = (0..(next() % 4))
+            .map(|_| {
+                let start = next() % cols;
+                start..(start + 1 + next() % 5).min(cols)
+            })
+            .collect();
+        let temperature = [0.0f32, 1.0, 0.7, 1.3][round % 4];
+        let row = next() % rows;
+        let logits = upload(
+            &kernels,
+            &HostTensor::new([rows, cols], data.clone()).unwrap(),
+        );
+        let row_scores = &data[(row * cols) as usize..((row + 1) * cols) as usize];
+        assert_eq!(
+            kernels
+                .greedy_select(&logits, row, &excluded, temperature)
+                .unwrap(),
+            host(row_scores, &excluded, temperature),
+            "round {round}: [{rows}, {cols}] row {row}, temperature {temperature}"
+        );
+    }
+    // -0 and +0 compare equal: the lower column wins.
+    let logits = upload(
+        &kernels,
+        &HostTensor::new([1, 3], vec![-1.0, 0.0, -0.0]).unwrap(),
+    );
+    assert_eq!(
+        kernels.greedy_select(&logits, 0, &[], 0.0).unwrap(),
+        Some(1)
+    );
+    let logits = upload(
+        &kernels,
+        &HostTensor::new([1, 3], vec![-1.0, -0.0, 0.0]).unwrap(),
+    );
+    assert_eq!(
+        kernels.greedy_select(&logits, 0, &[], 0.0).unwrap(),
+        Some(1)
+    );
+    // Nothing eligible.
+    let logits = upload(
+        &kernels,
+        &HostTensor::new([1, 3], vec![1.0, f32::NAN, 2.0]).unwrap(),
+    );
+    assert_eq!(
+        kernels
+            .greedy_select(&logits, 0, &[0..1, 2..3], 0.0)
+            .unwrap(),
+        None
+    );
+    // A row past the logits is refused.
+    assert!(kernels.greedy_select(&logits, 1, &[], 0.0).is_err());
+}
+
 #[test]
 fn causal_attention_matches_reference_cpu() {
     let Some(kernels) = kernels_or_skip() else {

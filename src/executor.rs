@@ -1689,6 +1689,23 @@ impl ProviderExecutionApi for CudaExecutor {
     fn release_step_capture(&self, id: &StepCaptureId) {
         CudaExecutor::release_step_capture(self, id)
     }
+
+    /// Selects a plain greedy step's token on the Device: one reduction
+    /// over the logits row and an 8-byte download instead of the row.
+    fn select_greedy_column(
+        &self,
+        logits: &TensorResourceId,
+        row: u64,
+        excluded: &[std::ops::Range<u64>],
+        temperature: f32,
+    ) -> Option<u64> {
+        let storage = self.storage.lock().unwrap();
+        let buffer = storage.get(logits)?;
+        self.kernels
+            .greedy_select(buffer, row, excluded, temperature)
+            .ok()
+            .flatten()
+    }
 }
 
 #[cfg(test)]
