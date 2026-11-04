@@ -288,6 +288,49 @@ extern "C" __global__ void matmul_kernel(
 // (float addition of two operands is commutative), so a fused
 // `matmul-bias` or `matmul-residual` is bit-identical to them.
 #define MATMUL_SPLIT_K 16
+// Loads of one slice issued before their products are added.
+#define MATMUL_UNROLL 8
+__device__ __forceinline__ float matmul_weight(const float* b, unsigned long long i) {
+    return b[i];
+}
+__device__ __forceinline__ float matmul_weight(const unsigned short* b16, unsigned long long i) {
+    return bf16_bits_to_float(b16[i]);
+}
+// One split-K slice's sum: `a[inner] * b[inner]` for inner = slice,
+// slice + MATMUL_SPLIT_K, ... < k, added in that order. The loads of
+// MATMUL_UNROLL consecutive terms are all issued before the first add, so
+// each warp keeps that many weight loads in flight instead of one; the
+// adds, and so the result, are those of the one-term-at-a-time loop.
+template <typename W>
+__device__ __forceinline__ float matmul_slice_sum(
+    const float* a_row,
+    unsigned long long a_inner_stride,
+    const W* b_col,
+    unsigned long long b_inner_stride,
+    unsigned int slice,
+    unsigned long long k
+) {
+    float acc = 0.0f;
+    unsigned long long inner = slice;
+    const unsigned long long step = MATMUL_SPLIT_K;
+    for (; inner + (MATMUL_UNROLL - 1) * step < k; inner += MATMUL_UNROLL * step) {
+        float av[MATMUL_UNROLL];
+        float bv[MATMUL_UNROLL];
+#pragma unroll
+        for (int u = 0; u < MATMUL_UNROLL; u++) {
+            av[u] = a_row[(inner + u * step) * a_inner_stride];
+            bv[u] = matmul_weight(b_col, (inner + u * step) * b_inner_stride);
+        }
+#pragma unroll
+        for (int u = 0; u < MATMUL_UNROLL; u++) {
+            acc += av[u] * bv[u];
+        }
+    }
+    for (; inner < k; inner += step) {
+        acc += a_row[inner * a_inner_stride] * matmul_weight(b_col, inner * b_inner_stride);
+    }
+    return acc;
+}
 extern "C" __global__ void matmul_split_k_kernel(
     const float* a,
     const float* b,
@@ -309,16 +352,10 @@ extern "C" __global__ void matmul_split_k_kernel(
     unsigned int slice = threadIdx.y;
     float acc = 0.0f;
     if (row < m && col < n) {
-        if (b16) {
-            for (unsigned long long inner = slice; inner < k; inner += MATMUL_SPLIT_K) {
-                acc += a[row * a_row_stride + inner * a_inner_stride]
-                    * bf16_bits_to_float(b16[inner * b_inner_stride + col]);
-            }
-        } else {
-            for (unsigned long long inner = slice; inner < k; inner += MATMUL_SPLIT_K) {
-                acc += a[row * a_row_stride + inner * a_inner_stride] * b[inner * b_inner_stride + col];
-            }
-        }
+        const float* a_row = a + row * a_row_stride;
+        acc = b16
+            ? matmul_slice_sum(a_row, a_inner_stride, b16 + col, b_inner_stride, slice, k)
+            : matmul_slice_sum(a_row, a_inner_stride, b + col, b_inner_stride, slice, k);
     }
     partial[slice][threadIdx.x] = acc;
     __syncthreads();
