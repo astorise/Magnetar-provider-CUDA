@@ -1288,6 +1288,58 @@ impl CudaKernels {
         )
     }
 
+    /// The greedy next-token column of `logits`' row `row`
+    /// (`ProviderExecutionApi::select_greedy_column`): `None` when no
+    /// column is eligible. Only the 8-byte answer is downloaded.
+    pub fn greedy_select(
+        &self,
+        logits: &CudaDeviceBuffer,
+        row: u64,
+        excluded: &[std::ops::Range<u64>],
+        temperature: f32,
+    ) -> Result<Option<u64>, CudaError> {
+        Self::require_f32(&[logits], "greedy selection's logits")?;
+        let cols = *logits.shape.last().ok_or_else(|| {
+            CudaError::new(CudaErrorCode::ShapeUnsupported, "logits have no columns")
+        })?;
+        let rows = logits.slice.len() as u64 / cols.max(1);
+        if cols == 0 || row >= rows || cols > u64::from(u32::MAX) {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!("no logits row {row} of {rows} rows of {cols} columns"),
+            ));
+        }
+        let ranges: Vec<u64> = excluded
+            .iter()
+            .flat_map(|range| [range.start, range.end])
+            .collect();
+        // A device buffer cannot be empty; one unused pair stands in.
+        let ranges: &[u64] = if ranges.is_empty() { &[0, 0] } else { &ranges };
+        let ranges_dev = self.stream.clone_htod(ranges)?;
+        let range_count = excluded.len() as u32;
+        let best = self.stream.alloc_zeros::<u64>(1)?;
+        let row_start = logits
+            .slice
+            .slice((row * cols) as usize..((row + 1) * cols) as usize);
+        let func = self.function("greedy_select_kernel")?;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(&row_start)
+            .arg(&cols)
+            .arg(&ranges_dev)
+            .arg(&range_count)
+            .arg(&temperature)
+            .arg(&best);
+        let config = LaunchConfig {
+            grid_dim: (cols.div_ceil(256).min(256) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { args.launch(config) }?;
+        let key = self.stream.clone_dtoh(&best)?[0];
+        self.download_count.fetch_add(1, Ordering::Relaxed);
+        Ok((key != 0).then(|| 0xFFFF_FFFF - (key & 0xFFFF_FFFF)))
+    }
+
     /// `silu(gate) * up`, elementwise: the Runtime's fused `silu-mul`
     /// Operator, bit-identical to `silu` followed by `mul`.
     pub fn silu_mul(

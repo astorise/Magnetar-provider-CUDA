@@ -425,6 +425,66 @@ extern "C" __global__ void gated_matmul_split_k_kernel(
     }
 }
 
+// Greedy next-token selection (`keep-sampling-on-device`): the column of
+// one logits row with the highest score divided by `temperature` (as is
+// when 0), among columns outside the `range_count` [start, end) pairs in
+// `ranges` whose raw score is finite, ties going to the lowest column, as
+// the Runtime's host greedy selection picks it. Each eligible column is
+// one 64-bit key: the score's bits, mapped so unsigned order is float
+// order (with -0 as +0, which compare equal), above the column's
+// complement; the largest key is the answer whatever order threads and
+// blocks run in. `best` must start at 0, which no eligible column yields.
+extern "C" __global__ void greedy_select_kernel(
+    const float* logits,
+    unsigned long long cols,
+    const unsigned long long* ranges,
+    unsigned int range_count,
+    float temperature,
+    unsigned long long* best
+) {
+    unsigned long long key = 0;
+    for (unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+         i < cols;
+         i += (unsigned long long)gridDim.x * blockDim.x) {
+        float value = logits[i];
+        if (!isfinite(value)) {
+            continue;
+        }
+        bool excluded = false;
+        for (unsigned int r = 0; r < range_count; r++) {
+            if (i >= ranges[2 * r] && i < ranges[2 * r + 1]) {
+                excluded = true;
+                break;
+            }
+        }
+        if (excluded) {
+            continue;
+        }
+        if (temperature != 0.0f) {
+            value = value / temperature;
+        }
+        if (value == 0.0f) {
+            value = 0.0f;
+        }
+        unsigned int bits = __float_as_uint(value);
+        unsigned int ordered = (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+        unsigned long long candidate =
+            ((unsigned long long)ordered << 32) | (0xFFFFFFFFull - (i & 0xFFFFFFFFull));
+        if (candidate > key) {
+            key = candidate;
+        }
+    }
+    for (int offset = 16; offset > 0; offset /= 2) {
+        unsigned long long other = __shfl_down_sync(0xFFFFFFFFu, key, offset);
+        if (other > key) {
+            key = other;
+        }
+    }
+    if ((threadIdx.x & 31) == 0 && key != 0) {
+        atomicMax(best, key);
+    }
+}
+
 // One thread per (head, query_index). Recomputes each query/key dot product
 // up to three times (max pass, sum-of-exp pass, output pass) instead of
 // materializing a per-thread scores buffer -- correctness-first, matching
