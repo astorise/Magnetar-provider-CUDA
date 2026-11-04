@@ -882,6 +882,128 @@ extern "C" __global__ void attention_block_kernel(
     }
 }
 
+// Prefill attention, tiled: block (query tile, head) serves
+// ATTENTION_TILE_QUERIES queries of one head with 4 threads each (thread
+// `part` of a query owns head dimensions part, part + 4, ...). K and V rows
+// are staged through shared memory one tile of `key_tile` keys at a time,
+// and each query keeps a running max, sum and output (online softmax), so
+// every K/V tile is read once per query tile instead of once per query.
+// A query's 4 partial dot products are added with a fixed butterfly, and
+// its keys are visited in order, so the result is deterministic.
+// head_dimension must be a multiple of 4 and at most 4 * ATTENTION_MAX_PART_DIMS.
+#define ATTENTION_TILE_QUERIES 32
+#define ATTENTION_MAX_PART_DIMS 32
+extern "C" __global__ void attention_tiled_kernel(
+    const float* q,
+    const float* k,
+    const float* v,
+    float* out,
+    unsigned long long seq_len,
+    unsigned long long kv_seq_len,
+    unsigned long long head_count,
+    unsigned long long kv_head_count,
+    unsigned long long head_dimension,
+    unsigned long long q_model_dim,
+    unsigned long long kv_model_dim,
+    int causal,
+    long long window_size, // -1 means "no window"
+    unsigned long long query_position_offset,
+    unsigned long long key_tile
+) {
+    extern __shared__ float tiles[];
+    float* k_tile = tiles;
+    float* v_tile = tiles + key_tile * head_dimension;
+    unsigned int tid = threadIdx.x;
+    unsigned int part = tid & 3;
+    unsigned long long head = blockIdx.y;
+    unsigned long long tile_first = (unsigned long long)blockIdx.x * ATTENTION_TILE_QUERIES;
+    unsigned long long query_index = tile_first + (tid >> 2);
+    bool active = query_index < seq_len;
+    unsigned long long group_size = head_count / kv_head_count;
+    unsigned long long q_offset = head * head_dimension;
+    unsigned long long kv_offset = (head / group_size) * head_dimension;
+    unsigned long long part_dims = head_dimension / 4;
+    float scale = 1.0f / sqrtf((float)head_dimension);
+
+    // The keys any query of this tile admits, and this query's own.
+    unsigned long long last_query = tile_first + ATTENTION_TILE_QUERIES - 1;
+    if (last_query >= seq_len) {
+        last_query = seq_len - 1;
+    }
+    unsigned long long tile_upper = causal ? (query_position_offset + last_query + 1) : kv_seq_len;
+    unsigned long long tile_lower = 0;
+    unsigned long long key_upper = 0;
+    unsigned long long key_lower = 0;
+    unsigned long long query_position = query_position_offset + (active ? query_index : last_query);
+    key_upper = causal ? (query_position + 1) : kv_seq_len;
+    if (window_size >= 0) {
+        unsigned long long window = (unsigned long long)window_size;
+        unsigned long long back = window > 0 ? window - 1 : 0;
+        key_lower = query_position > back ? query_position - back : 0;
+        if (key_lower > key_upper) {
+            key_lower = key_upper;
+        }
+        unsigned long long first_position = query_position_offset + tile_first;
+        tile_lower = first_position > back ? first_position - back : 0;
+    }
+
+    float q_part[ATTENTION_MAX_PART_DIMS];
+    float acc[ATTENTION_MAX_PART_DIMS];
+    for (unsigned long long i = 0; i < part_dims; i++) {
+        q_part[i] = active ? q[query_index * q_model_dim + q_offset + part + 4 * i] : 0.0f;
+        acc[i] = 0.0f;
+    }
+    float max_value = neg_inf();
+    float sum = 0.0f;
+
+    for (unsigned long long tile = tile_lower; tile < tile_upper; tile += key_tile) {
+        unsigned long long tile_keys = tile_upper - tile < key_tile ? tile_upper - tile : key_tile;
+        __syncthreads();
+        for (unsigned long long e = tid; e < tile_keys * head_dimension; e += blockDim.x) {
+            unsigned long long row = e / head_dimension;
+            unsigned long long d = e % head_dimension;
+            k_tile[e] = k[(tile + row) * kv_model_dim + kv_offset + d];
+            v_tile[e] = v[(tile + row) * kv_model_dim + kv_offset + d];
+        }
+        __syncthreads();
+        for (unsigned long long j = 0; j < tile_keys; j++) {
+            const float* k_row = k_tile + j * head_dimension;
+            float dot = 0.0f;
+            for (unsigned long long i = 0; i < part_dims; i++) {
+                dot += q_part[i] * k_row[part + 4 * i];
+            }
+            dot += __shfl_xor_sync(0xffffffffu, dot, 1);
+            dot += __shfl_xor_sync(0xffffffffu, dot, 2);
+            unsigned long long key = tile + j;
+            if (!active || key < key_lower || key >= key_upper) {
+                continue;
+            }
+            float score = dot * scale;
+            if (score > max_value) {
+                float correction = expf(max_value - score);
+                sum *= correction;
+                for (unsigned long long i = 0; i < part_dims; i++) {
+                    acc[i] *= correction;
+                }
+                max_value = score;
+            }
+            float weight = expf(score - max_value);
+            sum += weight;
+            const float* v_row = v_tile + j * head_dimension;
+            for (unsigned long long i = 0; i < part_dims; i++) {
+                acc[i] += weight * v_row[part + 4 * i];
+            }
+        }
+    }
+    if (active) {
+        // No key admitted (an empty window) leaves the output zero.
+        for (unsigned long long i = 0; i < part_dims; i++) {
+            out[query_index * q_model_dim + q_offset + part + 4 * i] =
+                sum > 0.0f ? acc[i] / sum : 0.0f;
+        }
+    }
+}
+
 // Split-key attention for one query row (a decode step). The keys a query
 // admits are cut into chunks of ATTENTION_CHUNK_KEYS from its first admitted
 // key; block (chunk, head) computes that chunk's softmax max, its sum of

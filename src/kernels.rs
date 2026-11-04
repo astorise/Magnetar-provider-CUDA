@@ -75,6 +75,11 @@ const ATTENTION_THREADS: u32 = 128;
 const ATTENTION_CHUNK_KEYS: u64 = 128;
 /// `ATTENTION_SPLIT_THREADS` in `kernels.cu`.
 const ATTENTION_SPLIT_THREADS: u32 = 128;
+/// `ATTENTION_TILE_QUERIES` in `kernels.cu`: queries per tiled-attention
+/// block, 4 threads each.
+const ATTENTION_TILE_QUERIES: u64 = 32;
+/// `ATTENTION_MAX_PART_DIMS` in `kernels.cu`: head dimensions per thread.
+const ATTENTION_MAX_PART_DIMS: u64 = 32;
 
 /// Dynamic shared memory `attention_block_kernel` may use without opting a
 /// function into more (the CUDA default limit per block).
@@ -1779,6 +1784,57 @@ impl CudaKernels {
                 window_arg,
                 step_offset,
             );
+        }
+
+        // Several query rows (a prefill), outside a capture: the tiled
+        // Kernel, when the head dimension fits its per-thread registers.
+        if seq_len > 1
+            && !self.is_capturing()
+            && head_dimension.is_multiple_of(4)
+            && head_dimension <= 4 * ATTENTION_MAX_PART_DIMS
+        {
+            let overflow = || {
+                CudaError::new(
+                    CudaErrorCode::ShapeUnsupported,
+                    "attention launch size overflows a grid dimension",
+                )
+            };
+            let key_tile: u64 = if head_dimension <= 64 { 64 } else { 32 };
+            let mut out_dev = self.alloc_output(q.slice.len())?;
+            let func = self.function("attention_tiled_kernel")?;
+            let mut args = self.stream.launch_builder(&func);
+            args.arg(&q.slice)
+                .arg(&k.slice)
+                .arg(&v.slice)
+                .arg(&mut out_dev)
+                .arg(&seq_len)
+                .arg(&kv_seq_len)
+                .arg(&head_count)
+                .arg(&kv_head_count)
+                .arg(&head_dimension)
+                .arg(&q_model_dim)
+                .arg(&kv_model_dim)
+                .arg(&causal_flag)
+                .arg(&window_arg)
+                .arg(&query_position_offset)
+                .arg(&key_tile);
+            let config = LaunchConfig {
+                grid_dim: (
+                    u32::try_from(seq_len.div_ceil(ATTENTION_TILE_QUERIES))
+                        .map_err(|_| overflow())?,
+                    u32::try_from(head_count).map_err(|_| overflow())?,
+                    1,
+                ),
+                block_dim: (4 * ATTENTION_TILE_QUERIES as u32, 1, 1),
+                shared_mem_bytes: u32::try_from(2 * key_tile * head_dimension * 4)
+                    .map_err(|_| overflow())?,
+            };
+            unsafe { args.launch(config) }?;
+            return Ok(CudaDeviceBuffer {
+                slice: out_dev,
+                shape: q.shape.clone(),
+                bf16: None,
+            });
         }
 
         // `attention_block_kernel` keeps q, its reduction slots and every
