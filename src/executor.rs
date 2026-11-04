@@ -487,6 +487,26 @@ impl CudaExecutor {
         }
     }
 
+    /// See [`ProviderExecutionApi::write_zeroed_tensor`]: the zeros are set
+    /// on the Device, replacing whatever this Provider held for `id`.
+    pub fn write_zeroed_tensor(
+        &self,
+        id: &TensorResourceId,
+        shape: &[u64],
+    ) -> Result<(), ProviderExecutionError> {
+        let buffer = self.kernels.zeros(shape).map_err(|error| {
+            ProviderExecutionError::new(
+                ProviderExecutionErrorCode::MaterializationFailed,
+                ProviderExecutionPhase::Submit,
+                self.provider_binding(),
+                Some(self.device_binding()),
+                format!("CUDA zeroed allocation failed: {error}"),
+            )
+        })?;
+        self.storage.lock().unwrap().insert(id.clone(), buffer);
+        Ok(())
+    }
+
     pub fn write_tensor_value_admitted(
         &self,
         memory: &mut MemoryManager,
@@ -1655,6 +1675,14 @@ impl ProviderExecutionApi for CudaExecutor {
         value: TensorValue,
     ) -> Result<(), ProviderExecutionError> {
         CudaExecutor::write_tensor_value(self, id, value)
+    }
+
+    fn write_zeroed_tensor(
+        &self,
+        id: &TensorResourceId,
+        shape: &[u64],
+    ) -> Result<bool, ProviderExecutionError> {
+        CudaExecutor::write_zeroed_tensor(self, id, shape).map(|()| true)
     }
 
     fn write_tensor_value_admitted(

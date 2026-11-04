@@ -778,6 +778,20 @@ fn download_rows_returns_only_the_requested_rows() {
 }
 
 #[test]
+fn zeros_are_set_on_the_device_without_an_upload() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let uploads = kernels.upload_count();
+    let buffer = kernels.zeros(&[5, 3]).unwrap();
+    assert_eq!(kernels.upload_count(), uploads);
+    let tensor = kernels.download(&buffer).unwrap();
+    assert_eq!(tensor.shape, vec![5, 3]);
+    assert_eq!(tensor.data, vec![0.0; 15]);
+    assert!(kernels.zeros(&[u64::MAX, 2]).is_err());
+}
+
+#[test]
 fn causal_attention_matches_reference_cpu() {
     let Some(kernels) = kernels_or_skip() else {
         return;
