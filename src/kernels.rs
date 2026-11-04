@@ -32,6 +32,16 @@ use crate::error::{CudaError, CudaErrorCode};
 use crate::half_precision;
 
 const KERNEL_SOURCE: &str = include_str!("kernels.cu");
+/// Tensor Core matmuls (`mma.sync` bfloat16), built for compute capability
+/// 8.0 and later only.
+const TENSOR_KERNEL_SOURCE: &str = include_str!("tensor_kernels.cu");
+/// `TC_BLOCK_M` / `TC_BLOCK_N` / `TC_THREADS` in `tensor_kernels.cu`.
+const TC_BLOCK_M: u64 = 64;
+const TC_BLOCK_N: u64 = 64;
+const TC_THREADS: u32 = 128;
+/// Set to `0` to keep long prefill matmuls off the Tensor Cores (the
+/// bit-identical CUDA-core tile Kernels then serve them).
+pub const TENSOR_CORES_ENV: &str = "MAGNETAR_CUDA_TENSOR_CORES";
 
 /// What a fused matmul adds to its product.
 #[derive(Clone, Copy)]
@@ -243,6 +253,10 @@ pub struct CudaKernels {
     stream: Arc<CudaStream>,
     #[allow(dead_code)]
     module: Arc<CudaModule>,
+    /// The Tensor Core Kernels, when the Device has them (compute
+    /// capability 8.0 or later), they compiled, and
+    /// [`TENSOR_CORES_ENV`] does not turn them off.
+    tensor_module: Option<Arc<CudaModule>>,
     /// Counts real host<->device crossings (`upload`/`download` calls
     /// only, never a Kernel launch itself) -- used by tests to prove two
     /// chained Kernel invocations do not round-trip through the host
@@ -345,6 +359,21 @@ impl CudaKernels {
         unsafe { context.disable_event_tracking() };
         let ptx = compile_ptx(KERNEL_SOURCE)?;
         let module = context.load_module(ptx)?;
+        let tensor_cores_allowed = std::env::var(TENSOR_CORES_ENV).as_deref() != Ok("0");
+        let tensor_module = match context.compute_capability() {
+            Ok((major, _)) if major >= 8 && tensor_cores_allowed => {
+                cudarc::nvrtc::compile_ptx_with_opts(
+                    TENSOR_KERNEL_SOURCE,
+                    cudarc::nvrtc::CompileOptions {
+                        arch: Some("compute_80"),
+                        ..Default::default()
+                    },
+                )
+                .ok()
+                .and_then(|ptx| context.load_module(ptx).ok())
+            }
+            _ => None,
+        };
         // A stream of its own: CUDA cannot capture the legacy default
         // stream (`capture-and-replay-cuda-graphs`). Every buffer and
         // launch of this Provider still uses this one stream.
@@ -352,6 +381,7 @@ impl CudaKernels {
         Ok(Self {
             stream,
             module,
+            tensor_module,
             upload_count: AtomicU64::new(0),
             download_count: AtomicU64::new(0),
             functions: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -550,6 +580,23 @@ impl CudaKernels {
     /// not the host round-trip this counter exists to catch.
     pub fn download_count(&self) -> u64 {
         self.download_count.load(Ordering::Relaxed)
+    }
+
+    /// Whether long prefill matmuls run on the Tensor Cores.
+    pub fn has_tensor_cores(&self) -> bool {
+        self.tensor_module.is_some()
+    }
+
+    /// A Tensor Core Kernel function, when the Tensor Core module loaded.
+    fn tensor_function(&self, name: &'static str) -> Option<CudaFunction> {
+        let module = self.tensor_module.as_ref()?;
+        let mut functions = self.functions.lock().unwrap();
+        if let Some(function) = functions.get(name) {
+            return Some(function.clone());
+        }
+        let function = module.load_function(name).ok()?;
+        functions.insert(name, function.clone());
+        Some(function)
     }
 
     fn function(&self, name: &'static str) -> Result<CudaFunction, CudaError> {
@@ -1520,6 +1567,38 @@ impl CudaKernels {
         let b_inner_stride = n;
         let (gate16, up16) = (self.bf16_address(gate), self.bf16_address(up));
         let mut out_dev = self.alloc_output((m * n) as usize)?;
+        // A long prefill against compact weights: the Tensor Cores.
+        if m >= MATMUL_TILE_MIN_ROWS
+            && gate16 != 0
+            && up16 != 0
+            && a_inner_stride == 1
+            && let Some(func) = self.tensor_function("gated_matmul_tc_kernel")
+        {
+            let mut args = self.stream.launch_builder(&func);
+            args.arg(&a.slice)
+                .arg(&gate16)
+                .arg(&up16)
+                .arg(&mut out_dev)
+                .arg(&m)
+                .arg(&k)
+                .arg(&n)
+                .arg(&a_row_stride);
+            let config = LaunchConfig {
+                grid_dim: (
+                    n.div_ceil(TC_BLOCK_N) as u32,
+                    m.div_ceil(TC_BLOCK_M) as u32,
+                    1,
+                ),
+                block_dim: (TC_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe { args.launch(config) }?;
+            return Ok(CudaDeviceBuffer {
+                slice: out_dev,
+                shape: vec![m, n],
+                bf16: None,
+            });
+        }
         let (name, grid_dim) = split_k_rows(
             m,
             n,
@@ -1619,6 +1698,45 @@ impl CudaKernels {
         }
         let b16 = self.bf16_address(b);
         let mut out_dev = self.alloc_output((m * n) as usize)?;
+        // A long prefill against a compact weight: the Tensor Cores.
+        if m >= MATMUL_TILE_MIN_ROWS
+            && b16 != 0
+            && a_inner_stride == 1
+            && b_col_stride == 1
+            && b_inner_stride == n
+            && let Some(func) = self.tensor_function("matmul_tc_kernel")
+        {
+            let (addend_buffer, addend_mode) = match addend {
+                None => (a, 0i32),
+                Some(MatmulAddend::Row(bias)) => (bias, 1),
+                Some(MatmulAddend::Full(residual)) => (residual, 2),
+            };
+            let mut args = self.stream.launch_builder(&func);
+            args.arg(&a.slice)
+                .arg(&b16)
+                .arg(&mut out_dev)
+                .arg(&m)
+                .arg(&k)
+                .arg(&n)
+                .arg(&a_row_stride)
+                .arg(&addend_buffer.slice)
+                .arg(&addend_mode);
+            let config = LaunchConfig {
+                grid_dim: (
+                    n.div_ceil(TC_BLOCK_N) as u32,
+                    m.div_ceil(TC_BLOCK_M) as u32,
+                    1,
+                ),
+                block_dim: (TC_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe { args.launch(config) }?;
+            return Ok(CudaDeviceBuffer {
+                slice: out_dev,
+                shape: vec![m, n],
+                bf16: None,
+            });
+        }
         if b_col_stride == 1 && m <= MATMUL_SPLIT_K_MAX_ROWS {
             let (name, grid_dim) = split_k_rows(
                 m,
