@@ -331,6 +331,46 @@ __device__ __forceinline__ float matmul_slice_sum(
     }
     return acc;
 }
+// `rmsnorm_kernel`'s normalization of one row, computed by a whole block
+// (at least RMSNORM_THREADS threads) into `out` (shared memory): the same
+// RMSNORM_THREADS-strided sums, the same tree, the same scale and the same
+// `x * scale * w` products, so a matmul reading `out` reads exactly the
+// values `rmsnorm_kernel` would have written. Every thread of the block
+// must call it.
+__device__ void rmsnorm_row_into(
+    const float* in_row,
+    const float* w,
+    unsigned long long cols,
+    float epsilon,
+    float* out,
+    float* partial
+) {
+    unsigned int t = threadIdx.y * blockDim.x + threadIdx.x;
+    unsigned int threads = blockDim.x * blockDim.y;
+    if (t < RMSNORM_THREADS) {
+        float sum = 0.0f;
+        for (unsigned long long i = t; i < cols; i += RMSNORM_THREADS) {
+            sum += in_row[i] * in_row[i];
+        }
+        partial[t] = sum;
+    }
+    __syncthreads();
+    for (unsigned int stride = RMSNORM_THREADS / 2; stride > 0; stride /= 2) {
+        if (t < stride) {
+            partial[t] += partial[t + stride];
+        }
+        __syncthreads();
+    }
+    float scale = 1.0f / sqrtf(partial[0] / (float)cols + epsilon);
+    for (unsigned long long i = t; i < cols; i += threads) {
+        out[i] = in_row[i] * scale * w[i];
+    }
+    __syncthreads();
+}
+
+// With `norm_weight` set, `a` is first normalized row by row as the
+// Runtime's `rmsnorm-` fused Operators define (`rmsnorm_row_into`, into
+// `k` floats of dynamic shared memory); `a` must then be row-contiguous.
 extern "C" __global__ void matmul_split_k_kernel(
     const float* a,
     const float* b,
@@ -344,15 +384,23 @@ extern "C" __global__ void matmul_split_k_kernel(
     const float* addend,
     int addend_mode,
     // `b`'s bfloat16 bits when it is compact; `b` is then unused.
-    const unsigned short* b16
+    const unsigned short* b16,
+    const float* norm_weight,
+    float norm_epsilon
 ) {
+    extern __shared__ float normalized_row[];
     __shared__ float partial[MATMUL_SPLIT_K][32];
+    __shared__ float norm_partial[RMSNORM_THREADS];
     unsigned long long row = blockIdx.y;
     unsigned long long col = (unsigned long long)blockIdx.x * 32 + threadIdx.x;
     unsigned int slice = threadIdx.y;
+    const float* a_row = a + row * a_row_stride;
+    if (norm_weight) {
+        rmsnorm_row_into(a_row, norm_weight, k, norm_epsilon, normalized_row, norm_partial);
+        a_row = normalized_row;
+    }
     float acc = 0.0f;
     if (row < m && col < n) {
-        const float* a_row = a + row * a_row_stride;
         acc = b16
             ? matmul_slice_sum(a_row, a_inner_stride, b16 + col, b_inner_stride, slice, k)
             : matmul_slice_sum(a_row, a_inner_stride, b + col, b_inner_stride, slice, k);
@@ -390,17 +438,25 @@ extern "C" __global__ void gated_matmul_split_k_kernel(
     unsigned long long n,
     unsigned long long a_row_stride,
     unsigned long long a_inner_stride,
-    unsigned long long b_inner_stride
+    unsigned long long b_inner_stride,
+    const float* norm_weight,
+    float norm_epsilon
 ) {
+    extern __shared__ float normalized_row[];
     __shared__ float gate_partial[MATMUL_SPLIT_K][32];
     __shared__ float up_partial[MATMUL_SPLIT_K][32];
+    __shared__ float norm_partial[RMSNORM_THREADS];
     unsigned long long row = blockIdx.y;
     unsigned long long col = (unsigned long long)blockIdx.x * 32 + threadIdx.x;
     unsigned int slice = threadIdx.y;
+    const float* a_row = a + row * a_row_stride;
+    if (norm_weight) {
+        rmsnorm_row_into(a_row, norm_weight, k, norm_epsilon, normalized_row, norm_partial);
+        a_row = normalized_row;
+    }
     float gate_acc = 0.0f;
     float up_acc = 0.0f;
     if (row < m && col < n) {
-        const float* a_row = a + row * a_row_stride;
         gate_acc = gate16
             ? matmul_slice_sum(a_row, a_inner_stride, gate16 + col, b_inner_stride, slice, k)
             : matmul_slice_sum(a_row, a_inner_stride, gate + col, b_inner_stride, slice, k);

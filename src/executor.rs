@@ -866,6 +866,8 @@ impl CudaExecutor {
         let reads_compact = |index: usize| match invocation.kernel.name.as_str() {
             "matmul" | "matmul-bias" | "matmul-residual" => index == 1,
             "gated-matmul" => index == 1 || index == 2,
+            "rmsnorm-matmul" | "rmsnorm-matmul-bias" => index == 2,
+            "rmsnorm-gated-matmul" => index == 2 || index == 3,
             "embedding" => index == 0,
             _ => false,
         };
@@ -1014,6 +1016,46 @@ impl CudaExecutor {
                     self.kernels
                         .gated_matmul(get(0)?, get(1)?, get(2)?, transpose_a, transpose_b)
                         .map_err(KernelError::from)?
+                }
+                // The Runtime's `rmsnorm-` fused Operators: inputs
+                // `[x, norm, b, ...]`, the norm applied to `x` first.
+                "rmsnorm-matmul" | "rmsnorm-matmul-bias" | "rmsnorm-gated-matmul" => {
+                    let transpose_a =
+                        Self::attribute_bool(&invocation.attributes, "transpose_a", false);
+                    let transpose_b =
+                        Self::attribute_bool(&invocation.attributes, "transpose_b", false);
+                    Self::require_f32_accumulation(&invocation.attributes)?;
+                    let epsilon = Self::attribute_float(&invocation.attributes, "epsilon", 1e-6);
+                    let (x, norm, b) = (get(0)?, get(1)?, get(2)?);
+                    match name {
+                        "rmsnorm-matmul" => self.kernels.rmsnorm_matmul(
+                            x,
+                            norm,
+                            epsilon,
+                            b,
+                            transpose_a,
+                            transpose_b,
+                        ),
+                        "rmsnorm-matmul-bias" => self.kernels.rmsnorm_matmul_bias(
+                            x,
+                            norm,
+                            epsilon,
+                            b,
+                            get(3)?,
+                            transpose_a,
+                            transpose_b,
+                        ),
+                        _ => self.kernels.rmsnorm_gated_matmul(
+                            x,
+                            norm,
+                            epsilon,
+                            b,
+                            get(3)?,
+                            transpose_a,
+                            transpose_b,
+                        ),
+                    }
+                    .map_err(KernelError::from)?
                 }
                 // The Runtime's fused `silu(gate) * up`.
                 "silu-mul" => self

@@ -555,6 +555,122 @@ fn gated_matmul_is_bit_identical_to_two_matmuls_and_silu_mul() {
     );
 }
 
+/// The `rmsnorm-` fused matmuls normalize `a` inside the matmul launch
+/// and are bit-identical to `rmsnorm` followed by the matmul-family
+/// Kernel, with f32 and compact weights and one- and multi-row inputs;
+/// a transposed `b`, or a row longer than shared memory holds, takes the
+/// two-launch path.
+#[test]
+fn rmsnorm_fused_matmuls_are_bit_identical_to_rmsnorm_then_matmul() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let bits = |tensor: &HostTensor| tensor.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    let epsilon = 1e-6;
+    for (m, k, n) in [
+        (1u64, 896u64, 1152u64),
+        (3, 96, 1000),
+        (2, 37, 33),
+        (1, 9000, 40),
+    ] {
+        let x = upload(
+            &kernels,
+            &HostTensor::new([m, k], bf16_exact_values((m * k) as usize, 1)).unwrap(),
+        );
+        let norm = upload(
+            &kernels,
+            &HostTensor::new([k], bf16_exact_values(k as usize, 2)).unwrap(),
+        );
+        let normalized = kernels.rmsnorm(&x, &norm, epsilon).unwrap();
+        let weights =
+            |seed| HostTensor::new([k, n], bf16_exact_values((k * n) as usize, seed)).unwrap();
+        let bias = upload(
+            &kernels,
+            &HostTensor::new([n], bf16_exact_values(n as usize, 3)).unwrap(),
+        );
+        for compact in [false, true] {
+            let place = |tensor: &HostTensor| {
+                if compact {
+                    kernels.upload_weight(tensor).unwrap()
+                } else {
+                    upload(&kernels, tensor)
+                }
+            };
+            let (b, up) = (place(&weights(4)), place(&weights(5)));
+            let label = format!("[{m}, {k}] x [{k}, {n}], compact {compact}");
+            assert_eq!(
+                bits(&download(
+                    &kernels,
+                    &kernels
+                        .rmsnorm_matmul(&x, &norm, epsilon, &b, false, false)
+                        .unwrap()
+                )),
+                bits(&download(
+                    &kernels,
+                    &kernels.matmul(&normalized, &b, false, false).unwrap()
+                )),
+                "rmsnorm-matmul {label}"
+            );
+            assert_eq!(
+                bits(&download(
+                    &kernels,
+                    &kernels
+                        .rmsnorm_matmul_bias(&x, &norm, epsilon, &b, &bias, false, false)
+                        .unwrap()
+                )),
+                bits(&download(
+                    &kernels,
+                    &kernels
+                        .matmul_bias(&normalized, &b, &bias, false, false)
+                        .unwrap()
+                )),
+                "rmsnorm-matmul-bias {label}"
+            );
+            assert_eq!(
+                bits(&download(
+                    &kernels,
+                    &kernels
+                        .rmsnorm_gated_matmul(&x, &norm, epsilon, &b, &up, false, false)
+                        .unwrap()
+                )),
+                bits(&download(
+                    &kernels,
+                    &kernels
+                        .gated_matmul(&normalized, &b, &up, false, false)
+                        .unwrap()
+                )),
+                "rmsnorm-gated-matmul {label}"
+            );
+        }
+    }
+    // A transposed `b` takes the two-launch path.
+    let x = upload(
+        &kernels,
+        &HostTensor::new([2, 8], bf16_exact_values(16, 6)).unwrap(),
+    );
+    let norm = upload(
+        &kernels,
+        &HostTensor::new([8], bf16_exact_values(8, 7)).unwrap(),
+    );
+    let b = upload(
+        &kernels,
+        &HostTensor::new([5, 8], bf16_exact_values(40, 8)).unwrap(),
+    );
+    let normalized = kernels.rmsnorm(&x, &norm, epsilon).unwrap();
+    assert_eq!(
+        bits(&download(
+            &kernels,
+            &kernels
+                .rmsnorm_matmul(&x, &norm, epsilon, &b, false, true)
+                .unwrap()
+        )),
+        bits(&download(
+            &kernels,
+            &kernels.matmul(&normalized, &b, false, true).unwrap()
+        ))
+    );
+}
+
 #[test]
 fn causal_attention_matches_reference_cpu() {
     let Some(kernels) = kernels_or_skip() else {

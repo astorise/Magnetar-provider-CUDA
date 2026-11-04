@@ -49,6 +49,18 @@ const MATMUL_SPLIT_K: u32 = 16;
 /// Rows a split-K launch covers in its grid's y dimension (CUDA's limit).
 const MATMUL_SPLIT_K_MAX_ROWS: u64 = 65_535;
 
+/// The longest row a split-K launch normalizes into shared memory (the
+/// `rmsnorm-` fused Operators); longer ones run `rmsnorm` first.
+const NORMALIZED_ROW_MAX_COLUMNS: u64 = 8192;
+
+/// An `rmsnorm` applied to a matmul's `a` before the product: the
+/// Runtime's `rmsnorm-` fused Operators.
+#[derive(Clone, Copy)]
+pub struct RowNorm<'a> {
+    pub weight: &'a CudaDeviceBuffer,
+    pub epsilon: f32,
+}
+
 /// Threads per row of `rmsnorm_kernel`; must equal `RMSNORM_THREADS` in
 /// `kernels.cu`.
 const RMSNORM_THREADS: u32 = 256;
@@ -1245,7 +1257,53 @@ impl CudaKernels {
         transpose_a: bool,
         transpose_b: bool,
     ) -> Result<CudaDeviceBuffer, CudaError> {
-        self.matmul_with_addend(a, b, None, transpose_a, transpose_b)
+        self.matmul_with_addend(a, None, b, None, transpose_a, transpose_b)
+    }
+
+    /// `matmul(rmsnorm(x, norm), b)`: the Runtime's fused `rmsnorm-matmul`,
+    /// bit-identical to [`Self::rmsnorm`] followed by [`Self::matmul`].
+    pub fn rmsnorm_matmul(
+        &self,
+        x: &CudaDeviceBuffer,
+        norm: &CudaDeviceBuffer,
+        epsilon: f32,
+        b: &CudaDeviceBuffer,
+        transpose_a: bool,
+        transpose_b: bool,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        let norm = RowNorm {
+            weight: norm,
+            epsilon,
+        };
+        self.matmul_with_addend(x, Some(norm), b, None, transpose_a, transpose_b)
+    }
+
+    /// `matmul-bias(rmsnorm(x, norm), b, bias)`: the Runtime's fused
+    /// `rmsnorm-matmul-bias`, bit-identical to [`Self::rmsnorm`] followed
+    /// by [`Self::matmul_bias`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn rmsnorm_matmul_bias(
+        &self,
+        x: &CudaDeviceBuffer,
+        norm: &CudaDeviceBuffer,
+        epsilon: f32,
+        b: &CudaDeviceBuffer,
+        bias: &CudaDeviceBuffer,
+        transpose_a: bool,
+        transpose_b: bool,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        let norm = RowNorm {
+            weight: norm,
+            epsilon,
+        };
+        self.matmul_with_addend(
+            x,
+            Some(norm),
+            b,
+            Some(MatmulAddend::Row(bias)),
+            transpose_a,
+            transpose_b,
+        )
     }
 
     /// `matmul(a, b) + bias`, `bias` a `[n]` (or `[1, n]`) row added to
@@ -1261,6 +1319,7 @@ impl CudaKernels {
     ) -> Result<CudaDeviceBuffer, CudaError> {
         self.matmul_with_addend(
             a,
+            None,
             b,
             Some(MatmulAddend::Row(bias)),
             transpose_a,
@@ -1281,6 +1340,7 @@ impl CudaKernels {
     ) -> Result<CudaDeviceBuffer, CudaError> {
         self.matmul_with_addend(
             a,
+            None,
             b,
             Some(MatmulAddend::Full(residual)),
             transpose_a,
@@ -1333,6 +1393,68 @@ impl CudaKernels {
         transpose_a: bool,
         transpose_b: bool,
     ) -> Result<CudaDeviceBuffer, CudaError> {
+        self.gated_matmul_normed(a, None, gate, up, transpose_a, transpose_b)
+    }
+
+    /// `gated-matmul(rmsnorm(x, norm), gate, up)`: the Runtime's fused
+    /// `rmsnorm-gated-matmul`, bit-identical to [`Self::rmsnorm`] followed
+    /// by [`Self::gated_matmul`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn rmsnorm_gated_matmul(
+        &self,
+        x: &CudaDeviceBuffer,
+        norm: &CudaDeviceBuffer,
+        epsilon: f32,
+        gate: &CudaDeviceBuffer,
+        up: &CudaDeviceBuffer,
+        transpose_a: bool,
+        transpose_b: bool,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        let norm = RowNorm {
+            weight: norm,
+            epsilon,
+        };
+        self.gated_matmul_normed(x, Some(norm), gate, up, transpose_a, transpose_b)
+    }
+
+    /// Whether a split-K launch can normalize `a`'s rows itself.
+    fn normalizes_in_kernel(
+        norm: Option<RowNorm<'_>>,
+        a: &CudaDeviceBuffer,
+        k: u64,
+        transpose_a: bool,
+    ) -> bool {
+        norm.is_some_and(|norm| {
+            !transpose_a
+                && k <= NORMALIZED_ROW_MAX_COLUMNS
+                && norm.weight.shape == [k]
+                && a.shape.len() == 2
+                && !norm.weight.is_compact()
+        })
+    }
+
+    /// The device address and epsilon a split-K launch normalizes with (0
+    /// for none), and the dynamic shared memory it needs.
+    fn norm_arguments(&self, norm: Option<RowNorm<'_>>, k: u64) -> (u64, f32, u32) {
+        match norm {
+            Some(norm) => (
+                norm.weight.slice.device_ptr(&self.stream).0,
+                norm.epsilon,
+                (k * 4) as u32,
+            ),
+            None => (0, 0.0, 0),
+        }
+    }
+
+    fn gated_matmul_normed(
+        &self,
+        a: &CudaDeviceBuffer,
+        norm: Option<RowNorm<'_>>,
+        gate: &CudaDeviceBuffer,
+        up: &CudaDeviceBuffer,
+        transpose_a: bool,
+        transpose_b: bool,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
         if gate.shape != up.shape {
             return Err(CudaError::new(
                 CudaErrorCode::ShapeUnsupported,
@@ -1349,11 +1471,28 @@ impl CudaKernels {
         } else {
             (a_rows, a_cols)
         };
-        if transpose_b || m > MATMUL_SPLIT_K_MAX_ROWS || k != b_rows {
+        let in_kernel = Self::normalizes_in_kernel(norm, a, k, transpose_a);
+        if transpose_b
+            || m > MATMUL_SPLIT_K_MAX_ROWS
+            || k != b_rows
+            || (norm.is_some() && !in_kernel)
+        {
+            let normalized;
+            let a = match norm {
+                Some(norm) => {
+                    normalized = self.rmsnorm(a, norm.weight, norm.epsilon)?;
+                    &normalized
+                }
+                None => a,
+            };
             let gate_out = self.matmul(a, gate, transpose_a, transpose_b)?;
             let up_out = self.matmul(a, up, transpose_a, transpose_b)?;
             return self.silu_mul(&gate_out, &up_out);
         }
+        if let Some(norm) = norm {
+            Self::require_f32(&[norm.weight], "an rmsnorm weight")?;
+        }
+        let (norm_address, norm_epsilon, shared_mem_bytes) = self.norm_arguments(norm, k);
         Self::require_f32(&[a], "gated-matmul's input")?;
         let n = b_cols;
         let (a_row_stride, a_inner_stride) = if transpose_a {
@@ -1377,11 +1516,13 @@ impl CudaKernels {
             .arg(&n)
             .arg(&a_row_stride)
             .arg(&a_inner_stride)
-            .arg(&b_inner_stride);
+            .arg(&b_inner_stride)
+            .arg(&norm_address)
+            .arg(&norm_epsilon);
         let config = LaunchConfig {
             grid_dim: (n.div_ceil(32) as u32, m as u32, 1),
             block_dim: (32, MATMUL_SPLIT_K, 1),
-            shared_mem_bytes: 0,
+            shared_mem_bytes,
         };
         unsafe { args.launch(config) }?;
         Ok(CudaDeviceBuffer {
@@ -1394,6 +1535,7 @@ impl CudaKernels {
     fn matmul_with_addend(
         &self,
         a: &CudaDeviceBuffer,
+        norm: Option<RowNorm<'_>>,
         b: &CudaDeviceBuffer,
         addend: Option<MatmulAddend<'_>>,
         transpose_a: bool,
@@ -1448,13 +1590,24 @@ impl CudaKernels {
             }
             _ => {}
         }
+        let split_k = b_col_stride == 1 && m <= MATMUL_SPLIT_K_MAX_ROWS;
+        if let Some(norm) = norm
+            && !(split_k && Self::normalizes_in_kernel(Some(norm), a, k, transpose_a))
+        {
+            let normalized = self.rmsnorm(a, norm.weight, norm.epsilon)?;
+            return self.matmul_with_addend(&normalized, None, b, addend, transpose_a, transpose_b);
+        }
         Self::require_f32(&[a], "matmul's a")?;
+        if let Some(norm) = norm {
+            Self::require_f32(&[norm.weight], "an rmsnorm weight")?;
+        }
         if let Some(MatmulAddend::Row(addend) | MatmulAddend::Full(addend)) = addend {
             Self::require_f32(&[addend], "a fused matmul's addend")?;
         }
         let b16 = self.bf16_address(b);
         let mut out_dev = self.alloc_output((m * n) as usize)?;
-        if b_col_stride == 1 && m <= MATMUL_SPLIT_K_MAX_ROWS {
+        if split_k {
+            let (norm_address, norm_epsilon, shared_mem_bytes) = self.norm_arguments(norm, k);
             let func = self.function("matmul_split_k_kernel")?;
             let mut args = self.stream.launch_builder(&func);
             args.arg(&a.slice)
@@ -1473,11 +1626,15 @@ impl CudaKernels {
                 Some(MatmulAddend::Row(bias)) => (bias, 1),
                 Some(MatmulAddend::Full(residual)) => (residual, 2),
             };
-            args.arg(&addend_buffer.slice).arg(&addend_mode).arg(&b16);
+            args.arg(&addend_buffer.slice)
+                .arg(&addend_mode)
+                .arg(&b16)
+                .arg(&norm_address)
+                .arg(&norm_epsilon);
             let config = LaunchConfig {
                 grid_dim: (n.div_ceil(32) as u32, m as u32, 1),
                 block_dim: (32, MATMUL_SPLIT_K, 1),
-                shared_mem_bytes: 0,
+                shared_mem_bytes,
             };
             unsafe { args.launch(config) }?;
             return Ok(CudaDeviceBuffer {
