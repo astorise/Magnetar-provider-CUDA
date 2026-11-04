@@ -7,7 +7,9 @@
 // enters the Tensor Cores exactly. Each `a` value (f32) is split into two
 // bfloat16 terms, hi = bf16(a) and lo = bf16(a - hi), and both are
 // multiplied by `b`: the product keeps about 16 significant bits of `a`,
-// close to f32, at twice the Tensor Core work. Accumulation is f32.
+// close to f32, at twice the Tensor Core work. With `split` off (an
+// opt-in profile), only hi is multiplied: about 8 significant bits of `a`,
+// half the work. Accumulation is f32 either way.
 //
 // Block tile: TC_BLOCK_M x TC_BLOCK_N outputs, 4 warps of 32 x 32, each
 // warp 2 x 4 `m16n8k16` tiles. `a` and `b` are staged through shared
@@ -81,7 +83,7 @@ __device__ __forceinline__ void tc_stage_b(
 __device__ __forceinline__ void tc_warp_tiles(
     unsigned short (*a_hi)[TC_PITCH], unsigned short (*a_lo)[TC_PITCH],
     unsigned short (*b_t)[TC_PITCH], unsigned int warp_m, unsigned int warp_n,
-    unsigned int group, unsigned int pair, float acc[2][4][4]
+    unsigned int group, unsigned int pair, int split, float acc[2][4][4]
 ) {
 #pragma unroll
     for (int mt = 0; mt < 2; mt++) {
@@ -101,7 +103,9 @@ __device__ __forceinline__ void tc_warp_tiles(
             unsigned int col = warp_n + nt * 8 + group;
             unsigned int b0 = *(const unsigned int*)&b_t[col][2 * pair];
             unsigned int b1 = *(const unsigned int*)&b_t[col][2 * pair + 8];
-            tc_mma(acc[mt][nt], lo, b0, b1);
+            if (split) {
+                tc_mma(acc[mt][nt], lo, b0, b1);
+            }
             tc_mma(acc[mt][nt], hi, b0, b1);
         }
     }
@@ -118,7 +122,8 @@ extern "C" __global__ void matmul_tc_kernel(
     unsigned long long n,
     unsigned long long lda,
     const float* addend,
-    int addend_mode
+    int addend_mode,
+    int split
 ) {
     __shared__ __align__(16) unsigned short a_hi[TC_BLOCK_M][TC_PITCH];
     __shared__ __align__(16) unsigned short a_lo[TC_BLOCK_M][TC_PITCH];
@@ -144,7 +149,7 @@ extern "C" __global__ void matmul_tc_kernel(
         tc_stage_a(a, m, k, lda, m0, k0, a_hi, a_lo);
         tc_stage_b(b16, k, n, k0, n0, b_t);
         __syncthreads();
-        tc_warp_tiles(a_hi, a_lo, b_t, warp_m, warp_n, group, pair, acc);
+        tc_warp_tiles(a_hi, a_lo, b_t, warp_m, warp_n, group, pair, split, acc);
     }
 
 #pragma unroll
@@ -178,7 +183,8 @@ extern "C" __global__ void gated_matmul_tc_kernel(
     unsigned long long m,
     unsigned long long k,
     unsigned long long n,
-    unsigned long long lda
+    unsigned long long lda,
+    int split
 ) {
     __shared__ __align__(16) unsigned short a_hi[TC_BLOCK_M][TC_PITCH];
     __shared__ __align__(16) unsigned short a_lo[TC_BLOCK_M][TC_PITCH];
@@ -210,8 +216,8 @@ extern "C" __global__ void gated_matmul_tc_kernel(
         tc_stage_b(gate16, k, n, k0, n0, gate_t);
         tc_stage_b(up16, k, n, k0, n0, up_t);
         __syncthreads();
-        tc_warp_tiles(a_hi, a_lo, gate_t, warp_m, warp_n, group, pair, gate_acc);
-        tc_warp_tiles(a_hi, a_lo, up_t, warp_m, warp_n, group, pair, up_acc);
+        tc_warp_tiles(a_hi, a_lo, gate_t, warp_m, warp_n, group, pair, split, gate_acc);
+        tc_warp_tiles(a_hi, a_lo, up_t, warp_m, warp_n, group, pair, split, up_acc);
     }
 
 #pragma unroll
