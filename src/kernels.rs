@@ -103,9 +103,7 @@ const ATTENTION_CHUNK_KEYS: u64 = 128;
 const ATTENTION_SPLIT_THREADS: u32 = 128;
 /// `ATTENTION_TILE_QUERIES` in `kernels.cu`: queries per tiled-attention
 /// block, 4 threads each.
-const ATTENTION_TILE_QUERIES: u64 = 32;
-/// `ATTENTION_MAX_PART_DIMS` in `kernels.cu`: head dimensions per thread.
-const ATTENTION_MAX_PART_DIMS: u64 = 32;
+const ATTENTION_TILE_QUERIES: u64 = 64;
 
 /// Dynamic shared memory `attention_block_kernel` may use without opting a
 /// function into more (the CUDA default limit per block).
@@ -1824,21 +1822,27 @@ impl CudaKernels {
         }
 
         // Several query rows (a prefill), outside a capture: the tiled
-        // Kernel, when the head dimension fits its per-thread registers.
-        if seq_len > 1
-            && !self.is_capturing()
-            && head_dimension.is_multiple_of(4)
-            && head_dimension <= 4 * ATTENTION_MAX_PART_DIMS
-        {
+        // Kernel compiled for its head dimension.
+        let tiled = match head_dimension {
+            4 => Some("attention_tiled_1_kernel"),
+            8 => Some("attention_tiled_2_kernel"),
+            16 => Some("attention_tiled_4_kernel"),
+            32 => Some("attention_tiled_8_kernel"),
+            64 => Some("attention_tiled_16_kernel"),
+            96 => Some("attention_tiled_24_kernel"),
+            128 => Some("attention_tiled_32_kernel"),
+            _ => None,
+        };
+        if let Some(tiled) = tiled.filter(|_| seq_len > 1 && !self.is_capturing()) {
             let overflow = || {
                 CudaError::new(
                     CudaErrorCode::ShapeUnsupported,
                     "attention launch size overflows a grid dimension",
                 )
             };
-            let key_tile: u64 = if head_dimension <= 64 { 64 } else { 32 };
+            let key_tile: u32 = if head_dimension <= 64 { 64 } else { 32 };
             let mut out_dev = self.alloc_output(q.slice.len())?;
-            let func = self.function("attention_tiled_kernel")?;
+            let func = self.function(tiled)?;
             let mut args = self.stream.launch_builder(&func);
             args.arg(&q.slice)
                 .arg(&k.slice)
@@ -1848,7 +1852,6 @@ impl CudaKernels {
                 .arg(&kv_seq_len)
                 .arg(&head_count)
                 .arg(&kv_head_count)
-                .arg(&head_dimension)
                 .arg(&q_model_dim)
                 .arg(&kv_model_dim)
                 .arg(&causal_flag)
@@ -1863,7 +1866,7 @@ impl CudaKernels {
                     1,
                 ),
                 block_dim: (4 * ATTENTION_TILE_QUERIES as u32, 1, 1),
-                shared_mem_bytes: u32::try_from(2 * key_tile * head_dimension * 4)
+                shared_mem_bytes: u32::try_from(2 * u64::from(key_tile) * head_dimension * 4)
                     .map_err(|_| overflow())?,
             };
             unsafe { args.launch(config) }?;
