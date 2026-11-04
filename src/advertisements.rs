@@ -141,24 +141,6 @@ pub fn cuda_kernel_advertisements(
             provider_name,
         ),
         baseline_advertisement(
-            "rmsnorm-matmul",
-            OperatorFamily::LinearAlgebra,
-            device_id,
-            provider_name,
-        ),
-        baseline_advertisement(
-            "rmsnorm-matmul-bias",
-            OperatorFamily::LinearAlgebra,
-            device_id,
-            provider_name,
-        ),
-        baseline_advertisement(
-            "rmsnorm-gated-matmul",
-            OperatorFamily::LinearAlgebra,
-            device_id,
-            provider_name,
-        ),
-        baseline_advertisement(
             "embedding",
             OperatorFamily::Tensor,
             device_id,
