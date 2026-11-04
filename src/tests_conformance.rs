@@ -668,6 +668,10 @@ fn multi_row_split_k_rows_are_bit_identical_to_single_row_matmuls() {
         (3, 37, 33),
         (9, 130, 70),
         (8, 64, 32),
+        // The tile Kernels: several 256-inner stages, a partial last stage,
+        // a partial last column tile and a partial last row group.
+        (64, 896, 256),
+        (130, 600, 200),
     ] {
         let a = HostTensor::new([m, k], bf16_exact_values((m * k) as usize, 1)).unwrap();
         let weight = HostTensor::new([k, n], bf16_exact_values((k * n) as usize, 2)).unwrap();

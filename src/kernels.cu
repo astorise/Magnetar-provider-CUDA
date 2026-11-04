@@ -559,6 +559,183 @@ extern "C" __global__ void gated_matmul_split_k_rows_kernel(
     }
 }
 
+// Prefill matmul tiles: each thread computes MATMUL_ROWS rows times
+// MATMUL_TILE_COLUMNS columns (lane, lane + 32, ...) of one split-K slice,
+// so each weight it loads serves MATMUL_ROWS rows and each `a` value
+// MATMUL_TILE_COLUMNS columns. The block's `a` rows are staged through
+// shared memory MATMUL_TILE_INNER inners at a time (a multiple of
+// MATMUL_SPLIT_K, so every slice keeps its own inners). Each output's slice
+// sums still add inner ascending, and the slices are added in slice order,
+// so every output is bit-identical to `matmul_split_k_kernel`'s.
+#define MATMUL_TILE_COLUMNS 4
+#define MATMUL_TILE_INNER 256
+template <typename W>
+__device__ __forceinline__ void matmul_tile_sums(
+    const float* a_rows,
+    unsigned long long a_row_stride,
+    unsigned long long a_inner_stride,
+    unsigned int rows,
+    const W* b,
+    unsigned long long b_inner_stride,
+    unsigned long long first_col,
+    unsigned long long n,
+    unsigned int slice,
+    unsigned long long k,
+    float (*a_shared)[MATMUL_TILE_INNER],
+    float acc[MATMUL_ROWS][MATMUL_TILE_COLUMNS]
+) {
+    unsigned int tid = threadIdx.y * 32 + threadIdx.x;
+    unsigned int threads = 32 * MATMUL_SPLIT_K;
+#pragma unroll
+    for (int r = 0; r < MATMUL_ROWS; r++) {
+#pragma unroll
+        for (int c = 0; c < MATMUL_TILE_COLUMNS; c++) {
+            acc[r][c] = 0.0f;
+        }
+    }
+    for (unsigned long long base = 0; base < k; base += MATMUL_TILE_INNER) {
+        __syncthreads();
+        for (unsigned int e = tid; e < MATMUL_ROWS * MATMUL_TILE_INNER; e += threads) {
+            unsigned int r = e / MATMUL_TILE_INNER;
+            unsigned int i = e % MATMUL_TILE_INNER;
+            a_shared[r][i] = r < rows && base + i < k
+                ? a_rows[r * a_row_stride + (base + i) * a_inner_stride]
+                : 0.0f;
+        }
+        __syncthreads();
+        unsigned long long end = base + MATMUL_TILE_INNER < k ? base + MATMUL_TILE_INNER : k;
+        for (unsigned long long inner = base + slice; inner < end; inner += MATMUL_SPLIT_K) {
+            float w[MATMUL_TILE_COLUMNS];
+#pragma unroll
+            for (int c = 0; c < MATMUL_TILE_COLUMNS; c++) {
+                unsigned long long col = first_col + c * 32;
+                w[c] = col < n ? matmul_weight(b, inner * b_inner_stride + col) : 0.0f;
+            }
+#pragma unroll
+            for (int r = 0; r < MATMUL_ROWS; r++) {
+                float a_value = a_shared[r][inner - base];
+#pragma unroll
+                for (int c = 0; c < MATMUL_TILE_COLUMNS; c++) {
+                    acc[r][c] += a_value * w[c];
+                }
+            }
+        }
+    }
+}
+
+extern "C" __global__ void matmul_split_k_tile_kernel(
+    const float* a,
+    const float* b,
+    float* out,
+    unsigned long long m,
+    unsigned long long k,
+    unsigned long long n,
+    unsigned long long a_row_stride,
+    unsigned long long a_inner_stride,
+    unsigned long long b_inner_stride,
+    const float* addend,
+    int addend_mode,
+    const unsigned short* b16
+) {
+    __shared__ float a_shared[MATMUL_ROWS][MATMUL_TILE_INNER];
+    __shared__ float partial[MATMUL_ROWS][MATMUL_SPLIT_K][32];
+    unsigned long long first_row = (unsigned long long)blockIdx.y * MATMUL_ROWS;
+    unsigned int rows = (unsigned int)min((unsigned long long)MATMUL_ROWS, m - first_row);
+    unsigned long long first_col = (unsigned long long)blockIdx.x * 32 * MATMUL_TILE_COLUMNS + threadIdx.x;
+    unsigned int slice = threadIdx.y;
+    float acc[MATMUL_ROWS][MATMUL_TILE_COLUMNS];
+    const float* a_rows = a + first_row * a_row_stride;
+    if (b16) {
+        matmul_tile_sums(a_rows, a_row_stride, a_inner_stride, rows, b16, b_inner_stride, first_col, n, slice, k, a_shared, acc);
+    } else {
+        matmul_tile_sums(a_rows, a_row_stride, a_inner_stride, rows, b, b_inner_stride, first_col, n, slice, k, a_shared, acc);
+    }
+#pragma unroll
+    for (int c = 0; c < MATMUL_TILE_COLUMNS; c++) {
+        __syncthreads();
+#pragma unroll
+        for (int r = 0; r < MATMUL_ROWS; r++) {
+            partial[r][slice][threadIdx.x] = acc[r][c];
+        }
+        __syncthreads();
+        unsigned long long col = first_col + c * 32;
+        if (slice < rows && col < n) {
+            unsigned long long row = first_row + slice;
+            float sum = 0.0f;
+            for (unsigned int s = 0; s < MATMUL_SPLIT_K; s++) {
+                sum += partial[slice][s][threadIdx.x];
+            }
+            if (addend_mode == 1) {
+                sum += addend[col];
+            } else if (addend_mode == 2) {
+                sum += addend[row * n + col];
+            }
+            out[row * n + col] = sum;
+        }
+    }
+}
+
+// `gated_matmul_split_k_rows_kernel` in tiles, bit-identical to it.
+extern "C" __global__ void gated_matmul_split_k_tile_kernel(
+    const float* a,
+    const float* gate,
+    const unsigned short* gate16,
+    const float* up,
+    const unsigned short* up16,
+    float* out,
+    unsigned long long m,
+    unsigned long long k,
+    unsigned long long n,
+    unsigned long long a_row_stride,
+    unsigned long long a_inner_stride,
+    unsigned long long b_inner_stride
+) {
+    __shared__ float a_shared[MATMUL_ROWS][MATMUL_TILE_INNER];
+    __shared__ float gate_partial[MATMUL_ROWS][MATMUL_SPLIT_K][32];
+    __shared__ float up_partial[MATMUL_ROWS][MATMUL_SPLIT_K][32];
+    unsigned long long first_row = (unsigned long long)blockIdx.y * MATMUL_ROWS;
+    unsigned int rows = (unsigned int)min((unsigned long long)MATMUL_ROWS, m - first_row);
+    unsigned long long first_col = (unsigned long long)blockIdx.x * 32 * MATMUL_TILE_COLUMNS + threadIdx.x;
+    unsigned int slice = threadIdx.y;
+    float gate_acc[MATMUL_ROWS][MATMUL_TILE_COLUMNS];
+    float up_acc[MATMUL_ROWS][MATMUL_TILE_COLUMNS];
+    const float* a_rows = a + first_row * a_row_stride;
+    if (gate16) {
+        matmul_tile_sums(a_rows, a_row_stride, a_inner_stride, rows, gate16, b_inner_stride, first_col, n, slice, k, a_shared, gate_acc);
+    } else {
+        matmul_tile_sums(a_rows, a_row_stride, a_inner_stride, rows, gate, b_inner_stride, first_col, n, slice, k, a_shared, gate_acc);
+    }
+    if (up16) {
+        matmul_tile_sums(a_rows, a_row_stride, a_inner_stride, rows, up16, b_inner_stride, first_col, n, slice, k, a_shared, up_acc);
+    } else {
+        matmul_tile_sums(a_rows, a_row_stride, a_inner_stride, rows, up, b_inner_stride, first_col, n, slice, k, a_shared, up_acc);
+    }
+#pragma unroll
+    for (int c = 0; c < MATMUL_TILE_COLUMNS; c++) {
+        __syncthreads();
+#pragma unroll
+        for (int r = 0; r < MATMUL_ROWS; r++) {
+            gate_partial[r][slice][threadIdx.x] = gate_acc[r][c];
+            up_partial[r][slice][threadIdx.x] = up_acc[r][c];
+        }
+        __syncthreads();
+        unsigned long long col = first_col + c * 32;
+        if (slice < rows && col < n) {
+            unsigned long long row = first_row + slice;
+            float gate_sum = 0.0f;
+            float up_sum = 0.0f;
+            for (unsigned int s = 0; s < MATMUL_SPLIT_K; s++) {
+                gate_sum += gate_partial[slice][s][threadIdx.x];
+            }
+            for (unsigned int s = 0; s < MATMUL_SPLIT_K; s++) {
+                up_sum += up_partial[slice][s][threadIdx.x];
+            }
+            float activated = gate_sum * (1.0f / (1.0f + expf(-gate_sum)));
+            out[row * n + col] = activated * up_sum;
+        }
+    }
+}
+
 // `silu(a x gate) * (a x up)` for the Runtime's fused `gated-matmul`: the
 // split-K matmul's sums for both weights, in its order, then
 // `silu_mul_kernel`'s arithmetic, so the result is bit-identical to two

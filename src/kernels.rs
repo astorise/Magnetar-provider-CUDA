@@ -53,14 +53,40 @@ const MATMUL_SPLIT_K_MAX_ROWS: u64 = 65_535;
 /// equal `MATMUL_ROWS` in `kernels.cu`.
 const MATMUL_ROWS: u64 = 8;
 
-/// The split-K function and grid height for `m` rows: one row per block
-/// for a decode step, MATMUL_ROWS per block otherwise (each weight is
-/// then read once per row group, with bit-identical results).
-fn split_k_rows(m: u64, single: &'static str, multi: &'static str) -> (&'static str, u32) {
-    if m > 1 {
-        (multi, m.div_ceil(MATMUL_ROWS) as u32)
+/// Rows from which a multi-row matmul uses the tile Kernels: enough row
+/// groups to occupy the Device with 128-column blocks.
+const MATMUL_TILE_MIN_ROWS: u64 = 64;
+
+/// Columns of one tile-Kernel block: `32 * MATMUL_TILE_COLUMNS` in
+/// `kernels.cu`.
+const MATMUL_TILE_BLOCK_COLUMNS: u64 = 128;
+
+/// The split-K function and grid for `m` rows of `n` columns: one row per
+/// block for a decode step, MATMUL_ROWS per block otherwise (each weight
+/// is then read once per row group), and MATMUL_ROWS by 128 columns per
+/// block for a long prefill (each weight load serves 8 rows and each `a`
+/// value 4 columns). All are bit-identical row by row.
+fn split_k_rows(
+    m: u64,
+    n: u64,
+    [single, multi, tile]: [&'static str; 3],
+) -> (&'static str, (u32, u32, u32)) {
+    if m >= MATMUL_TILE_MIN_ROWS {
+        (
+            tile,
+            (
+                n.div_ceil(MATMUL_TILE_BLOCK_COLUMNS) as u32,
+                m.div_ceil(MATMUL_ROWS) as u32,
+                1,
+            ),
+        )
+    } else if m > 1 {
+        (
+            multi,
+            (n.div_ceil(32) as u32, m.div_ceil(MATMUL_ROWS) as u32, 1),
+        )
     } else {
-        (single, m as u32)
+        (single, (n.div_ceil(32) as u32, m as u32, 1))
     }
 }
 
@@ -1496,10 +1522,14 @@ impl CudaKernels {
         let b_inner_stride = n;
         let (gate16, up16) = (self.bf16_address(gate), self.bf16_address(up));
         let mut out_dev = self.alloc_output((m * n) as usize)?;
-        let (name, grid_rows) = split_k_rows(
+        let (name, grid_dim) = split_k_rows(
             m,
-            "gated_matmul_split_k_kernel",
-            "gated_matmul_split_k_rows_kernel",
+            n,
+            [
+                "gated_matmul_split_k_kernel",
+                "gated_matmul_split_k_rows_kernel",
+                "gated_matmul_split_k_tile_kernel",
+            ],
         );
         let func = self.function(name)?;
         let mut args = self.stream.launch_builder(&func);
@@ -1516,7 +1546,7 @@ impl CudaKernels {
             .arg(&a_inner_stride)
             .arg(&b_inner_stride);
         let config = LaunchConfig {
-            grid_dim: (n.div_ceil(32) as u32, grid_rows, 1),
+            grid_dim,
             block_dim: (32, MATMUL_SPLIT_K, 1),
             shared_mem_bytes: 0,
         };
@@ -1592,8 +1622,15 @@ impl CudaKernels {
         let b16 = self.bf16_address(b);
         let mut out_dev = self.alloc_output((m * n) as usize)?;
         if b_col_stride == 1 && m <= MATMUL_SPLIT_K_MAX_ROWS {
-            let (name, grid_rows) =
-                split_k_rows(m, "matmul_split_k_kernel", "matmul_split_k_rows_kernel");
+            let (name, grid_dim) = split_k_rows(
+                m,
+                n,
+                [
+                    "matmul_split_k_kernel",
+                    "matmul_split_k_rows_kernel",
+                    "matmul_split_k_tile_kernel",
+                ],
+            );
             let func = self.function(name)?;
             let mut args = self.stream.launch_builder(&func);
             args.arg(&a.slice)
@@ -1614,7 +1651,7 @@ impl CudaKernels {
             };
             args.arg(&addend_buffer.slice).arg(&addend_mode).arg(&b16);
             let config = LaunchConfig {
-                grid_dim: (n.div_ceil(32) as u32, grid_rows, 1),
+                grid_dim,
                 block_dim: (32, MATMUL_SPLIT_K, 1),
                 shared_mem_bytes: 0,
             };
