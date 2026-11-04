@@ -652,6 +652,131 @@ fn greedy_select_matches_host_greedy_selection() {
     assert!(kernels.greedy_select(&logits, 1, &[], 0.0).is_err());
 }
 
+/// The multi-row split-K Kernels (prefill: several rows of `a`) give each
+/// row exactly the bits the one-row Kernel gives it alone, for matmul,
+/// matmul-bias, matmul-residual and gated-matmul, with f32 and compact
+/// weights, row counts that are and are not multiples of the row group,
+/// and inner lengths that leave a tail.
+#[test]
+fn multi_row_split_k_rows_are_bit_identical_to_single_row_matmuls() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let bits = |tensor: &HostTensor| tensor.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    for (m, k, n) in [
+        (16u64, 896u64, 128u64),
+        (3, 37, 33),
+        (9, 130, 70),
+        (8, 64, 32),
+    ] {
+        let a = HostTensor::new([m, k], bf16_exact_values((m * k) as usize, 1)).unwrap();
+        let weight = HostTensor::new([k, n], bf16_exact_values((k * n) as usize, 2)).unwrap();
+        let up = HostTensor::new([k, n], bf16_exact_values((k * n) as usize, 3)).unwrap();
+        let bias = upload(
+            &kernels,
+            &HostTensor::new([n], bf16_exact_values(n as usize, 4)).unwrap(),
+        );
+        let residual_host =
+            HostTensor::new([m, n], bf16_exact_values((m * n) as usize, 5)).unwrap();
+        let residual = upload(&kernels, &residual_host);
+        let a_dev = upload(&kernels, &a);
+        for compact in [false, true] {
+            let place = |tensor: &HostTensor| {
+                if compact {
+                    kernels.upload_weight(tensor).unwrap()
+                } else {
+                    upload(&kernels, tensor)
+                }
+            };
+            let (b, up_dev) = (place(&weight), place(&up));
+            let outputs = [
+                download(&kernels, &kernels.matmul(&a_dev, &b, false, false).unwrap()),
+                download(
+                    &kernels,
+                    &kernels
+                        .matmul_bias(&a_dev, &b, &bias, false, false)
+                        .unwrap(),
+                ),
+                download(
+                    &kernels,
+                    &kernels
+                        .matmul_residual(&a_dev, &b, &residual, false, false)
+                        .unwrap(),
+                ),
+                download(
+                    &kernels,
+                    &kernels
+                        .gated_matmul(&a_dev, &b, &up_dev, false, false)
+                        .unwrap(),
+                ),
+            ];
+            for row in 0..m as usize {
+                let a_row = upload(
+                    &kernels,
+                    &HostTensor::new(
+                        [1, k],
+                        a.data[row * k as usize..(row + 1) * k as usize].to_vec(),
+                    )
+                    .unwrap(),
+                );
+                let residual_row = upload(
+                    &kernels,
+                    &HostTensor::new(
+                        [1, n],
+                        residual_host.data[row * n as usize..(row + 1) * n as usize].to_vec(),
+                    )
+                    .unwrap(),
+                );
+                let singles = [
+                    download(&kernels, &kernels.matmul(&a_row, &b, false, false).unwrap()),
+                    download(
+                        &kernels,
+                        &kernels
+                            .matmul_bias(&a_row, &b, &bias, false, false)
+                            .unwrap(),
+                    ),
+                    download(
+                        &kernels,
+                        &kernels
+                            .matmul_residual(&a_row, &b, &residual_row, false, false)
+                            .unwrap(),
+                    ),
+                    download(
+                        &kernels,
+                        &kernels
+                            .gated_matmul(&a_row, &b, &up_dev, false, false)
+                            .unwrap(),
+                    ),
+                ];
+                for (operator, (multi, single)) in outputs.iter().zip(&singles).enumerate() {
+                    let row_bits = &bits(multi)[row * n as usize..(row + 1) * n as usize];
+                    assert_eq!(
+                        row_bits,
+                        bits(single).as_slice(),
+                        "operator {operator}, [{m}, {k}] x [{k}, {n}] row {row}, compact {compact}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `download_rows` returns exactly the requested rows of a rank-2 buffer.
+#[test]
+fn download_rows_returns_only_the_requested_rows() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let tensor = HostTensor::new([4, 3], (0..12).map(|v| v as f32).collect::<Vec<_>>()).unwrap();
+    let buffer = upload(&kernels, &tensor);
+    let last = kernels.download_rows(&buffer, 3, 1).unwrap().unwrap();
+    assert_eq!(last.shape, vec![1, 3]);
+    assert_eq!(last.data, vec![9.0, 10.0, 11.0]);
+    let middle = kernels.download_rows(&buffer, 1, 2).unwrap().unwrap();
+    assert_eq!(middle.data, vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+    assert!(kernels.download_rows(&buffer, 3, 2).unwrap().is_none());
+}
+
 #[test]
 fn causal_attention_matches_reference_cpu() {
     let Some(kernels) = kernels_or_skip() else {

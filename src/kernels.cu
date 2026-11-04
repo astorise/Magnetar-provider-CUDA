@@ -373,6 +373,192 @@ extern "C" __global__ void matmul_split_k_kernel(
     }
 }
 
+// Rows of `a` one block of the multi-row split-K kernels serves: each
+// weight they load is used for every one of these rows (prefill), instead
+// of being loaded once per row.
+#define MATMUL_ROWS 8
+// Weight loads a multi-row slice issues before adding, fewer than
+// MATMUL_UNROLL to keep MATMUL_ROWS rows of `a` values in registers.
+#define MATMUL_ROWS_UNROLL 4
+// `matmul_slice_sum` for the `rows` (at most MATMUL_ROWS) consecutive rows
+// of `a` from `a_rows`: each weight is loaded once for all of them, and
+// each row's products are added in exactly `matmul_slice_sum`'s order
+// (inner ascending), so each row's sum is bit-identical to it.
+template <typename W>
+__device__ __forceinline__ void matmul_slice_sums(
+    const float* a_rows,
+    unsigned long long a_row_stride,
+    unsigned long long a_inner_stride,
+    unsigned int rows,
+    const W* b_col,
+    unsigned long long b_inner_stride,
+    unsigned int slice,
+    unsigned long long k,
+    float acc[MATMUL_ROWS]
+) {
+#pragma unroll
+    for (int r = 0; r < MATMUL_ROWS; r++) {
+        acc[r] = 0.0f;
+    }
+    unsigned long long inner = slice;
+    const unsigned long long step = MATMUL_SPLIT_K;
+    for (; inner + (MATMUL_ROWS_UNROLL - 1) * step < k; inner += MATMUL_ROWS_UNROLL * step) {
+        float bv[MATMUL_ROWS_UNROLL];
+        float av[MATMUL_ROWS][MATMUL_ROWS_UNROLL];
+#pragma unroll
+        for (int u = 0; u < MATMUL_ROWS_UNROLL; u++) {
+            bv[u] = matmul_weight(b_col, (inner + u * step) * b_inner_stride);
+        }
+#pragma unroll
+        for (int r = 0; r < MATMUL_ROWS; r++) {
+#pragma unroll
+            for (int u = 0; u < MATMUL_ROWS_UNROLL; u++) {
+                av[r][u] = r < rows
+                    ? a_rows[r * a_row_stride + (inner + u * step) * a_inner_stride]
+                    : 0.0f;
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < MATMUL_ROWS; r++) {
+#pragma unroll
+            for (int u = 0; u < MATMUL_ROWS_UNROLL; u++) {
+                acc[r] += av[r][u] * bv[u];
+            }
+        }
+    }
+    for (; inner < k; inner += step) {
+        float w = matmul_weight(b_col, inner * b_inner_stride);
+#pragma unroll
+        for (int r = 0; r < MATMUL_ROWS; r++) {
+            float a_value = r < rows ? a_rows[r * a_row_stride + inner * a_inner_stride] : 0.0f;
+            acc[r] += a_value * w;
+        }
+    }
+}
+
+// `matmul_split_k_kernel` for up to MATMUL_ROWS rows per block (blockIdx.y
+// selects the row group): the same per-row sums, slice order and addend,
+// so each output is bit-identical to it, with each weight read once per
+// row group instead of once per row.
+extern "C" __global__ void matmul_split_k_rows_kernel(
+    const float* a,
+    const float* b,
+    float* out,
+    unsigned long long m,
+    unsigned long long k,
+    unsigned long long n,
+    unsigned long long a_row_stride,
+    unsigned long long a_inner_stride,
+    unsigned long long b_inner_stride,
+    const float* addend,
+    int addend_mode,
+    const unsigned short* b16
+) {
+    __shared__ float partial[MATMUL_ROWS][MATMUL_SPLIT_K][32];
+    unsigned long long first_row = (unsigned long long)blockIdx.y * MATMUL_ROWS;
+    unsigned int rows = (unsigned int)min((unsigned long long)MATMUL_ROWS, m - first_row);
+    unsigned long long col = (unsigned long long)blockIdx.x * 32 + threadIdx.x;
+    unsigned int slice = threadIdx.y;
+    float acc[MATMUL_ROWS];
+    const float* a_rows = a + first_row * a_row_stride;
+    if (col < n) {
+        if (b16) {
+            matmul_slice_sums(a_rows, a_row_stride, a_inner_stride, rows, b16 + col, b_inner_stride, slice, k, acc);
+        } else {
+            matmul_slice_sums(a_rows, a_row_stride, a_inner_stride, rows, b + col, b_inner_stride, slice, k, acc);
+        }
+    } else {
+#pragma unroll
+        for (int r = 0; r < MATMUL_ROWS; r++) {
+            acc[r] = 0.0f;
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < MATMUL_ROWS; r++) {
+        partial[r][slice][threadIdx.x] = acc[r];
+    }
+    __syncthreads();
+    // Slice-0 threads finish rows 0, 8, ...; every slice finishes the row
+    // it is numbered after, so the MATMUL_ROWS rows finish in parallel.
+    if (slice < rows && col < n) {
+        unsigned long long row = first_row + slice;
+        float sum = 0.0f;
+        for (unsigned int s = 0; s < MATMUL_SPLIT_K; s++) {
+            sum += partial[slice][s][threadIdx.x];
+        }
+        if (addend_mode == 1) {
+            sum += addend[col];
+        } else if (addend_mode == 2) {
+            sum += addend[row * n + col];
+        }
+        out[row * n + col] = sum;
+    }
+}
+
+// `gated_matmul_split_k_kernel` for up to MATMUL_ROWS rows per block,
+// bit-identical to it row by row.
+extern "C" __global__ void gated_matmul_split_k_rows_kernel(
+    const float* a,
+    const float* gate,
+    const unsigned short* gate16,
+    const float* up,
+    const unsigned short* up16,
+    float* out,
+    unsigned long long m,
+    unsigned long long k,
+    unsigned long long n,
+    unsigned long long a_row_stride,
+    unsigned long long a_inner_stride,
+    unsigned long long b_inner_stride
+) {
+    __shared__ float gate_partial[MATMUL_ROWS][MATMUL_SPLIT_K][32];
+    __shared__ float up_partial[MATMUL_ROWS][MATMUL_SPLIT_K][32];
+    unsigned long long first_row = (unsigned long long)blockIdx.y * MATMUL_ROWS;
+    unsigned int rows = (unsigned int)min((unsigned long long)MATMUL_ROWS, m - first_row);
+    unsigned long long col = (unsigned long long)blockIdx.x * 32 + threadIdx.x;
+    unsigned int slice = threadIdx.y;
+    float gate_acc[MATMUL_ROWS];
+    float up_acc[MATMUL_ROWS];
+    const float* a_rows = a + first_row * a_row_stride;
+    if (col < n) {
+        if (gate16) {
+            matmul_slice_sums(a_rows, a_row_stride, a_inner_stride, rows, gate16 + col, b_inner_stride, slice, k, gate_acc);
+        } else {
+            matmul_slice_sums(a_rows, a_row_stride, a_inner_stride, rows, gate + col, b_inner_stride, slice, k, gate_acc);
+        }
+        if (up16) {
+            matmul_slice_sums(a_rows, a_row_stride, a_inner_stride, rows, up16 + col, b_inner_stride, slice, k, up_acc);
+        } else {
+            matmul_slice_sums(a_rows, a_row_stride, a_inner_stride, rows, up + col, b_inner_stride, slice, k, up_acc);
+        }
+    } else {
+#pragma unroll
+        for (int r = 0; r < MATMUL_ROWS; r++) {
+            gate_acc[r] = 0.0f;
+            up_acc[r] = 0.0f;
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < MATMUL_ROWS; r++) {
+        gate_partial[r][slice][threadIdx.x] = gate_acc[r];
+        up_partial[r][slice][threadIdx.x] = up_acc[r];
+    }
+    __syncthreads();
+    if (slice < rows && col < n) {
+        unsigned long long row = first_row + slice;
+        float gate_sum = 0.0f;
+        float up_sum = 0.0f;
+        for (unsigned int s = 0; s < MATMUL_SPLIT_K; s++) {
+            gate_sum += gate_partial[slice][s][threadIdx.x];
+        }
+        for (unsigned int s = 0; s < MATMUL_SPLIT_K; s++) {
+            up_sum += up_partial[slice][s][threadIdx.x];
+        }
+        float activated = gate_sum * (1.0f / (1.0f + expf(-gate_sum)));
+        out[row * n + col] = activated * up_sum;
+    }
+}
+
 // `silu(a x gate) * (a x up)` for the Runtime's fused `gated-matmul`: the
 // split-K matmul's sums for both weights, in its order, then
 // `silu_mul_kernel`'s arithmetic, so the result is bit-identical to two
