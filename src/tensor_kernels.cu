@@ -54,6 +54,12 @@ __device__ __forceinline__ void tc_stage_a(
         unsigned int c = e % TC_BLOCK_K;
         float value = (m0 + r < m && k0 + c < k) ? a[(m0 + r) * lda + k0 + c] : 0.0f;
         unsigned short hi = tc_float_to_bf16(value);
+        if ((hi & 0x7FFF) == 0x7F80 && isfinite(value)) {
+            // A finite value that rounds past bfloat16's largest finite
+            // value: truncate instead (still finite), and let the low
+            // term carry the remainder.
+            hi = (unsigned short)(((unsigned int)__float_as_int(value)) >> 16);
+        }
         a_hi[r][c] = hi;
         a_lo[r][c] = tc_float_to_bf16(value - tc_bf16_to_float(hi));
     }

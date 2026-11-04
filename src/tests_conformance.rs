@@ -835,6 +835,38 @@ fn tensor_core_matmul_keeps_f32_activation_precision() {
     }
 }
 
+/// A finite activation that bfloat16 rounding would turn into infinity
+/// stays finite on the Tensor Core path: `f32::MAX` times 2^-120, summed
+/// over 256 inners, is about 65536 (Codex review on
+/// astorise/Magnetar-provider-CUDA#25).
+#[test]
+fn tensor_core_matmul_keeps_activations_near_f32_max_finite() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    if !kernels.has_tensor_cores() {
+        return;
+    }
+    let (m, k, n) = (64u64, 256u64, 256u64);
+    let a = upload(
+        &kernels,
+        &HostTensor::new([m, k], vec![f32::MAX; (m * k) as usize]).unwrap(),
+    );
+    let small = 2f32.powi(-120);
+    let b = kernels
+        .upload_weight(&HostTensor::new([k, n], vec![small; (k * n) as usize]).unwrap())
+        .unwrap();
+    assert!(b.is_compact());
+    let expected = f64::from(f32::MAX) * f64::from(small) * k as f64;
+    let actual = download(&kernels, &kernels.matmul(&a, &b, false, false).unwrap());
+    for value in &actual.data {
+        assert!(
+            value.is_finite() && ((f64::from(*value) - expected) / expected).abs() < 1e-4,
+            "{value} vs {expected}"
+        );
+    }
+}
+
 /// `download_rows` returns exactly the requested rows of a rank-2 buffer.
 #[test]
 fn download_rows_returns_only_the_requested_rows() {
