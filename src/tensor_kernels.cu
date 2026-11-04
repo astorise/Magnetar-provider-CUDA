@@ -16,7 +16,7 @@
 
 #define TC_BLOCK_M 64
 #define TC_BLOCK_N 64
-#define TC_BLOCK_K 32
+#define TC_BLOCK_K 16
 // Row pitch of the staged tiles, in bfloat16 elements (padded against bank
 // conflicts).
 #define TC_PITCH (TC_BLOCK_K + 8)
@@ -77,41 +77,32 @@ __device__ __forceinline__ void tc_stage_b(
     }
 }
 
-// One warp's 2 x 4 tiles for the staged inners (TC_BLOCK_K of them, 16
-// per `mma`): hi and lo terms of `a`.
+// One warp's 2 x 4 tiles for the staged inners: hi and lo terms of `a`.
 __device__ __forceinline__ void tc_warp_tiles(
     unsigned short (*a_hi)[TC_PITCH], unsigned short (*a_lo)[TC_PITCH],
     unsigned short (*b_t)[TC_PITCH], unsigned int warp_m, unsigned int warp_n,
     unsigned int group, unsigned int pair, float acc[2][4][4]
 ) {
 #pragma unroll
-    for (int kk = 0; kk < TC_BLOCK_K; kk += 16) {
-        unsigned int c0 = kk + 2 * pair;
-        unsigned int b[4][2];
+    for (int mt = 0; mt < 2; mt++) {
+        unsigned int r = warp_m + mt * 16 + group;
+        unsigned int hi[4];
+        unsigned int lo[4];
+        hi[0] = *(const unsigned int*)&a_hi[r][2 * pair];
+        hi[1] = *(const unsigned int*)&a_hi[r + 8][2 * pair];
+        hi[2] = *(const unsigned int*)&a_hi[r][2 * pair + 8];
+        hi[3] = *(const unsigned int*)&a_hi[r + 8][2 * pair + 8];
+        lo[0] = *(const unsigned int*)&a_lo[r][2 * pair];
+        lo[1] = *(const unsigned int*)&a_lo[r + 8][2 * pair];
+        lo[2] = *(const unsigned int*)&a_lo[r][2 * pair + 8];
+        lo[3] = *(const unsigned int*)&a_lo[r + 8][2 * pair + 8];
 #pragma unroll
         for (int nt = 0; nt < 4; nt++) {
             unsigned int col = warp_n + nt * 8 + group;
-            b[nt][0] = *(const unsigned int*)&b_t[col][c0];
-            b[nt][1] = *(const unsigned int*)&b_t[col][c0 + 8];
-        }
-#pragma unroll
-        for (int mt = 0; mt < 2; mt++) {
-            unsigned int r = warp_m + mt * 16 + group;
-            unsigned int hi[4];
-            unsigned int lo[4];
-            hi[0] = *(const unsigned int*)&a_hi[r][c0];
-            hi[1] = *(const unsigned int*)&a_hi[r + 8][c0];
-            hi[2] = *(const unsigned int*)&a_hi[r][c0 + 8];
-            hi[3] = *(const unsigned int*)&a_hi[r + 8][c0 + 8];
-            lo[0] = *(const unsigned int*)&a_lo[r][c0];
-            lo[1] = *(const unsigned int*)&a_lo[r + 8][c0];
-            lo[2] = *(const unsigned int*)&a_lo[r][c0 + 8];
-            lo[3] = *(const unsigned int*)&a_lo[r + 8][c0 + 8];
-#pragma unroll
-            for (int nt = 0; nt < 4; nt++) {
-                tc_mma(acc[mt][nt], lo, b[nt][0], b[nt][1]);
-                tc_mma(acc[mt][nt], hi, b[nt][0], b[nt][1]);
-            }
+            unsigned int b0 = *(const unsigned int*)&b_t[col][2 * pair];
+            unsigned int b1 = *(const unsigned int*)&b_t[col][2 * pair + 8];
+            tc_mma(acc[mt][nt], lo, b0, b1);
+            tc_mma(acc[mt][nt], hi, b0, b1);
         }
     }
 }
