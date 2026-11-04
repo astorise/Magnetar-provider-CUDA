@@ -49,6 +49,21 @@ const MATMUL_SPLIT_K: u32 = 16;
 /// Rows a split-K launch covers in its grid's y dimension (CUDA's limit).
 const MATMUL_SPLIT_K_MAX_ROWS: u64 = 65_535;
 
+/// Rows of `a` one block of the multi-row split-K Kernels serves; must
+/// equal `MATMUL_ROWS` in `kernels.cu`.
+const MATMUL_ROWS: u64 = 8;
+
+/// The split-K function and grid height for `m` rows: one row per block
+/// for a decode step, MATMUL_ROWS per block otherwise (each weight is
+/// then read once per row group, with bit-identical results).
+fn split_k_rows(m: u64, single: &'static str, multi: &'static str) -> (&'static str, u32) {
+    if m > 1 {
+        (multi, m.div_ceil(MATMUL_ROWS) as u32)
+    } else {
+        (single, m as u32)
+    }
+}
+
 /// Threads per row of `rmsnorm_kernel`; must equal `RMSNORM_THREADS` in
 /// `kernels.cu`.
 const RMSNORM_THREADS: u32 = 256;
@@ -1416,7 +1431,12 @@ impl CudaKernels {
         let b_inner_stride = n;
         let (gate16, up16) = (self.bf16_address(gate), self.bf16_address(up));
         let mut out_dev = self.alloc_output((m * n) as usize)?;
-        let func = self.function("gated_matmul_split_k_kernel")?;
+        let (name, grid_rows) = split_k_rows(
+            m,
+            "gated_matmul_split_k_kernel",
+            "gated_matmul_split_k_rows_kernel",
+        );
+        let func = self.function(name)?;
         let mut args = self.stream.launch_builder(&func);
         args.arg(&a.slice)
             .arg(&gate.slice)
@@ -1431,7 +1451,7 @@ impl CudaKernels {
             .arg(&a_inner_stride)
             .arg(&b_inner_stride);
         let config = LaunchConfig {
-            grid_dim: (n.div_ceil(32) as u32, m as u32, 1),
+            grid_dim: (n.div_ceil(32) as u32, grid_rows, 1),
             block_dim: (32, MATMUL_SPLIT_K, 1),
             shared_mem_bytes: 0,
         };
@@ -1507,7 +1527,9 @@ impl CudaKernels {
         let b16 = self.bf16_address(b);
         let mut out_dev = self.alloc_output((m * n) as usize)?;
         if b_col_stride == 1 && m <= MATMUL_SPLIT_K_MAX_ROWS {
-            let func = self.function("matmul_split_k_kernel")?;
+            let (name, grid_rows) =
+                split_k_rows(m, "matmul_split_k_kernel", "matmul_split_k_rows_kernel");
+            let func = self.function(name)?;
             let mut args = self.stream.launch_builder(&func);
             args.arg(&a.slice)
                 .arg(&b.slice)
@@ -1527,7 +1549,7 @@ impl CudaKernels {
             };
             args.arg(&addend_buffer.slice).arg(&addend_mode).arg(&b16);
             let config = LaunchConfig {
-                grid_dim: (n.div_ceil(32) as u32, m as u32, 1),
+                grid_dim: (n.div_ceil(32) as u32, grid_rows, 1),
                 block_dim: (32, MATMUL_SPLIT_K, 1),
                 shared_mem_bytes: 0,
             };
