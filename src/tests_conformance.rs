@@ -668,6 +668,10 @@ fn multi_row_split_k_rows_are_bit_identical_to_single_row_matmuls() {
         (3, 37, 33),
         (9, 130, 70),
         (8, 64, 32),
+        // The tile Kernels: several 256-inner stages, a partial last stage,
+        // a partial last column tile and a partial last row group.
+        (64, 896, 256),
+        (130, 600, 200),
     ] {
         let a = HostTensor::new([m, k], bf16_exact_values((m * k) as usize, 1)).unwrap();
         let weight = HostTensor::new([k, n], bf16_exact_values((k * n) as usize, 2)).unwrap();
@@ -994,8 +998,13 @@ fn block_attention_matches_reference_cpu_on_decode_prefill_and_long_histories() 
         return;
     };
     // (seq_len, kv_seq_len, head_count, kv_head_count, head_dimension, window)
-    let cases: [(u64, u64, u64, u64, u64, Option<u64>); 4] = [
+    let cases: [(u64, u64, u64, u64, u64, Option<u64>); 9] = [
         (1, 300, 14, 2, 64, None),
+        (1, 1000, 14, 2, 64, Some(300)),
+        (130, 130, 14, 2, 64, None),
+        (300, 300, 14, 2, 64, Some(100)),
+        (40, 200, 4, 2, 16, None),
+        (70, 70, 2, 1, 128, Some(9)),
         (37, 37, 14, 2, 64, None),
         (23, 23, 4, 2, 8, Some(5)),
         (1, 12_500, 2, 1, 4, None),
@@ -1058,6 +1067,40 @@ fn block_attention_keeps_large_finite_values_finite() {
                 None,
                 None,
                 false,
+            )
+            .unwrap(),
+    );
+    for value in &actual.data {
+        assert!(
+            value.is_finite() && (value / 1e38 - 1.0).abs() < 1e-5,
+            "{value}"
+        );
+    }
+}
+
+/// The same for a prefill (the tiled Kernel): each query's running
+/// output is a weighted mean of V rows, never their weighted sum.
+#[test]
+fn tiled_prefill_attention_keeps_large_finite_values_finite() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let rows = 70u64;
+    let q = HostTensor::new([rows, 8], vec![0.0; 8 * rows as usize]).unwrap();
+    let k = HostTensor::new([rows, 8], vec![0.0; 8 * rows as usize]).unwrap();
+    let v = HostTensor::new([rows, 8], vec![1e38; 8 * rows as usize]).unwrap();
+    let actual = download(
+        &kernels,
+        &kernels
+            .attention(
+                &upload(&kernels, &q),
+                &upload(&kernels, &k),
+                &upload(&kernels, &v),
+                2,
+                4,
+                None,
+                None,
+                true,
             )
             .unwrap(),
     );
@@ -1351,6 +1394,82 @@ fn compact_bf16_weights_give_bit_identical_results() {
     assert!(!kernels.upload_weight(&inexact).unwrap().is_compact());
     let small = HostTensor::new([4, 4], bf16_exact_values(16, 3)).unwrap();
     assert!(!kernels.upload_weight(&small).unwrap().is_compact());
+}
+
+/// Device time of a Qwen2.5-0.5B layer's long-context work: each prefill
+/// matmul shape and the attention, at 512 and 4096 rows, plus a decode
+/// step's attention over that many keys. Not a conformance check: run it
+/// with `--ignored --nocapture` on a GPU.
+#[test]
+#[ignore = "GPU timing diagnostic"]
+fn long_context_kernel_times() {
+    // Minutes of Device work in a debug build, which runs ignored tests too.
+    if cfg!(debug_assertions) {
+        return;
+    }
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let context = kernels.stream().context().clone();
+    let timing = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
+    let time = |repeats: usize, run: &dyn Fn()| -> f32 {
+        run();
+        let start = context.new_event(timing).unwrap();
+        let end = context.new_event(timing).unwrap();
+        start.record(kernels.stream()).unwrap();
+        for _ in 0..repeats {
+            run();
+        }
+        end.record(kernels.stream()).unwrap();
+        start.elapsed_ms(&end).unwrap() / repeats as f32
+    };
+    let filled = |rows: u64, cols: u64, seed: u32| {
+        upload(
+            &kernels,
+            &HostTensor::new(
+                [rows, cols],
+                bf16_exact_values((rows * cols) as usize, seed),
+            )
+            .unwrap(),
+        )
+    };
+    for rows in [512u64, 4096] {
+        let repeats = if rows > 1024 { 2 } else { 5 };
+        for (k, n) in [
+            (896u64, 896u64),
+            (896, 128),
+            (896, 4864),
+            (4864, 896),
+            (896, 151_936),
+        ] {
+            let a = filled(rows, k, 3);
+            let weight = HostTensor::new([k, n], bf16_exact_values((k * n) as usize, 13)).unwrap();
+            let b = kernels.upload_weight(&weight).unwrap();
+            let ms = time(repeats, &|| {
+                kernels.matmul(&a, &b, false, false).unwrap();
+            });
+            let tflops = 2.0 * (rows * k * n) as f32 / ms / 1e9;
+            eprintln!(
+                "prefill matmul [{rows}, {k}] x [{k}, {n}]: {ms:.2} ms ({tflops:.2} TFLOP/s)"
+            );
+        }
+        let q = filled(rows, 896, 5);
+        let kv_k = filled(rows, 128, 7);
+        let kv_v = filled(rows, 128, 9);
+        let ms = time(repeats, &|| {
+            kernels
+                .attention(&q, &kv_k, &kv_v, 14, 64, Some(2), None, true)
+                .unwrap();
+        });
+        eprintln!("prefill attention, {rows} rows, 14 heads / 2 KV heads: {ms:.2} ms");
+        let q1 = filled(1, 896, 11);
+        let ms = time(20, &|| {
+            kernels
+                .attention(&q1, &kv_k, &kv_v, 14, 64, Some(2), None, false)
+                .unwrap();
+        });
+        eprintln!("decode attention over {rows} keys: {:.1} us", ms * 1e3);
+    }
 }
 
 /// Diagnostic, not a gate: the Device time of one decode-step matmul of

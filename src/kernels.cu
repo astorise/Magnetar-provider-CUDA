@@ -559,6 +559,183 @@ extern "C" __global__ void gated_matmul_split_k_rows_kernel(
     }
 }
 
+// Prefill matmul tiles: each thread computes MATMUL_ROWS rows times
+// MATMUL_TILE_COLUMNS columns (lane, lane + 32, ...) of one split-K slice,
+// so each weight it loads serves MATMUL_ROWS rows and each `a` value
+// MATMUL_TILE_COLUMNS columns. The block's `a` rows are staged through
+// shared memory MATMUL_TILE_INNER inners at a time (a multiple of
+// MATMUL_SPLIT_K, so every slice keeps its own inners). Each output's slice
+// sums still add inner ascending, and the slices are added in slice order,
+// so every output is bit-identical to `matmul_split_k_kernel`'s.
+#define MATMUL_TILE_COLUMNS 4
+#define MATMUL_TILE_INNER 256
+template <typename W>
+__device__ __forceinline__ void matmul_tile_sums(
+    const float* a_rows,
+    unsigned long long a_row_stride,
+    unsigned long long a_inner_stride,
+    unsigned int rows,
+    const W* b,
+    unsigned long long b_inner_stride,
+    unsigned long long first_col,
+    unsigned long long n,
+    unsigned int slice,
+    unsigned long long k,
+    float (*a_shared)[MATMUL_TILE_INNER],
+    float acc[MATMUL_ROWS][MATMUL_TILE_COLUMNS]
+) {
+    unsigned int tid = threadIdx.y * 32 + threadIdx.x;
+    unsigned int threads = 32 * MATMUL_SPLIT_K;
+#pragma unroll
+    for (int r = 0; r < MATMUL_ROWS; r++) {
+#pragma unroll
+        for (int c = 0; c < MATMUL_TILE_COLUMNS; c++) {
+            acc[r][c] = 0.0f;
+        }
+    }
+    for (unsigned long long base = 0; base < k; base += MATMUL_TILE_INNER) {
+        __syncthreads();
+        for (unsigned int e = tid; e < MATMUL_ROWS * MATMUL_TILE_INNER; e += threads) {
+            unsigned int r = e / MATMUL_TILE_INNER;
+            unsigned int i = e % MATMUL_TILE_INNER;
+            a_shared[r][i] = r < rows && base + i < k
+                ? a_rows[r * a_row_stride + (base + i) * a_inner_stride]
+                : 0.0f;
+        }
+        __syncthreads();
+        unsigned long long end = base + MATMUL_TILE_INNER < k ? base + MATMUL_TILE_INNER : k;
+        for (unsigned long long inner = base + slice; inner < end; inner += MATMUL_SPLIT_K) {
+            float w[MATMUL_TILE_COLUMNS];
+#pragma unroll
+            for (int c = 0; c < MATMUL_TILE_COLUMNS; c++) {
+                unsigned long long col = first_col + c * 32;
+                w[c] = col < n ? matmul_weight(b, inner * b_inner_stride + col) : 0.0f;
+            }
+#pragma unroll
+            for (int r = 0; r < MATMUL_ROWS; r++) {
+                float a_value = a_shared[r][inner - base];
+#pragma unroll
+                for (int c = 0; c < MATMUL_TILE_COLUMNS; c++) {
+                    acc[r][c] += a_value * w[c];
+                }
+            }
+        }
+    }
+}
+
+extern "C" __global__ void matmul_split_k_tile_kernel(
+    const float* a,
+    const float* b,
+    float* out,
+    unsigned long long m,
+    unsigned long long k,
+    unsigned long long n,
+    unsigned long long a_row_stride,
+    unsigned long long a_inner_stride,
+    unsigned long long b_inner_stride,
+    const float* addend,
+    int addend_mode,
+    const unsigned short* b16
+) {
+    __shared__ float a_shared[MATMUL_ROWS][MATMUL_TILE_INNER];
+    __shared__ float partial[MATMUL_ROWS][MATMUL_SPLIT_K][32];
+    unsigned long long first_row = (unsigned long long)blockIdx.y * MATMUL_ROWS;
+    unsigned int rows = (unsigned int)min((unsigned long long)MATMUL_ROWS, m - first_row);
+    unsigned long long first_col = (unsigned long long)blockIdx.x * 32 * MATMUL_TILE_COLUMNS + threadIdx.x;
+    unsigned int slice = threadIdx.y;
+    float acc[MATMUL_ROWS][MATMUL_TILE_COLUMNS];
+    const float* a_rows = a + first_row * a_row_stride;
+    if (b16) {
+        matmul_tile_sums(a_rows, a_row_stride, a_inner_stride, rows, b16, b_inner_stride, first_col, n, slice, k, a_shared, acc);
+    } else {
+        matmul_tile_sums(a_rows, a_row_stride, a_inner_stride, rows, b, b_inner_stride, first_col, n, slice, k, a_shared, acc);
+    }
+#pragma unroll
+    for (int c = 0; c < MATMUL_TILE_COLUMNS; c++) {
+        __syncthreads();
+#pragma unroll
+        for (int r = 0; r < MATMUL_ROWS; r++) {
+            partial[r][slice][threadIdx.x] = acc[r][c];
+        }
+        __syncthreads();
+        unsigned long long col = first_col + c * 32;
+        if (slice < rows && col < n) {
+            unsigned long long row = first_row + slice;
+            float sum = 0.0f;
+            for (unsigned int s = 0; s < MATMUL_SPLIT_K; s++) {
+                sum += partial[slice][s][threadIdx.x];
+            }
+            if (addend_mode == 1) {
+                sum += addend[col];
+            } else if (addend_mode == 2) {
+                sum += addend[row * n + col];
+            }
+            out[row * n + col] = sum;
+        }
+    }
+}
+
+// `gated_matmul_split_k_rows_kernel` in tiles, bit-identical to it.
+extern "C" __global__ void gated_matmul_split_k_tile_kernel(
+    const float* a,
+    const float* gate,
+    const unsigned short* gate16,
+    const float* up,
+    const unsigned short* up16,
+    float* out,
+    unsigned long long m,
+    unsigned long long k,
+    unsigned long long n,
+    unsigned long long a_row_stride,
+    unsigned long long a_inner_stride,
+    unsigned long long b_inner_stride
+) {
+    __shared__ float a_shared[MATMUL_ROWS][MATMUL_TILE_INNER];
+    __shared__ float gate_partial[MATMUL_ROWS][MATMUL_SPLIT_K][32];
+    __shared__ float up_partial[MATMUL_ROWS][MATMUL_SPLIT_K][32];
+    unsigned long long first_row = (unsigned long long)blockIdx.y * MATMUL_ROWS;
+    unsigned int rows = (unsigned int)min((unsigned long long)MATMUL_ROWS, m - first_row);
+    unsigned long long first_col = (unsigned long long)blockIdx.x * 32 * MATMUL_TILE_COLUMNS + threadIdx.x;
+    unsigned int slice = threadIdx.y;
+    float gate_acc[MATMUL_ROWS][MATMUL_TILE_COLUMNS];
+    float up_acc[MATMUL_ROWS][MATMUL_TILE_COLUMNS];
+    const float* a_rows = a + first_row * a_row_stride;
+    if (gate16) {
+        matmul_tile_sums(a_rows, a_row_stride, a_inner_stride, rows, gate16, b_inner_stride, first_col, n, slice, k, a_shared, gate_acc);
+    } else {
+        matmul_tile_sums(a_rows, a_row_stride, a_inner_stride, rows, gate, b_inner_stride, first_col, n, slice, k, a_shared, gate_acc);
+    }
+    if (up16) {
+        matmul_tile_sums(a_rows, a_row_stride, a_inner_stride, rows, up16, b_inner_stride, first_col, n, slice, k, a_shared, up_acc);
+    } else {
+        matmul_tile_sums(a_rows, a_row_stride, a_inner_stride, rows, up, b_inner_stride, first_col, n, slice, k, a_shared, up_acc);
+    }
+#pragma unroll
+    for (int c = 0; c < MATMUL_TILE_COLUMNS; c++) {
+        __syncthreads();
+#pragma unroll
+        for (int r = 0; r < MATMUL_ROWS; r++) {
+            gate_partial[r][slice][threadIdx.x] = gate_acc[r][c];
+            up_partial[r][slice][threadIdx.x] = up_acc[r][c];
+        }
+        __syncthreads();
+        unsigned long long col = first_col + c * 32;
+        if (slice < rows && col < n) {
+            unsigned long long row = first_row + slice;
+            float gate_sum = 0.0f;
+            float up_sum = 0.0f;
+            for (unsigned int s = 0; s < MATMUL_SPLIT_K; s++) {
+                gate_sum += gate_partial[slice][s][threadIdx.x];
+            }
+            for (unsigned int s = 0; s < MATMUL_SPLIT_K; s++) {
+                up_sum += up_partial[slice][s][threadIdx.x];
+            }
+            float activated = gate_sum * (1.0f / (1.0f + expf(-gate_sum)));
+            out[row * n + col] = activated * up_sum;
+        }
+    }
+}
+
 // `silu(a x gate) * (a x up)` for the Runtime's fused `gated-matmul`: the
 // split-K matmul's sums for both weights, in its order, then
 // `silu_mul_kernel`'s arithmetic, so the result is bit-identical to two
@@ -879,6 +1056,320 @@ extern "C" __global__ void attention_block_kernel(
             acc += scores[j] * v[(key_lower + j) * kv_model_dim + kv_offset + d];
         }
         out_row[d] = acc;
+    }
+}
+
+// Prefill attention, tiled: block (query tile, head) serves
+// ATTENTION_TILE_QUERIES queries of one head with 4 threads each (thread
+// `part` of a query owns head dimensions part, part + 4, ...). K and V rows
+// are staged through shared memory one tile of `key_tile` keys at a time,
+// and each query keeps a running max, sum and weighted mean of V (online
+// softmax, the mean never leaving the V rows' range), so
+// every K/V tile is read once per query tile instead of once per query.
+// A query's 4 partial dot products are added with a fixed butterfly, and
+// its keys are visited in order, so the result is deterministic.
+// head_dimension must be a multiple of 4 and at most 4 * ATTENTION_MAX_PART_DIMS.
+#define ATTENTION_TILE_QUERIES 32
+#define ATTENTION_MAX_PART_DIMS 32
+extern "C" __global__ void attention_tiled_kernel(
+    const float* q,
+    const float* k,
+    const float* v,
+    float* out,
+    unsigned long long seq_len,
+    unsigned long long kv_seq_len,
+    unsigned long long head_count,
+    unsigned long long kv_head_count,
+    unsigned long long head_dimension,
+    unsigned long long q_model_dim,
+    unsigned long long kv_model_dim,
+    int causal,
+    long long window_size, // -1 means "no window"
+    unsigned long long query_position_offset,
+    unsigned long long key_tile
+) {
+    extern __shared__ float tiles[];
+    float* k_tile = tiles;
+    float* v_tile = tiles + key_tile * head_dimension;
+    unsigned int tid = threadIdx.x;
+    unsigned int part = tid & 3;
+    unsigned long long head = blockIdx.y;
+    unsigned long long tile_first = (unsigned long long)blockIdx.x * ATTENTION_TILE_QUERIES;
+    unsigned long long query_index = tile_first + (tid >> 2);
+    bool active = query_index < seq_len;
+    unsigned long long group_size = head_count / kv_head_count;
+    unsigned long long q_offset = head * head_dimension;
+    unsigned long long kv_offset = (head / group_size) * head_dimension;
+    unsigned long long part_dims = head_dimension / 4;
+    float scale = 1.0f / sqrtf((float)head_dimension);
+
+    // The keys any query of this tile admits, and this query's own.
+    unsigned long long last_query = tile_first + ATTENTION_TILE_QUERIES - 1;
+    if (last_query >= seq_len) {
+        last_query = seq_len - 1;
+    }
+    unsigned long long tile_upper = causal ? (query_position_offset + last_query + 1) : kv_seq_len;
+    unsigned long long tile_lower = 0;
+    unsigned long long key_upper = 0;
+    unsigned long long key_lower = 0;
+    unsigned long long query_position = query_position_offset + (active ? query_index : last_query);
+    key_upper = causal ? (query_position + 1) : kv_seq_len;
+    if (window_size >= 0) {
+        unsigned long long window = (unsigned long long)window_size;
+        unsigned long long back = window > 0 ? window - 1 : 0;
+        key_lower = query_position > back ? query_position - back : 0;
+        if (key_lower > key_upper) {
+            key_lower = key_upper;
+        }
+        unsigned long long first_position = query_position_offset + tile_first;
+        tile_lower = first_position > back ? first_position - back : 0;
+    }
+
+    float q_part[ATTENTION_MAX_PART_DIMS];
+    float acc[ATTENTION_MAX_PART_DIMS];
+    for (unsigned long long i = 0; i < part_dims; i++) {
+        q_part[i] = active ? q[query_index * q_model_dim + q_offset + part + 4 * i] : 0.0f;
+        acc[i] = 0.0f;
+    }
+    float max_value = neg_inf();
+    float sum = 0.0f;
+
+    for (unsigned long long tile = tile_lower; tile < tile_upper; tile += key_tile) {
+        unsigned long long tile_keys = tile_upper - tile < key_tile ? tile_upper - tile : key_tile;
+        __syncthreads();
+        for (unsigned long long e = tid; e < tile_keys * head_dimension; e += blockDim.x) {
+            unsigned long long row = e / head_dimension;
+            unsigned long long d = e % head_dimension;
+            k_tile[e] = k[(tile + row) * kv_model_dim + kv_offset + d];
+            v_tile[e] = v[(tile + row) * kv_model_dim + kv_offset + d];
+        }
+        __syncthreads();
+        for (unsigned long long j = 0; j < tile_keys; j++) {
+            const float* k_row = k_tile + j * head_dimension;
+            float dot = 0.0f;
+            for (unsigned long long i = 0; i < part_dims; i++) {
+                dot += q_part[i] * k_row[part + 4 * i];
+            }
+            dot += __shfl_xor_sync(0xffffffffu, dot, 1);
+            dot += __shfl_xor_sync(0xffffffffu, dot, 2);
+            unsigned long long key = tile + j;
+            if (!active || key < key_lower || key >= key_upper) {
+                continue;
+            }
+            float score = dot * scale;
+            // `acc` is the weighted mean of the V rows seen so far (not
+            // their weighted sum), so it stays within their range and
+            // large finite values cannot overflow.
+            float kept = sum;
+            if (score > max_value) {
+                kept = sum * expf(max_value - score);
+                max_value = score;
+            }
+            float weight = expf(score - max_value);
+            sum = kept + weight;
+            float keep = kept / sum;
+            float take = weight / sum;
+            const float* v_row = v_tile + j * head_dimension;
+            for (unsigned long long i = 0; i < part_dims; i++) {
+                acc[i] = acc[i] * keep + v_row[part + 4 * i] * take;
+            }
+        }
+    }
+    if (active) {
+        // No key admitted (an empty window) leaves the output zero.
+        for (unsigned long long i = 0; i < part_dims; i++) {
+            out[query_index * q_model_dim + q_offset + part + 4 * i] = sum > 0.0f ? acc[i] : 0.0f;
+        }
+    }
+}
+
+// Split-key attention for one query row (a decode step). The keys a query
+// admits are cut into chunks of ATTENTION_CHUNK_KEYS from its first admitted
+// key; block (chunk, head) computes that chunk's softmax max, its sum of
+// exponentials and its normalized weighted sum of V into `partial`
+// (head_dimension + 2 floats per (head, chunk)). A chunk past the admitted
+// keys writes an empty partial. `attention_combine_kernel` then merges the
+// chunks of each head in chunk order, so the result does not depend on
+// block scheduling. Each warp scores one key at a time, its lanes reading
+// consecutive elements of the K row and adding their products with a
+// fixed butterfly.
+#define ATTENTION_CHUNK_KEYS 128
+#define ATTENTION_SPLIT_THREADS 128
+extern "C" __global__ void attention_split_kernel(
+    const float* q,
+    const float* k,
+    const float* v,
+    float* partial,
+    unsigned long long kv_seq_len,
+    unsigned long long head_count,
+    unsigned long long kv_head_count,
+    unsigned long long head_dimension,
+    unsigned long long q_model_dim,
+    unsigned long long kv_model_dim,
+    int causal,
+    long long window_size, // -1 means "no window"
+    unsigned long long query_position_offset,
+    unsigned long long chunks,
+    const unsigned long long* step_offset
+) {
+    __shared__ float scores[ATTENTION_CHUNK_KEYS];
+    __shared__ float reduce[ATTENTION_SPLIT_THREADS];
+    extern __shared__ float q_shared[];
+    if (step_offset) {
+        kv_seq_len += *step_offset;
+        query_position_offset += *step_offset;
+    }
+    unsigned long long chunk = blockIdx.x;
+    unsigned long long head = blockIdx.y;
+    unsigned int tid = threadIdx.x;
+    unsigned int lane = tid & 31;
+    unsigned int warp = tid >> 5;
+    unsigned long long group_size = head_count / kv_head_count;
+    unsigned long long kv_offset = (head / group_size) * head_dimension;
+    float scale = 1.0f / sqrtf((float)head_dimension);
+
+    unsigned long long query_position = query_position_offset;
+    unsigned long long key_upper = causal ? (query_position + 1) : kv_seq_len;
+    unsigned long long key_lower = 0;
+    if (window_size >= 0) {
+        unsigned long long window = (unsigned long long)window_size;
+        unsigned long long back = window > 0 ? window - 1 : 0;
+        key_lower = query_position > back ? query_position - back : 0;
+        if (key_lower > key_upper) {
+            key_lower = key_upper;
+        }
+    }
+    unsigned long long first = key_lower + chunk * ATTENTION_CHUNK_KEYS;
+    unsigned long long last = first + ATTENTION_CHUNK_KEYS;
+    if (last > key_upper) {
+        last = key_upper;
+    }
+    float* out = partial + (head * chunks + chunk) * (head_dimension + 2);
+    if (first >= last) {
+        for (unsigned long long d = tid; d < head_dimension; d += ATTENTION_SPLIT_THREADS) {
+            out[d] = 0.0f;
+        }
+        if (tid == 0) {
+            out[head_dimension] = neg_inf();
+            out[head_dimension + 1] = 0.0f;
+        }
+        return;
+    }
+    unsigned long long count = last - first;
+
+    const float* q_row = q + head * head_dimension;
+    for (unsigned long long d = tid; d < head_dimension; d += ATTENTION_SPLIT_THREADS) {
+        q_shared[d] = q_row[d];
+    }
+    __syncthreads();
+
+    for (unsigned long long j = warp; j < count; j += ATTENTION_SPLIT_THREADS / 32) {
+        const float* k_row = k + (first + j) * kv_model_dim + kv_offset;
+        float dot = 0.0f;
+        for (unsigned long long d = lane; d < head_dimension; d += 32) {
+            dot += q_shared[d] * k_row[d];
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            dot += __shfl_xor_sync(0xffffffffu, dot, offset);
+        }
+        if (lane == 0) {
+            scores[j] = dot * scale;
+        }
+    }
+    __syncthreads();
+
+    float local_max = neg_inf();
+    for (unsigned long long j = tid; j < count; j += ATTENTION_SPLIT_THREADS) {
+        local_max = fmaxf(local_max, scores[j]);
+    }
+    reduce[tid] = local_max;
+    __syncthreads();
+    for (unsigned int stride = ATTENTION_SPLIT_THREADS / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            reduce[tid] = fmaxf(reduce[tid], reduce[tid + stride]);
+        }
+        __syncthreads();
+    }
+    float max_value = reduce[0];
+    __syncthreads();
+
+    float local_sum = 0.0f;
+    for (unsigned long long j = tid; j < count; j += ATTENTION_SPLIT_THREADS) {
+        float weight = expf(scores[j] - max_value);
+        scores[j] = weight;
+        local_sum += weight;
+    }
+    reduce[tid] = local_sum;
+    __syncthreads();
+    for (unsigned int stride = ATTENTION_SPLIT_THREADS / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            reduce[tid] += reduce[tid + stride];
+        }
+        __syncthreads();
+    }
+    float sum = reduce[0];
+    // Weights normalized before they weight V, as `attention_block_kernel`:
+    // a chunk's output is then a weighted mean of V rows, which cannot
+    // overflow where the result is representable.
+    for (unsigned long long j = tid; j < count; j += ATTENTION_SPLIT_THREADS) {
+        scores[j] = scores[j] / sum;
+    }
+    __syncthreads();
+
+    for (unsigned long long d = tid; d < head_dimension; d += ATTENTION_SPLIT_THREADS) {
+        float acc = 0.0f;
+        for (unsigned long long j = 0; j < count; j++) {
+            acc += scores[j] * v[(first + j) * kv_model_dim + kv_offset + d];
+        }
+        out[d] = acc;
+    }
+    if (tid == 0) {
+        out[head_dimension] = max_value;
+        out[head_dimension + 1] = sum;
+    }
+}
+
+// Merges each head's chunks from `attention_split_kernel`, in chunk order:
+// out = sum_c o_c * (s_c * exp(m_c - M) / sum_c' s_c' * exp(m_c' - M)), with M the
+// largest chunk max. Empty chunks are skipped; a head with no admitted key
+// gets zeros.
+extern "C" __global__ void attention_combine_kernel(
+    const float* partial,
+    float* out,
+    unsigned long long head_count,
+    unsigned long long head_dimension,
+    unsigned long long chunks
+) {
+    unsigned long long head = blockIdx.x;
+    if (head >= head_count) {
+        return;
+    }
+    const float* head_partial = partial + head * chunks * (head_dimension + 2);
+    float max_value = neg_inf();
+    for (unsigned long long c = 0; c < chunks; c++) {
+        const float* p = head_partial + c * (head_dimension + 2);
+        if (p[head_dimension + 1] > 0.0f) {
+            max_value = fmaxf(max_value, p[head_dimension]);
+        }
+    }
+    float total = 0.0f;
+    for (unsigned long long c = 0; c < chunks; c++) {
+        const float* p = head_partial + c * (head_dimension + 2);
+        if (p[head_dimension + 1] > 0.0f) {
+            total += p[head_dimension + 1] * expf(p[head_dimension] - max_value);
+        }
+    }
+    for (unsigned long long d = threadIdx.x; d < head_dimension; d += blockDim.x) {
+        float acc = 0.0f;
+        for (unsigned long long c = 0; c < chunks; c++) {
+            const float* p = head_partial + c * (head_dimension + 2);
+            if (p[head_dimension + 1] > 0.0f) {
+                // Each chunk's share of the softmax mass, at most 1: the
+                // sum stays a weighted mean of V rows.
+                acc += p[d] * (p[head_dimension + 1] * expf(p[head_dimension] - max_value) / total);
+            }
+        }
+        out[head * head_dimension + d] = acc;
     }
 }
 

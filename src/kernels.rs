@@ -53,14 +53,40 @@ const MATMUL_SPLIT_K_MAX_ROWS: u64 = 65_535;
 /// equal `MATMUL_ROWS` in `kernels.cu`.
 const MATMUL_ROWS: u64 = 8;
 
-/// The split-K function and grid height for `m` rows: one row per block
-/// for a decode step, MATMUL_ROWS per block otherwise (each weight is
-/// then read once per row group, with bit-identical results).
-fn split_k_rows(m: u64, single: &'static str, multi: &'static str) -> (&'static str, u32) {
-    if m > 1 {
-        (multi, m.div_ceil(MATMUL_ROWS) as u32)
+/// Rows from which a multi-row matmul uses the tile Kernels: enough row
+/// groups to occupy the Device with 128-column blocks.
+const MATMUL_TILE_MIN_ROWS: u64 = 64;
+
+/// Columns of one tile-Kernel block: `32 * MATMUL_TILE_COLUMNS` in
+/// `kernels.cu`.
+const MATMUL_TILE_BLOCK_COLUMNS: u64 = 128;
+
+/// The split-K function and grid for `m` rows of `n` columns: one row per
+/// block for a decode step, MATMUL_ROWS per block otherwise (each weight
+/// is then read once per row group), and MATMUL_ROWS by 128 columns per
+/// block for a long prefill (each weight load serves 8 rows and each `a`
+/// value 4 columns). All are bit-identical row by row.
+fn split_k_rows(
+    m: u64,
+    n: u64,
+    [single, multi, tile]: [&'static str; 3],
+) -> (&'static str, (u32, u32, u32)) {
+    if m >= MATMUL_TILE_MIN_ROWS {
+        (
+            tile,
+            (
+                n.div_ceil(MATMUL_TILE_BLOCK_COLUMNS) as u32,
+                m.div_ceil(MATMUL_ROWS) as u32,
+                1,
+            ),
+        )
+    } else if m > 1 {
+        (
+            multi,
+            (n.div_ceil(32) as u32, m.div_ceil(MATMUL_ROWS) as u32, 1),
+        )
     } else {
-        (single, m as u32)
+        (single, (n.div_ceil(32) as u32, m as u32, 1))
     }
 }
 
@@ -71,6 +97,15 @@ const RMSNORM_THREADS: u32 = 256;
 /// Threads per (head, query) of `attention_block_kernel`; must equal
 /// `ATTENTION_THREADS` in `kernels.cu`.
 const ATTENTION_THREADS: u32 = 128;
+/// `ATTENTION_CHUNK_KEYS` in `kernels.cu`: keys per split-attention block.
+const ATTENTION_CHUNK_KEYS: u64 = 128;
+/// `ATTENTION_SPLIT_THREADS` in `kernels.cu`.
+const ATTENTION_SPLIT_THREADS: u32 = 128;
+/// `ATTENTION_TILE_QUERIES` in `kernels.cu`: queries per tiled-attention
+/// block, 4 threads each.
+const ATTENTION_TILE_QUERIES: u64 = 32;
+/// `ATTENTION_MAX_PART_DIMS` in `kernels.cu`: head dimensions per thread.
+const ATTENTION_MAX_PART_DIMS: u64 = 32;
 
 /// Dynamic shared memory `attention_block_kernel` may use without opting a
 /// function into more (the CUDA default limit per block).
@@ -231,7 +266,14 @@ pub struct CudaKernels {
     capture: std::sync::Mutex<Option<KernelCapture>>,
     /// The embedding lookup's invalid-id flag, allocated once.
     embedding_flag: std::sync::Mutex<Option<CudaSlice<i32>>>,
+    /// The split-key attention's per-chunk partials: the current buffer,
+    /// then every buffer it outgrew. A captured step may still read an
+    /// outgrown one, so none is freed before this Provider.
+    attention_scratch: std::sync::Mutex<AttentionScratch>,
 }
+
+/// The current split-attention scratch buffer and the ones it outgrew.
+type AttentionScratch = (Option<CudaSlice<f32>>, Vec<CudaSlice<f32>>);
 
 /// A step capture in progress: what the captured launches need, and what
 /// a replay must check.
@@ -318,6 +360,7 @@ impl CudaKernels {
             offered_output: std::sync::Mutex::new(None),
             capture: std::sync::Mutex::new(None),
             embedding_flag: std::sync::Mutex::new(None),
+            attention_scratch: std::sync::Mutex::new((None, Vec::new())),
         })
     }
 
@@ -1479,10 +1522,14 @@ impl CudaKernels {
         let b_inner_stride = n;
         let (gate16, up16) = (self.bf16_address(gate), self.bf16_address(up));
         let mut out_dev = self.alloc_output((m * n) as usize)?;
-        let (name, grid_rows) = split_k_rows(
+        let (name, grid_dim) = split_k_rows(
             m,
-            "gated_matmul_split_k_kernel",
-            "gated_matmul_split_k_rows_kernel",
+            n,
+            [
+                "gated_matmul_split_k_kernel",
+                "gated_matmul_split_k_rows_kernel",
+                "gated_matmul_split_k_tile_kernel",
+            ],
         );
         let func = self.function(name)?;
         let mut args = self.stream.launch_builder(&func);
@@ -1499,7 +1546,7 @@ impl CudaKernels {
             .arg(&a_inner_stride)
             .arg(&b_inner_stride);
         let config = LaunchConfig {
-            grid_dim: (n.div_ceil(32) as u32, grid_rows, 1),
+            grid_dim,
             block_dim: (32, MATMUL_SPLIT_K, 1),
             shared_mem_bytes: 0,
         };
@@ -1575,8 +1622,15 @@ impl CudaKernels {
         let b16 = self.bf16_address(b);
         let mut out_dev = self.alloc_output((m * n) as usize)?;
         if b_col_stride == 1 && m <= MATMUL_SPLIT_K_MAX_ROWS {
-            let (name, grid_rows) =
-                split_k_rows(m, "matmul_split_k_kernel", "matmul_split_k_rows_kernel");
+            let (name, grid_dim) = split_k_rows(
+                m,
+                n,
+                [
+                    "matmul_split_k_kernel",
+                    "matmul_split_k_rows_kernel",
+                    "matmul_split_k_tile_kernel",
+                ],
+            );
             let func = self.function(name)?;
             let mut args = self.stream.launch_builder(&func);
             args.arg(&a.slice)
@@ -1597,7 +1651,7 @@ impl CudaKernels {
             };
             args.arg(&addend_buffer.slice).arg(&addend_mode).arg(&b16);
             let config = LaunchConfig {
-                grid_dim: (n.div_ceil(32) as u32, grid_rows, 1),
+                grid_dim,
                 block_dim: (32, MATMUL_SPLIT_K, 1),
                 shared_mem_bytes: 0,
             };
@@ -1742,6 +1796,84 @@ impl CudaKernels {
         let causal_flag: i32 = if causal { 1 } else { 0 };
         let window_arg: i64 = window_size.map(|w| w as i64).unwrap_or(-1);
 
+        if seq_len == 1 {
+            let step_offset = match key_count {
+                Some(_) => self.advancing_offset("key_count", kv_rows - kv_seq_len),
+                None => 0,
+            };
+            return self.attention_split(
+                q,
+                k,
+                v,
+                [
+                    kv_seq_len,
+                    head_count,
+                    kv_head_count,
+                    head_dimension,
+                    q_model_dim,
+                    kv_model_dim,
+                    query_position_offset,
+                    // Every key a replay may admit has a chunk, so a
+                    // captured launch covers every later step.
+                    kv_rows,
+                ],
+                causal_flag,
+                window_arg,
+                step_offset,
+            );
+        }
+
+        // Several query rows (a prefill), outside a capture: the tiled
+        // Kernel, when the head dimension fits its per-thread registers.
+        if seq_len > 1
+            && !self.is_capturing()
+            && head_dimension.is_multiple_of(4)
+            && head_dimension <= 4 * ATTENTION_MAX_PART_DIMS
+        {
+            let overflow = || {
+                CudaError::new(
+                    CudaErrorCode::ShapeUnsupported,
+                    "attention launch size overflows a grid dimension",
+                )
+            };
+            let key_tile: u64 = if head_dimension <= 64 { 64 } else { 32 };
+            let mut out_dev = self.alloc_output(q.slice.len())?;
+            let func = self.function("attention_tiled_kernel")?;
+            let mut args = self.stream.launch_builder(&func);
+            args.arg(&q.slice)
+                .arg(&k.slice)
+                .arg(&v.slice)
+                .arg(&mut out_dev)
+                .arg(&seq_len)
+                .arg(&kv_seq_len)
+                .arg(&head_count)
+                .arg(&kv_head_count)
+                .arg(&head_dimension)
+                .arg(&q_model_dim)
+                .arg(&kv_model_dim)
+                .arg(&causal_flag)
+                .arg(&window_arg)
+                .arg(&query_position_offset)
+                .arg(&key_tile);
+            let config = LaunchConfig {
+                grid_dim: (
+                    u32::try_from(seq_len.div_ceil(ATTENTION_TILE_QUERIES))
+                        .map_err(|_| overflow())?,
+                    u32::try_from(head_count).map_err(|_| overflow())?,
+                    1,
+                ),
+                block_dim: (4 * ATTENTION_TILE_QUERIES as u32, 1, 1),
+                shared_mem_bytes: u32::try_from(2 * key_tile * head_dimension * 4)
+                    .map_err(|_| overflow())?,
+            };
+            unsafe { args.launch(config) }?;
+            return Ok(CudaDeviceBuffer {
+                slice: out_dev,
+                shape: q.shape.clone(),
+                bf16: None,
+            });
+        }
+
         // `attention_block_kernel` keeps q, its reduction slots and every
         // score of one (head, query) in shared memory; longer histories
         // than that fits use the one-thread-per-(head, query) kernel.
@@ -1818,6 +1950,111 @@ impl CudaKernels {
             .arg(&window_arg)
             .arg(&query_position_offset);
         unsafe { args.launch(LaunchConfig::for_num_elems((head_count * seq_len) as u32)) }?;
+        Ok(CudaDeviceBuffer {
+            slice: out_dev,
+            shape: q.shape.clone(),
+            bf16: None,
+        })
+    }
+}
+
+impl CudaKernels {
+    /// One query row's attention (a decode step), its keys split into
+    /// chunks of [`ATTENTION_CHUNK_KEYS`] scored by separate blocks, then
+    /// merged in chunk order (`attention_split_kernel`,
+    /// `attention_combine_kernel` in `kernels.cu`). `dims` is the key
+    /// count, head count, KV head count, head dimension, q and k/v row
+    /// widths, query position and the K/V row count.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_split(
+        &self,
+        q: &CudaDeviceBuffer,
+        k: &CudaDeviceBuffer,
+        v: &CudaDeviceBuffer,
+        dims: [u64; 8],
+        causal_flag: i32,
+        window_arg: i64,
+        step_offset: u64,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        let [
+            kv_seq_len,
+            head_count,
+            kv_head_count,
+            head_dimension,
+            q_model_dim,
+            kv_model_dim,
+            query_position_offset,
+            kv_rows,
+        ] = dims;
+        let overflow = || {
+            CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                "attention launch size overflows a grid dimension",
+            )
+        };
+        let chunks = kv_rows.div_ceil(ATTENTION_CHUNK_KEYS).max(1);
+        let partial_len =
+            usize::try_from(head_count * chunks * (head_dimension + 2)).map_err(|_| overflow())?;
+        let mut scratch = self.attention_scratch.lock().unwrap();
+        if scratch
+            .0
+            .as_ref()
+            .is_none_or(|slice| slice.len() < partial_len)
+        {
+            self.forbid_in_capture("growing the attention scratch buffer")?;
+            // SAFETY: the split Kernel writes every partial of this launch
+            // before the combine Kernel reads it, on this same stream.
+            let grown = unsafe { self.stream.alloc::<f32>(partial_len.max(1 << 16)) }?;
+            if let Some(outgrown) = scratch.0.replace(grown) {
+                scratch.1.push(outgrown);
+            }
+        }
+        let partial = scratch.0.as_mut().expect("allocated above");
+        let mut out_dev = self.alloc_output(q.slice.len())?;
+        let split = self.function("attention_split_kernel")?;
+        let mut args = self.stream.launch_builder(&split);
+        args.arg(&q.slice)
+            .arg(&k.slice)
+            .arg(&v.slice)
+            .arg(&mut *partial)
+            .arg(&kv_seq_len)
+            .arg(&head_count)
+            .arg(&kv_head_count)
+            .arg(&head_dimension)
+            .arg(&q_model_dim)
+            .arg(&kv_model_dim)
+            .arg(&causal_flag)
+            .arg(&window_arg)
+            .arg(&query_position_offset)
+            .arg(&chunks)
+            .arg(&step_offset);
+        let config = LaunchConfig {
+            grid_dim: (
+                u32::try_from(chunks).map_err(|_| overflow())?,
+                u32::try_from(head_count).map_err(|_| overflow())?,
+                1,
+            ),
+            block_dim: (ATTENTION_SPLIT_THREADS, 1, 1),
+            shared_mem_bytes: u32::try_from(head_dimension * 4).map_err(|_| overflow())?,
+        };
+        unsafe { args.launch(config) }?;
+        let combine = self.function("attention_combine_kernel")?;
+        let mut args = self.stream.launch_builder(&combine);
+        args.arg(&*partial)
+            .arg(&mut out_dev)
+            .arg(&head_count)
+            .arg(&head_dimension)
+            .arg(&chunks);
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(head_count).map_err(|_| overflow())?, 1, 1),
+            block_dim: (
+                u32::try_from(head_dimension.min(1024)).map_err(|_| overflow())?,
+                1,
+                1,
+            ),
+            shared_mem_bytes: 0,
+        };
+        unsafe { args.launch(config) }?;
         Ok(CudaDeviceBuffer {
             slice: out_dev,
             shape: q.shape.clone(),
