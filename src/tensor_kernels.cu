@@ -298,7 +298,7 @@ __device__ __forceinline__ void tca_keys_of(
 //
 // `a` is first split, once per matmul, into its bfloat16 hi and lo terms
 // (`tc_split_kernel`), so no block converts it again. Tiles of TCP_BLOCK_M x
-// 64 or 128 outputs (8 warps) then stream TCP_BLOCK_K inners at
+// TCP_BLOCK_N outputs (8 warps of 32 x 32) then stream TCP_BLOCK_K inners at
 // a time through two shared-memory stages filled by `cp.async`, so the next
 // stage loads while this one computes. Fragments are read with `ldmatrix`
 // (the weight with `.trans`, from its natural [k][n] layout). The products
@@ -306,8 +306,10 @@ __device__ __forceinline__ void tca_keys_of(
 // Requires k and n to be multiples of 8 (16-byte rows) and a contiguous `a`.
 
 #define TCP_BLOCK_M 128
+#define TCP_BLOCK_N 64
 #define TCP_BLOCK_K 16
 #define TCP_A_PITCH (TCP_BLOCK_K + 8)
+#define TCP_B_PITCH (TCP_BLOCK_N + 8)
 #define TCP_THREADS 256
 
 extern "C" __global__ void tc_split_kernel(
@@ -364,17 +366,13 @@ __device__ __forceinline__ void tcp_ldmatrix_x4_trans(unsigned int r[4], const v
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(tcp_smem(pointer)));
 }
 
-// Weight stage pitch for a BN-column tile: 16-byte aligned rows whose
-// 8-row `ldmatrix` reads fall on distinct banks.
-#define TCP_B_PITCH_OF(BN) ((BN) + 8)
-
-template <int NB, int BN>
+template <int NB>
 __device__ __forceinline__ void tcp_load_stage(
     const unsigned short* a_hi, const unsigned short* a_lo, const unsigned short* const* b16,
     unsigned long long m, unsigned long long k, unsigned long long n,
     unsigned long long m0, unsigned long long n0, unsigned long long k0,
     unsigned short (*s_hi)[TCP_A_PITCH], unsigned short (*s_lo)[TCP_A_PITCH],
-    unsigned short (*s_b)[TCP_BLOCK_K][TCP_B_PITCH_OF(BN)]
+    unsigned short (*s_b)[TCP_BLOCK_K][TCP_B_PITCH]
 ) {
     unsigned int tid = threadIdx.x;
     // `a`: TCP_BLOCK_M rows of TCP_BLOCK_K inners, two 16-byte chunks per row.
@@ -386,12 +384,12 @@ __device__ __forceinline__ void tcp_load_stage(
         tcp_copy16(&s_hi[r][col], a_hi + offset, valid);
         tcp_copy16(&s_lo[r][col], a_lo + offset, valid);
     }
-    // Each weight: TCP_BLOCK_K inners of BN columns, BN / 8 chunks per row.
+    // Each weight: TCP_BLOCK_K inners of TCP_BLOCK_N columns, 8 chunks per row.
 #pragma unroll
     for (int w = 0; w < NB; w++) {
-        for (unsigned int c = tid; c < TCP_BLOCK_K * (BN / 8); c += TCP_THREADS) {
-            unsigned int r = c / (BN / 8);
-            unsigned int col = (c % (BN / 8)) * 8;
+        for (unsigned int c = tid; c < TCP_BLOCK_K * (TCP_BLOCK_N / 8); c += TCP_THREADS) {
+            unsigned int r = c / (TCP_BLOCK_N / 8);
+            unsigned int col = (c % (TCP_BLOCK_N / 8)) * 8;
             bool valid = k0 + r < k && n0 + col < n;
             unsigned long long offset = valid ? (k0 + r) * n + n0 + col : 0;
             tcp_copy16(&s_b[w][r][col], b16[w] + offset, valid);
@@ -399,41 +397,38 @@ __device__ __forceinline__ void tcp_load_stage(
     }
 }
 
-// A TCP_BLOCK_M x BN output tile: 8 warps of 32 rows x BN / 2 columns, so
-// each warp holds BN / 16 n-tiles of 8 columns. A wider tile stages each
-// `a` term once for twice the columns.
-template <int NB, int BN>
+template <int NB>
 __device__ __forceinline__ void tcp_matmul(
     const unsigned short* a_hi, const unsigned short* a_lo, const unsigned short* const* b16,
     unsigned long long m, unsigned long long k, unsigned long long n,
-    float acc[NB][2][BN / 16][4]
+    float acc[NB][2][4][4]
 ) {
     __shared__ __align__(16) unsigned short s_hi[2][TCP_BLOCK_M][TCP_A_PITCH];
     __shared__ __align__(16) unsigned short s_lo[2][TCP_BLOCK_M][TCP_A_PITCH];
-    __shared__ __align__(16) unsigned short s_b[2][NB][TCP_BLOCK_K][TCP_B_PITCH_OF(BN)];
+    __shared__ __align__(16) unsigned short s_b[2][NB][TCP_BLOCK_K][TCP_B_PITCH];
     unsigned long long m0 = (unsigned long long)blockIdx.y * TCP_BLOCK_M;
-    unsigned long long n0 = (unsigned long long)blockIdx.x * BN;
+    unsigned long long n0 = (unsigned long long)blockIdx.x * TCP_BLOCK_N;
     unsigned int warp = threadIdx.x >> 5;
     unsigned int lane = threadIdx.x & 31;
     unsigned int warp_m = (warp >> 1) * 32;
-    unsigned int warp_n = (warp & 1) * (BN / 2);
+    unsigned int warp_n = (warp & 1) * 32;
 #pragma unroll
     for (int w = 0; w < NB; w++)
 #pragma unroll
         for (int mt = 0; mt < 2; mt++)
 #pragma unroll
-            for (int nt = 0; nt < BN / 16; nt++)
+            for (int nt = 0; nt < 4; nt++)
 #pragma unroll
                 for (int i = 0; i < 4; i++) acc[w][mt][nt][i] = 0.0f;
 
     unsigned long long tiles = (k + TCP_BLOCK_K - 1) / TCP_BLOCK_K;
-    tcp_load_stage<NB, BN>(a_hi, a_lo, b16, m, k, n, m0, n0, 0, s_hi[0], s_lo[0], s_b[0]);
+    tcp_load_stage<NB>(a_hi, a_lo, b16, m, k, n, m0, n0, 0, s_hi[0], s_lo[0], s_b[0]);
     tcp_commit();
     for (unsigned long long tile = 0; tile < tiles; tile++) {
         unsigned int stage = tile & 1;
         if (tile + 1 < tiles) {
-            tcp_load_stage<NB, BN>(a_hi, a_lo, b16, m, k, n, m0, n0, (tile + 1) * TCP_BLOCK_K,
-                                   s_hi[stage ^ 1], s_lo[stage ^ 1], s_b[stage ^ 1]);
+            tcp_load_stage<NB>(a_hi, a_lo, b16, m, k, n, m0, n0, (tile + 1) * TCP_BLOCK_K,
+                               s_hi[stage ^ 1], s_lo[stage ^ 1], s_b[stage ^ 1]);
             tcp_commit();
             tcp_wait_all_but_one();
         } else {
@@ -452,7 +447,7 @@ __device__ __forceinline__ void tcp_matmul(
 #pragma unroll
         for (int w = 0; w < NB; w++) {
 #pragma unroll
-            for (int np = 0; np < BN / 32; np++) {
+            for (int np = 0; np < 2; np++) {
                 unsigned int b[4];
                 unsigned int krow = (lane & 7) + ((lane >> 3) & 1) * 8;
                 unsigned int ncol = warp_n + np * 16 + (lane >> 4) * 8;
@@ -470,17 +465,24 @@ __device__ __forceinline__ void tcp_matmul(
     }
 }
 
-template <int BN>
-__device__ __forceinline__ void tcp_matmul_body(
-    const unsigned short* a_hi, const unsigned short* a_lo, const unsigned short* b16,
-    float* out, unsigned long long m, unsigned long long k, unsigned long long n,
-    const float* addend, int addend_mode
+// `a x b16` (a given as its hi/lo bfloat16 terms), plus `addend[col]` (mode
+// 1) or `addend[row * n + col]` (mode 2).
+extern "C" __global__ void matmul_tcp_kernel(
+    const unsigned short* a_hi,
+    const unsigned short* a_lo,
+    const unsigned short* b16,
+    float* out,
+    unsigned long long m,
+    unsigned long long k,
+    unsigned long long n,
+    const float* addend,
+    int addend_mode
 ) {
     const unsigned short* weights[1] = {b16};
-    float acc[1][2][BN / 16][4];
-    tcp_matmul<1, BN>(a_hi, a_lo, weights, m, k, n, acc);
+    float acc[1][2][4][4];
+    tcp_matmul<1>(a_hi, a_lo, weights, m, k, n, acc);
     unsigned long long m0 = (unsigned long long)blockIdx.y * TCP_BLOCK_M;
-    unsigned long long n0 = (unsigned long long)blockIdx.x * BN;
+    unsigned long long n0 = (unsigned long long)blockIdx.x * TCP_BLOCK_N;
     unsigned int warp = threadIdx.x >> 5;
     unsigned int lane = threadIdx.x & 31;
     unsigned int group = lane >> 2;
@@ -488,11 +490,11 @@ __device__ __forceinline__ void tcp_matmul_body(
 #pragma unroll
     for (int mt = 0; mt < 2; mt++)
 #pragma unroll
-        for (int nt = 0; nt < BN / 16; nt++)
+        for (int nt = 0; nt < 4; nt++)
 #pragma unroll
             for (int i = 0; i < 4; i++) {
                 unsigned long long row = m0 + (warp >> 1) * 32 + mt * 16 + group + (i >= 2 ? 8 : 0);
-                unsigned long long col = n0 + (warp & 1) * (BN / 2) + nt * 8 + 2 * pair + (i & 1);
+                unsigned long long col = n0 + (warp & 1) * 32 + nt * 8 + 2 * pair + (i & 1);
                 if (row < m && col < n) {
                     float value = acc[0][mt][nt][i];
                     if (addend_mode == 1) {
@@ -505,17 +507,22 @@ __device__ __forceinline__ void tcp_matmul_body(
             }
 }
 
-template <int BN>
-__device__ __forceinline__ void tcp_gated_body(
-    const unsigned short* a_hi, const unsigned short* a_lo, const unsigned short* gate16,
-    const unsigned short* up16, float* out, unsigned long long m, unsigned long long k,
+// `silu(a x gate16) * (a x up16)`, `a` given as its hi/lo bfloat16 terms.
+extern "C" __global__ void gated_matmul_tcp_kernel(
+    const unsigned short* a_hi,
+    const unsigned short* a_lo,
+    const unsigned short* gate16,
+    const unsigned short* up16,
+    float* out,
+    unsigned long long m,
+    unsigned long long k,
     unsigned long long n
 ) {
     const unsigned short* weights[2] = {gate16, up16};
-    float acc[2][2][BN / 16][4];
-    tcp_matmul<2, BN>(a_hi, a_lo, weights, m, k, n, acc);
+    float acc[2][2][4][4];
+    tcp_matmul<2>(a_hi, a_lo, weights, m, k, n, acc);
     unsigned long long m0 = (unsigned long long)blockIdx.y * TCP_BLOCK_M;
-    unsigned long long n0 = (unsigned long long)blockIdx.x * BN;
+    unsigned long long n0 = (unsigned long long)blockIdx.x * TCP_BLOCK_N;
     unsigned int warp = threadIdx.x >> 5;
     unsigned int lane = threadIdx.x & 31;
     unsigned int group = lane >> 2;
@@ -523,54 +530,17 @@ __device__ __forceinline__ void tcp_gated_body(
 #pragma unroll
     for (int mt = 0; mt < 2; mt++)
 #pragma unroll
-        for (int nt = 0; nt < BN / 16; nt++)
+        for (int nt = 0; nt < 4; nt++)
 #pragma unroll
             for (int i = 0; i < 4; i++) {
                 unsigned long long row = m0 + (warp >> 1) * 32 + mt * 16 + group + (i >= 2 ? 8 : 0);
-                unsigned long long col = n0 + (warp & 1) * (BN / 2) + nt * 8 + 2 * pair + (i & 1);
+                unsigned long long col = n0 + (warp & 1) * 32 + nt * 8 + 2 * pair + (i & 1);
                 if (row < m && col < n) {
                     float gate = acc[0][mt][nt][i];
                     float activated = gate * (1.0f / (1.0f + expf(-gate)));
                     out[row * n + col] = activated * acc[1][mt][nt][i];
                 }
             }
-}
-
-// `a x b16` (a given as its hi/lo bfloat16 terms), plus `addend[col]` (mode
-// 1) or `addend[row * n + col]` (mode 2). 64-column tiles; the `_wide`
-// kernel takes 128 columns per tile. Each kernel instantiates one tile
-// width, so it carries one copy of the shared stages.
-extern "C" __global__ void matmul_tcp_kernel(
-    const unsigned short* a_hi, const unsigned short* a_lo, const unsigned short* b16,
-    float* out, unsigned long long m, unsigned long long k, unsigned long long n,
-    const float* addend, int addend_mode
-) {
-    tcp_matmul_body<64>(a_hi, a_lo, b16, out, m, k, n, addend, addend_mode);
-}
-
-extern "C" __global__ void matmul_tcp_wide_kernel(
-    const unsigned short* a_hi, const unsigned short* a_lo, const unsigned short* b16,
-    float* out, unsigned long long m, unsigned long long k, unsigned long long n,
-    const float* addend, int addend_mode
-) {
-    tcp_matmul_body<128>(a_hi, a_lo, b16, out, m, k, n, addend, addend_mode);
-}
-
-// `silu(a x gate16) * (a x up16)`, `a` given as its hi/lo bfloat16 terms.
-extern "C" __global__ void gated_matmul_tcp_kernel(
-    const unsigned short* a_hi, const unsigned short* a_lo, const unsigned short* gate16,
-    const unsigned short* up16, float* out, unsigned long long m, unsigned long long k,
-    unsigned long long n
-) {
-    tcp_gated_body<64>(a_hi, a_lo, gate16, up16, out, m, k, n);
-}
-
-extern "C" __global__ void gated_matmul_tcp_wide_kernel(
-    const unsigned short* a_hi, const unsigned short* a_lo, const unsigned short* gate16,
-    const unsigned short* up16, float* out, unsigned long long m, unsigned long long k,
-    unsigned long long n
-) {
-    tcp_gated_body<128>(a_hi, a_lo, gate16, up16, out, m, k, n);
 }
 
 // ---------------------------------------------------------------------------
