@@ -39,13 +39,27 @@ const TENSOR_KERNEL_SOURCE: &str = include_str!("tensor_kernels.cu");
 const TC_BLOCK_M: u64 = 64;
 const TC_BLOCK_N: u64 = 64;
 const TC_THREADS: u32 = 128;
-/// `TCP_BLOCK_M` / `TCP_BLOCK_N` / `TCP_THREADS` in `tensor_kernels.cu`:
-/// the pipelined Tensor Core matmuls, which need `k` and `n` to be
-/// multiples of `TCP_ALIGN` (16-byte rows of bfloat16).
+/// `TCP_BLOCK_M` / `TCP_THREADS` in `tensor_kernels.cu`: the pipelined
+/// Tensor Core matmuls, which need `k` and `n` to be multiples of
+/// `TCP_ALIGN` (16-byte rows of bfloat16).
 const TCP_BLOCK_M: u64 = 128;
-const TCP_BLOCK_N: u64 = 64;
+/// Blocks a wide (128-column) pipelined matmul grid needs before it is
+/// preferred: two per streaming multiprocessor of a mid-range Device, so
+/// the wider tiles do not leave the Device idle.
+const TCP_WIDE_MIN_BLOCKS: u64 = 56;
 const TCP_THREADS: u32 = 256;
 const TCP_ALIGN: u64 = 8;
+
+/// The pipelined Tensor Core matmul for `m` rows of `n` columns: the wide
+/// (128-column) variant, which stages each `a` term once for twice the
+/// columns, when its grid still fills the Device; else 64-column tiles.
+fn tcp_tile_columns(m: u64, n: u64) -> u64 {
+    if m.div_ceil(TCP_BLOCK_M) * n.div_ceil(128) >= TCP_WIDE_MIN_BLOCKS {
+        128
+    } else {
+        64
+    }
+}
 /// `TCA_QUERIES` in `tensor_kernels.cu`: queries per Tensor Core attention
 /// block.
 const TCA_QUERIES: u64 = 64;
@@ -1652,13 +1666,18 @@ impl CudaKernels {
         let mut out_dev = self.alloc_output((m * n) as usize)?;
         // A long prefill against compact weights: the pipelined Tensor
         // Core Kernel when the rows align, else the plain one.
+        let tile_columns = tcp_tile_columns(m, n);
         if m >= MATMUL_TILE_MIN_ROWS
             && gate16 != 0
             && up16 != 0
             && !transpose_a
             && k % TCP_ALIGN == 0
             && n % TCP_ALIGN == 0
-            && let Some(func) = self.tensor_function("gated_matmul_tcp_kernel")
+            && let Some(func) = self.tensor_function(if tile_columns == 128 {
+                "gated_matmul_tcp_wide_kernel"
+            } else {
+                "gated_matmul_tcp_kernel"
+            })
             && let Some((_split_lock, a_hi, a_lo)) = self.split_bf16(a, m * k)?
         {
             let mut args = self.stream.launch_builder(&func);
@@ -1672,7 +1691,7 @@ impl CudaKernels {
                 .arg(&n);
             let config = LaunchConfig {
                 grid_dim: (
-                    n.div_ceil(TCP_BLOCK_N) as u32,
+                    n.div_ceil(tile_columns) as u32,
                     m.div_ceil(TCP_BLOCK_M) as u32,
                     1,
                 ),
@@ -1823,13 +1842,18 @@ impl CudaKernels {
         };
         // A long prefill against a compact weight: the pipelined Tensor
         // Core Kernel when the rows align, else the plain one.
+        let tile_columns = tcp_tile_columns(m, n);
         if m >= MATMUL_TILE_MIN_ROWS
             && b16 != 0
             && !transpose_a
             && !transpose_b
             && k % TCP_ALIGN == 0
             && n % TCP_ALIGN == 0
-            && let Some(func) = self.tensor_function("matmul_tcp_kernel")
+            && let Some(func) = self.tensor_function(if tile_columns == 128 {
+                "matmul_tcp_wide_kernel"
+            } else {
+                "matmul_tcp_kernel"
+            })
             && let Some((_split_lock, a_hi, a_lo)) = self.split_bf16(a, m * k)?
         {
             let mut args = self.stream.launch_builder(&func);
@@ -1844,7 +1868,7 @@ impl CudaKernels {
                 .arg(&addend_mode);
             let config = LaunchConfig {
                 grid_dim: (
-                    n.div_ceil(TCP_BLOCK_N) as u32,
+                    n.div_ceil(tile_columns) as u32,
                     m.div_ceil(TCP_BLOCK_M) as u32,
                     1,
                 ),
