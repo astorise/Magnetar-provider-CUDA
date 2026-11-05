@@ -2095,7 +2095,8 @@ impl CudaKernels {
 
         // Several query rows, 64-dimension heads, on a Device with Tensor
         // Cores: `attention_tcp_kernel` on K and V split once, when their
-        // rows align; else `attention_tc_kernel`.
+        // rows align. Otherwise (and while capturing) the tiled Kernel
+        // compiled for the head dimension.
         let kv_len = kv_seq_len * kv_model_dim;
         if seq_len >= 16
             && head_dimension == 64
@@ -2119,48 +2120,6 @@ impl CudaKernels {
                 .arg(&k_lo)
                 .arg(&v_hi)
                 .arg(&v_lo)
-                .arg(&mut out_dev)
-                .arg(&seq_len)
-                .arg(&kv_seq_len)
-                .arg(&head_count)
-                .arg(&kv_head_count)
-                .arg(&q_model_dim)
-                .arg(&kv_model_dim)
-                .arg(&causal_flag)
-                .arg(&window_arg)
-                .arg(&query_position_offset);
-            let config = LaunchConfig {
-                grid_dim: (
-                    u32::try_from(seq_len.div_ceil(TCA_QUERIES)).map_err(|_| overflow())?,
-                    u32::try_from(head_count).map_err(|_| overflow())?,
-                    1,
-                ),
-                block_dim: (TC_THREADS, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            unsafe { args.launch(config) }?;
-            return Ok(CudaDeviceBuffer {
-                slice: out_dev,
-                shape: q.shape.clone(),
-                bf16: None,
-            });
-        }
-        if seq_len >= 16
-            && head_dimension == 64
-            && !self.is_capturing()
-            && let Some(func) = self.tensor_function("attention_tc_kernel")
-        {
-            let overflow = || {
-                CudaError::new(
-                    CudaErrorCode::ShapeUnsupported,
-                    "attention launch size overflows a grid dimension",
-                )
-            };
-            let mut out_dev = self.alloc_output(q.slice.len())?;
-            let mut args = self.stream.launch_builder(&func);
-            args.arg(&q.slice)
-                .arg(&k.slice)
-                .arg(&v.slice)
                 .arg(&mut out_dev)
                 .arg(&seq_len)
                 .arg(&kv_seq_len)
