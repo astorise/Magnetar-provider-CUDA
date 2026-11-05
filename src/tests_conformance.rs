@@ -797,6 +797,8 @@ fn tensor_cores_load_on_ampere_and_later() {
 /// The Tensor Core matmul keeps f32 activations: each `a` value enters as
 /// two bfloat16 terms. With every `a` equal to 1 + 2^-12 (bfloat16 rounds
 /// it to 1), dropping the low term would be off by 2^-12 of every sum.
+/// [70, 900] x [900, 130] takes the plain Tensor Core Kernel (900 is not a
+/// multiple of 8); [200, 904] x [904, 136] the pipelined one.
 #[test]
 fn tensor_core_matmul_keeps_f32_activation_precision() {
     let Some(kernels) = kernels_or_skip() else {
@@ -805,10 +807,15 @@ fn tensor_core_matmul_keeps_f32_activation_precision() {
     if !kernels.has_tensor_cores() {
         return;
     }
-    let (m, k, n) = (70u64, 900u64, 130u64);
+    for (m, k, n) in [(70u64, 900u64, 130u64), (200, 904, 136)] {
+        check_activation_precision(&kernels, m, k, n);
+    }
+}
+
+fn check_activation_precision(kernels: &CudaKernels, m: u64, k: u64, n: u64) {
     let a_value = 1.0f32 + 2f32.powi(-12);
     let a = upload(
-        &kernels,
+        kernels,
         &HostTensor::new([m, k], vec![a_value; (m * k) as usize]).unwrap(),
     );
     let weight: Vec<f32> = bf16_exact_values((k * n) as usize, 21)
@@ -819,7 +826,7 @@ fn tensor_core_matmul_keeps_f32_activation_precision() {
         .upload_weight(&HostTensor::new([k, n], weight.clone()).unwrap())
         .unwrap();
     assert!(b.is_compact());
-    let actual = download(&kernels, &kernels.matmul(&a, &b, false, false).unwrap());
+    let actual = download(kernels, &kernels.matmul(&a, &b, false, false).unwrap());
     for row in 0..m as usize {
         for col in 0..n as usize {
             let column_sum: f64 = (0..k as usize)
