@@ -366,8 +366,9 @@ __device__ __forceinline__ void tcp_ldmatrix_x4_trans(unsigned int r[4], const v
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(tcp_smem(pointer)));
 }
 
-template <int NB, bool SPLIT>
+template <int NB>
 __device__ __forceinline__ void tcp_load_stage(
+    bool split,
     const unsigned short* a_hi, const unsigned short* a_lo, const unsigned short* const* b16,
     unsigned long long m, unsigned long long k, unsigned long long n,
     unsigned long long m0, unsigned long long n0, unsigned long long k0,
@@ -382,7 +383,7 @@ __device__ __forceinline__ void tcp_load_stage(
         bool valid = m0 + r < m && k0 + col < k;
         unsigned long long offset = valid ? (m0 + r) * k + k0 + col : 0;
         tcp_copy16(&s_hi[r][col], a_hi + offset, valid);
-        if (SPLIT) {
+        if (split) {
             tcp_copy16(&s_lo[r][col], a_lo + offset, valid);
         }
     }
@@ -399,11 +400,13 @@ __device__ __forceinline__ void tcp_load_stage(
     }
 }
 
-// With SPLIT false, only the hi term of `a` enters the Tensor Cores (the
+// With `split` false, only the hi term of `a` enters the Tensor Cores (the
 // opt-in one-term profile): half the `mma` work, about 8 significant bits
-// of each activation instead of 16.
-template <int NB, bool SPLIT>
+// of each activation instead of 16. It is a runtime flag, uniform across
+// the grid, so each kernel keeps one copy of the shared stages.
+template <int NB>
 __device__ __forceinline__ void tcp_matmul(
+    bool split,
     const unsigned short* a_hi, const unsigned short* a_lo, const unsigned short* const* b16,
     unsigned long long m, unsigned long long k, unsigned long long n,
     float acc[NB][2][4][4]
@@ -427,12 +430,12 @@ __device__ __forceinline__ void tcp_matmul(
                 for (int i = 0; i < 4; i++) acc[w][mt][nt][i] = 0.0f;
 
     unsigned long long tiles = (k + TCP_BLOCK_K - 1) / TCP_BLOCK_K;
-    tcp_load_stage<NB, SPLIT>(a_hi, a_lo, b16, m, k, n, m0, n0, 0, s_hi[0], s_lo[0], s_b[0]);
+    tcp_load_stage<NB>(split, a_hi, a_lo, b16, m, k, n, m0, n0, 0, s_hi[0], s_lo[0], s_b[0]);
     tcp_commit();
     for (unsigned long long tile = 0; tile < tiles; tile++) {
         unsigned int stage = tile & 1;
         if (tile + 1 < tiles) {
-            tcp_load_stage<NB, SPLIT>(a_hi, a_lo, b16, m, k, n, m0, n0, (tile + 1) * TCP_BLOCK_K,
+            tcp_load_stage<NB>(split, a_hi, a_lo, b16, m, k, n, m0, n0, (tile + 1) * TCP_BLOCK_K,
                                s_hi[stage ^ 1], s_lo[stage ^ 1], s_b[stage ^ 1]);
             tcp_commit();
             tcp_wait_all_but_one();
@@ -447,7 +450,7 @@ __device__ __forceinline__ void tcp_matmul(
             unsigned int row = warp_m + mt * 16 + (lane & 15);
             unsigned int col = (lane >> 4) * 8;
             tcp_ldmatrix_x4(hi[mt], &s_hi[stage][row][col]);
-            if (SPLIT) {
+            if (split) {
                 tcp_ldmatrix_x4(lo[mt], &s_lo[stage][row][col]);
             }
         }
@@ -461,11 +464,11 @@ __device__ __forceinline__ void tcp_matmul(
                 tcp_ldmatrix_x4_trans(b, &s_b[stage][w][krow][ncol]);
 #pragma unroll
                 for (int mt = 0; mt < 2; mt++) {
-                    if (SPLIT) {
+                    if (split) {
                         tc_mma(acc[w][mt][2 * np], lo[mt], b[0], b[1]);
                     }
                     tc_mma(acc[w][mt][2 * np], hi[mt], b[0], b[1]);
-                    if (SPLIT) {
+                    if (split) {
                         tc_mma(acc[w][mt][2 * np + 1], lo[mt], b[2], b[3]);
                     }
                     tc_mma(acc[w][mt][2 * np + 1], hi[mt], b[2], b[3]);
@@ -492,11 +495,7 @@ extern "C" __global__ void matmul_tcp_kernel(
 ) {
     const unsigned short* weights[1] = {b16};
     float acc[1][2][4][4];
-    if (split) {
-        tcp_matmul<1, true>(a_hi, a_lo, weights, m, k, n, acc);
-    } else {
-        tcp_matmul<1, false>(a_hi, a_lo, weights, m, k, n, acc);
-    }
+    tcp_matmul<1>(split != 0, a_hi, a_lo, weights, m, k, n, acc);
     unsigned long long m0 = (unsigned long long)blockIdx.y * TCP_BLOCK_M;
     unsigned long long n0 = (unsigned long long)blockIdx.x * TCP_BLOCK_N;
     unsigned int warp = threadIdx.x >> 5;
@@ -537,11 +536,7 @@ extern "C" __global__ void gated_matmul_tcp_kernel(
 ) {
     const unsigned short* weights[2] = {gate16, up16};
     float acc[2][2][4][4];
-    if (split) {
-        tcp_matmul<2, true>(a_hi, a_lo, weights, m, k, n, acc);
-    } else {
-        tcp_matmul<2, false>(a_hi, a_lo, weights, m, k, n, acc);
-    }
+    tcp_matmul<2>(split != 0, a_hi, a_lo, weights, m, k, n, acc);
     unsigned long long m0 = (unsigned long long)blockIdx.y * TCP_BLOCK_M;
     unsigned long long n0 = (unsigned long long)blockIdx.x * TCP_BLOCK_N;
     unsigned int warp = threadIdx.x >> 5;
