@@ -1141,7 +1141,7 @@ fn block_attention_matches_reference_cpu_on_decode_prefill_and_long_histories() 
         return;
     };
     // (seq_len, kv_seq_len, head_count, kv_head_count, head_dimension, window)
-    let cases: [(u64, u64, u64, u64, u64, Option<u64>); 14] = [
+    let cases: [(u64, u64, u64, u64, u64, Option<u64>); 15] = [
         (1, 300, 14, 2, 64, None),
         // The grouped decode Kernel: one exact 64-key chunk, a long history
         // ending in a partial chunk, and one query head per KV head.
@@ -1158,6 +1158,10 @@ fn block_attention_matches_reference_cpu_on_decode_prefill_and_long_histories() 
         (37, 37, 14, 2, 64, None),
         (23, 23, 4, 2, 8, Some(5)),
         (1, 12_500, 2, 1, 4, None),
+        // More chunks than the combine's shared memory holds weights for
+        // (11,329 x 4 bytes > 44 KB): it recomputes each weight instead
+        // (Codex review on astorise/Magnetar-provider-CUDA#29).
+        (1, 1_450_000, 2, 1, 4, None),
     ];
     for (case, (seq_len, kv_seq_len, heads, kv_heads, dim, window)) in cases.into_iter().enumerate()
     {

@@ -2415,12 +2415,15 @@ impl CudaKernels {
             unsafe { args.launch(config) }?;
         }
         let combine = self.function("attention_combine_kernel")?;
+        let weight_bytes = u32::try_from(chunks * 4).unwrap_or(u32::MAX);
+        let cache_weights = i32::from(weight_bytes <= ATTENTION_COMBINE_MAX_DYNAMIC_SHARED);
         let mut args = self.stream.launch_builder(&combine);
         args.arg(&*partial)
             .arg(&mut out_dev)
             .arg(&head_count)
             .arg(&head_dimension)
-            .arg(&chunks);
+            .arg(&chunks)
+            .arg(&cache_weights);
         let config = LaunchConfig {
             grid_dim: (u32::try_from(head_count).map_err(|_| overflow())?, 1, 1),
             // Lanes of chunks per output dimension: up to 8, within 256
@@ -2435,12 +2438,10 @@ impl CudaKernels {
                 1,
                 1,
             ),
-            // One weight per chunk; the static reduction scratch takes 4 KB
-            // of the 48 KB a block may use.
-            shared_mem_bytes: u32::try_from(chunks * 4)
-                .ok()
-                .filter(|bytes| *bytes <= ATTENTION_COMBINE_MAX_DYNAMIC_SHARED)
-                .ok_or_else(overflow)?,
+            // One weight per chunk while they fit in shared memory (48 KB
+            // less the 4 KB static reduction scratch); past that the
+            // Kernel recomputes each weight from its partial.
+            shared_mem_bytes: if cache_weights == 1 { weight_bytes } else { 0 },
         };
         unsafe { args.launch(config) }?;
         Ok(CudaDeviceBuffer {

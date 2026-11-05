@@ -1535,15 +1535,18 @@ extern "C" __global__ void attention_split_gqa_kernel(
 // largest chunk max. Empty chunks are skipped; a head with no admitted key
 // gets zeros. The block shares the per-chunk work: the maximum and the
 // chunk weights are computed once per chunk (into dynamic shared memory,
-// `chunks` floats) instead of once per output dimension, and the weighted
-// sum of each dimension is split across lanes of chunks.
+// `chunks` floats, when they fit) instead of once per output dimension,
+// and the weighted sum of each dimension is split across lanes of chunks.
 extern "C" __global__ void attention_combine_kernel(
     const float* partial,
     float* out,
     unsigned long long head_count,
     unsigned long long head_dimension,
-    unsigned long long chunks
+    unsigned long long chunks,
+    int cache_weights
 ) {
+    // `chunks` floats when `cache_weights`; otherwise (too many chunks for
+    // shared memory) each weight is recomputed from its partial.
     extern __shared__ float chunk_weight[];
     __shared__ float reduce[1024];
     unsigned long long head = blockIdx.x;
@@ -1570,41 +1573,52 @@ extern "C" __global__ void attention_combine_kernel(
     }
     float max_value = reduce[0];
     __syncthreads();
-    for (unsigned long long c = tid; c < chunks; c += threads) {
+    auto weight_of = [&](unsigned long long c) -> float {
+        if (cache_weights) {
+            return chunk_weight[c];
+        }
         const float* p = head_partial + c * (head_dimension + 2);
-        chunk_weight[c] = p[head_dimension + 1] > 0.0f
+        return p[head_dimension + 1] > 0.0f
             ? p[head_dimension + 1] * expf(p[head_dimension] - max_value)
             : 0.0f;
+    };
+    if (cache_weights) {
+        for (unsigned long long c = tid; c < chunks; c += threads) {
+            const float* p = head_partial + c * (head_dimension + 2);
+            chunk_weight[c] = p[head_dimension + 1] > 0.0f
+                ? p[head_dimension + 1] * expf(p[head_dimension] - max_value)
+                : 0.0f;
+        }
+        __syncthreads();
     }
-    __syncthreads();
-    // The total in chunk order, as before (one thread: `chunks` is small
-    // next to the dimensions' work).
+    // The total in chunk order (one thread: `chunks` is small next to the
+    // dimensions' work).
     if (tid == 0) {
         float total = 0.0f;
         for (unsigned long long c = 0; c < chunks; c++) {
-            total += chunk_weight[c];
+            total += weight_of(c);
         }
         reduce[0] = total;
     }
     __syncthreads();
     float total = reduce[0];
-    // Thread t sums dimension t % head_dimension over every `lanes`-th
-    // chunk from t / head_dimension, several loads in flight; the lanes'
-    // sums are then added in lane order, so the result does not depend on
-    // scheduling.
+    // Thread t sums dimension t % width over every `lanes`-th chunk from
+    // t / width, several loads in flight; the lanes' sums are then added in
+    // lane order, so the result does not depend on scheduling.
     unsigned int lanes = threads / (unsigned int)head_dimension;
     if (lanes == 0) {
         lanes = 1;
     }
+    unsigned int width = threads / lanes;
     __syncthreads();
-    for (unsigned long long d0 = 0; d0 < head_dimension; d0 += threads / lanes) {
-        unsigned long long d = d0 + tid % (threads / lanes);
-        unsigned int lane = tid / (threads / lanes);
+    for (unsigned long long d0 = 0; d0 < head_dimension; d0 += width) {
+        unsigned long long d = d0 + tid % width;
+        unsigned int lane = tid / width;
         float acc = 0.0f;
         if (d < head_dimension && lane < lanes) {
 #pragma unroll 4
             for (unsigned long long c = lane; c < chunks; c += lanes) {
-                float w = chunk_weight[c];
+                float w = weight_of(c);
                 if (w > 0.0f) {
                     // Each chunk's share of the softmax mass, at most 1:
                     // the sum stays a weighted mean of V rows.
@@ -1617,7 +1631,7 @@ extern "C" __global__ void attention_combine_kernel(
         if (lane == 0 && d < head_dimension) {
             float sum = 0.0f;
             for (unsigned int l = 0; l < lanes; l++) {
-                sum += reduce[l * (threads / lanes) + tid % (threads / lanes)];
+                sum += reduce[l * width + tid % width];
             }
             out[head * head_dimension + d] = sum;
         }
