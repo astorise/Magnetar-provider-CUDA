@@ -237,7 +237,7 @@ extern "C" __global__ void gated_matmul_tc_kernel(
 // ---------------------------------------------------------------------------
 //
 // Block (query tile, head) serves TCA_QUERIES queries with 4 warps of 16.
-// Keys are taken TCA_KEYS at a time: S = Q K^T and the block's share of P V
+// Keys are taken a tile at a time: S = Q K^T and the block's share of P V
 // run as `m16n8k16` bfloat16 `mma` with f32 accumulation. Every f32 operand
 // enters as two bfloat16 terms (hi, lo) and each product as hi*hi + hi*lo +
 // lo*hi, which keeps about 16 significant bits. Softmax is online per query
@@ -250,7 +250,6 @@ __device__ __forceinline__ float neg_inf() {
 }
 
 #define TCA_QUERIES 64
-#define TCA_KEYS 64
 #define TCA_D 64
 #define TCA_PITCH (TCA_D + 8)
 
@@ -291,214 +290,6 @@ __device__ __forceinline__ void tca_keys_of(
     }
     *lower = low;
     *upper = up;
-}
-
-extern "C" __global__ void attention_tc_kernel(
-    const float* q,
-    const float* k,
-    const float* v,
-    float* out,
-    unsigned long long seq_len,
-    unsigned long long kv_seq_len,
-    unsigned long long head_count,
-    unsigned long long kv_head_count,
-    unsigned long long q_model_dim,
-    unsigned long long kv_model_dim,
-    int causal,
-    long long window_size,
-    unsigned long long query_position_offset
-) {
-    // Q is staged in the key buffers first, then each key tile.
-    __shared__ __align__(16) unsigned short s_hi[TCA_KEYS][TCA_PITCH];
-    __shared__ __align__(16) unsigned short s_lo[TCA_KEYS][TCA_PITCH];
-    __shared__ __align__(16) unsigned short vt_hi[TCA_D][TCA_PITCH];
-    __shared__ __align__(16) unsigned short vt_lo[TCA_D][TCA_PITCH];
-    unsigned int tid = threadIdx.x;
-    unsigned int warp = tid >> 5;
-    unsigned int lane = tid & 31;
-    unsigned int g = lane >> 2;
-    unsigned int t = lane & 3;
-    unsigned long long head = blockIdx.y;
-    unsigned long long tile_first = (unsigned long long)blockIdx.x * TCA_QUERIES;
-    unsigned long long group_size = head_count / kv_head_count;
-    unsigned long long q_offset = head * TCA_D;
-    unsigned long long kv_offset = (head / group_size) * TCA_D;
-    const float scale = 0.125f;
-
-    for (unsigned int e = tid; e < TCA_QUERIES * TCA_D; e += 128) {
-        unsigned int r = e / TCA_D;
-        unsigned int c = e % TCA_D;
-        unsigned long long qi = tile_first + r;
-        float value = qi < seq_len ? q[qi * q_model_dim + q_offset + c] * scale : 0.0f;
-        tca_split(value, &s_hi[r][c], &s_lo[r][c]);
-    }
-    __syncthreads();
-    unsigned int qh[4][4];
-    unsigned int ql[4][4];
-    unsigned int wr = warp * 16 + g;
-#pragma unroll
-    for (int ks = 0; ks < 4; ks++) {
-        unsigned int c0 = ks * 16 + 2 * t;
-        qh[ks][0] = tca_u32(&s_hi[wr][c0]);
-        qh[ks][1] = tca_u32(&s_hi[wr + 8][c0]);
-        qh[ks][2] = tca_u32(&s_hi[wr][c0 + 8]);
-        qh[ks][3] = tca_u32(&s_hi[wr + 8][c0 + 8]);
-        ql[ks][0] = tca_u32(&s_lo[wr][c0]);
-        ql[ks][1] = tca_u32(&s_lo[wr + 8][c0]);
-        ql[ks][2] = tca_u32(&s_lo[wr][c0 + 8]);
-        ql[ks][3] = tca_u32(&s_lo[wr + 8][c0 + 8]);
-    }
-
-    // This thread's two query rows (g and g + 8 of its warp).
-    unsigned long long last_query = tile_first + TCA_QUERIES - 1;
-    if (last_query >= seq_len) {
-        last_query = seq_len - 1;
-    }
-    unsigned long long row[2] = {tile_first + wr, tile_first + wr + 8};
-    unsigned long long lower[2];
-    unsigned long long upper[2];
-#pragma unroll
-    for (int h = 0; h < 2; h++) {
-        unsigned long long position = query_position_offset + (row[h] < seq_len ? row[h] : last_query);
-        tca_keys_of(position, causal, window_size, kv_seq_len, &lower[h], &upper[h]);
-    }
-    unsigned long long block_lower;
-    unsigned long long block_upper;
-    {
-        unsigned long long unused;
-        tca_keys_of(query_position_offset + tile_first, causal, window_size, kv_seq_len, &block_lower, &unused);
-        tca_keys_of(query_position_offset + last_query, causal, window_size, kv_seq_len, &unused, &block_upper);
-    }
-
-    float max_value[2] = {neg_inf(), neg_inf()};
-    float sum[2] = {0.0f, 0.0f};
-    float o[8][4];
-#pragma unroll
-    for (int dt = 0; dt < 8; dt++)
-#pragma unroll
-        for (int i = 0; i < 4; i++) o[dt][i] = 0.0f;
-
-    for (unsigned long long tile = block_lower; tile < block_upper; tile += TCA_KEYS) {
-        __syncthreads();
-        for (unsigned int e = tid; e < TCA_KEYS * TCA_D; e += 128) {
-            unsigned int r = e / TCA_D;
-            unsigned int c = e % TCA_D;
-            unsigned long long key = tile + r;
-            bool present = key < kv_seq_len;
-            float kv = present ? k[key * kv_model_dim + kv_offset + c] : 0.0f;
-            float vv = present ? v[key * kv_model_dim + kv_offset + c] : 0.0f;
-            tca_split(kv, &s_hi[r][c], &s_lo[r][c]);
-            tca_split(vv, &vt_hi[c][r], &vt_lo[c][r]);
-        }
-        __syncthreads();
-
-        float s[8][4];
-#pragma unroll
-        for (int nt = 0; nt < 8; nt++)
-#pragma unroll
-            for (int i = 0; i < 4; i++) s[nt][i] = 0.0f;
-#pragma unroll
-        for (int ks = 0; ks < 4; ks++) {
-            unsigned int c0 = ks * 16 + 2 * t;
-#pragma unroll
-            for (int nt = 0; nt < 8; nt++) {
-                unsigned int kr = nt * 8 + g;
-                unsigned int bh0 = tca_u32(&s_hi[kr][c0]);
-                unsigned int bh1 = tca_u32(&s_hi[kr][c0 + 8]);
-                unsigned int bl0 = tca_u32(&s_lo[kr][c0]);
-                unsigned int bl1 = tca_u32(&s_lo[kr][c0 + 8]);
-                tc_mma(s[nt], ql[ks], bh0, bh1);
-                tc_mma(s[nt], qh[ks], bl0, bl1);
-                tc_mma(s[nt], qh[ks], bh0, bh1);
-            }
-        }
-
-        // Masks, then each row's online softmax update.
-        float tile_max[2] = {neg_inf(), neg_inf()};
-#pragma unroll
-        for (int nt = 0; nt < 8; nt++)
-#pragma unroll
-            for (int i = 0; i < 4; i++) {
-                int h = i >> 1;
-                unsigned long long key = tile + nt * 8 + 2 * t + (i & 1);
-                bool admitted = key >= lower[h] && key < upper[h] && key < kv_seq_len;
-                s[nt][i] = admitted ? s[nt][i] : neg_inf();
-                tile_max[h] = fmaxf(tile_max[h], s[nt][i]);
-            }
-        float keep[2];
-        float take[2];
-#pragma unroll
-        for (int h = 0; h < 2; h++) {
-            tile_max[h] = fmaxf(tile_max[h], __shfl_xor_sync(0xffffffffu, tile_max[h], 1));
-            tile_max[h] = fmaxf(tile_max[h], __shfl_xor_sync(0xffffffffu, tile_max[h], 2));
-        }
-        float new_max[2];
-        float tile_sum[2] = {0.0f, 0.0f};
-#pragma unroll
-        for (int h = 0; h < 2; h++) {
-            new_max[h] = fmaxf(max_value[h], tile_max[h]);
-        }
-#pragma unroll
-        for (int nt = 0; nt < 8; nt++)
-#pragma unroll
-            for (int i = 0; i < 4; i++) {
-                int h = i >> 1;
-                float p = new_max[h] == neg_inf() ? 0.0f : expf(s[nt][i] - new_max[h]);
-                s[nt][i] = p;
-                tile_sum[h] += p;
-            }
-#pragma unroll
-        for (int h = 0; h < 2; h++) {
-            tile_sum[h] += __shfl_xor_sync(0xffffffffu, tile_sum[h], 1);
-            tile_sum[h] += __shfl_xor_sync(0xffffffffu, tile_sum[h], 2);
-            float kept = sum[h] > 0.0f ? sum[h] * expf(max_value[h] - new_max[h]) : 0.0f;
-            float total = kept + tile_sum[h];
-            keep[h] = total > 0.0f ? kept / total : 0.0f;
-            take[h] = total > 0.0f ? 1.0f / total : 0.0f;
-            sum[h] = total;
-            max_value[h] = new_max[h];
-        }
-#pragma unroll
-        for (int dt = 0; dt < 8; dt++)
-#pragma unroll
-            for (int i = 0; i < 4; i++) o[dt][i] *= keep[i >> 1];
-
-        // P V, P normalized by the running sum: two key n-tiles form one
-        // m16k16 A fragment.
-#pragma unroll
-        for (int j = 0; j < 4; j++) {
-            unsigned int ph[4];
-            unsigned int pl[4];
-            tca_split_pair(s[2 * j][0] * take[0], s[2 * j][1] * take[0], &ph[0], &pl[0]);
-            tca_split_pair(s[2 * j][2] * take[1], s[2 * j][3] * take[1], &ph[1], &pl[1]);
-            tca_split_pair(s[2 * j + 1][0] * take[0], s[2 * j + 1][1] * take[0], &ph[2], &pl[2]);
-            tca_split_pair(s[2 * j + 1][2] * take[1], s[2 * j + 1][3] * take[1], &ph[3], &pl[3]);
-            unsigned int c0 = j * 16 + 2 * t;
-#pragma unroll
-            for (int dt = 0; dt < 8; dt++) {
-                unsigned int dr = dt * 8 + g;
-                unsigned int bh0 = tca_u32(&vt_hi[dr][c0]);
-                unsigned int bh1 = tca_u32(&vt_hi[dr][c0 + 8]);
-                unsigned int bl0 = tca_u32(&vt_lo[dr][c0]);
-                unsigned int bl1 = tca_u32(&vt_lo[dr][c0 + 8]);
-                tc_mma(o[dt], pl, bh0, bh1);
-                tc_mma(o[dt], ph, bl0, bl1);
-                tc_mma(o[dt], ph, bh0, bh1);
-            }
-        }
-    }
-
-    // No key admitted (an empty window) leaves the output zero.
-#pragma unroll
-    for (int dt = 0; dt < 8; dt++)
-#pragma unroll
-        for (int i = 0; i < 4; i++) {
-            int h = i >> 1;
-            if (row[h] < seq_len) {
-                out[row[h] * q_model_dim + q_offset + dt * 8 + 2 * t + (i & 1)] =
-                    sum[h] > 0.0f ? o[dt][i] : 0.0f;
-            }
-        }
 }
 
 // ---------------------------------------------------------------------------
@@ -750,4 +541,252 @@ extern "C" __global__ void gated_matmul_tcp_kernel(
                     out[row * n + col] = activated * acc[1][mt][nt][i];
                 }
             }
+}
+
+// ---------------------------------------------------------------------------
+// Pipelined Tensor Core prefill attention (head dimension 64)
+// ---------------------------------------------------------------------------
+//
+// K and V are given as their bfloat16 hi and lo terms, split once per
+// attention by `tc_split_kernel` rather than once per query block. Key tiles of TCAP_KEYS stream through two
+// shared-memory stages filled by `cp.async`; fragments are read with
+// `ldmatrix` (V with `.trans`, from its natural [key][d] layout). Requires
+// `kv_model_dim` to be a multiple of 8.
+
+#define TCAP_KEYS 32
+
+extern "C" __global__ void attention_tcp_kernel(
+    const float* q,
+    const unsigned short* k_hi,
+    const unsigned short* k_lo,
+    const unsigned short* v_hi,
+    const unsigned short* v_lo,
+    float* out,
+    unsigned long long seq_len,
+    unsigned long long kv_seq_len,
+    unsigned long long head_count,
+    unsigned long long kv_head_count,
+    unsigned long long q_model_dim,
+    unsigned long long kv_model_dim,
+    int causal,
+    long long window_size,
+    unsigned long long query_position_offset
+) {
+    // Q is staged in the two K stages first (64 rows), then each key tile.
+    __shared__ __align__(16) unsigned short s_khi[2 * TCAP_KEYS][TCA_PITCH];
+    __shared__ __align__(16) unsigned short s_klo[2 * TCAP_KEYS][TCA_PITCH];
+    __shared__ __align__(16) unsigned short s_vhi[2 * TCAP_KEYS][TCA_PITCH];
+    __shared__ __align__(16) unsigned short s_vlo[2 * TCAP_KEYS][TCA_PITCH];
+    unsigned int tid = threadIdx.x;
+    unsigned int warp = tid >> 5;
+    unsigned int lane = tid & 31;
+    unsigned int g = lane >> 2;
+    unsigned int t = lane & 3;
+    unsigned long long head = blockIdx.y;
+    unsigned long long tile_first = (unsigned long long)blockIdx.x * TCA_QUERIES;
+    unsigned long long group_size = head_count / kv_head_count;
+    unsigned long long q_offset = head * TCA_D;
+    unsigned long long kv_offset = (head / group_size) * TCA_D;
+    const float scale = 0.125f;
+
+    for (unsigned int e = tid; e < TCA_QUERIES * TCA_D; e += 128) {
+        unsigned int r = e / TCA_D;
+        unsigned int c = e % TCA_D;
+        unsigned long long qi = tile_first + r;
+        float value = qi < seq_len ? q[qi * q_model_dim + q_offset + c] * scale : 0.0f;
+        tca_split(value, &s_khi[r][c], &s_klo[r][c]);
+    }
+    __syncthreads();
+    unsigned int qh[4][4];
+    unsigned int ql[4][4];
+    unsigned int wr = warp * 16 + g;
+#pragma unroll
+    for (int ks = 0; ks < 4; ks++) {
+        unsigned int c0 = ks * 16 + 2 * t;
+        qh[ks][0] = tca_u32(&s_khi[wr][c0]);
+        qh[ks][1] = tca_u32(&s_khi[wr + 8][c0]);
+        qh[ks][2] = tca_u32(&s_khi[wr][c0 + 8]);
+        qh[ks][3] = tca_u32(&s_khi[wr + 8][c0 + 8]);
+        ql[ks][0] = tca_u32(&s_klo[wr][c0]);
+        ql[ks][1] = tca_u32(&s_klo[wr + 8][c0]);
+        ql[ks][2] = tca_u32(&s_klo[wr][c0 + 8]);
+        ql[ks][3] = tca_u32(&s_klo[wr + 8][c0 + 8]);
+    }
+    __syncthreads();
+
+    unsigned long long last_query = tile_first + TCA_QUERIES - 1;
+    if (last_query >= seq_len) {
+        last_query = seq_len - 1;
+    }
+    unsigned long long row[2] = {tile_first + wr, tile_first + wr + 8};
+    unsigned long long lower[2];
+    unsigned long long upper[2];
+#pragma unroll
+    for (int h = 0; h < 2; h++) {
+        unsigned long long position = query_position_offset + (row[h] < seq_len ? row[h] : last_query);
+        tca_keys_of(position, causal, window_size, kv_seq_len, &lower[h], &upper[h]);
+    }
+    unsigned long long block_lower;
+    unsigned long long block_upper;
+    {
+        unsigned long long unused;
+        tca_keys_of(query_position_offset + tile_first, causal, window_size, kv_seq_len, &block_lower, &unused);
+        tca_keys_of(query_position_offset + last_query, causal, window_size, kv_seq_len, &unused, &block_upper);
+    }
+
+    float max_value[2] = {neg_inf(), neg_inf()};
+    float sum[2] = {0.0f, 0.0f};
+    float o[8][4];
+#pragma unroll
+    for (int dt = 0; dt < 8; dt++)
+#pragma unroll
+        for (int i = 0; i < 4; i++) o[dt][i] = 0.0f;
+
+    // One stage: TCAP_KEYS keys of 64 dimensions, 8 chunks of 16 bytes per
+    // row, for each of K hi, K lo, V hi and V lo.
+    auto load_stage = [&](unsigned long long tile, unsigned int stage) {
+        for (unsigned int c = tid; c < TCAP_KEYS * 8; c += 128) {
+            unsigned int r = c >> 3;
+            unsigned int col = (c & 7) * 8;
+            unsigned long long key = tile + r;
+            bool valid = key < kv_seq_len;
+            unsigned long long offset = valid ? key * kv_model_dim + kv_offset + col : 0;
+            unsigned int sr = stage * TCAP_KEYS + r;
+            tcp_copy16(&s_khi[sr][col], k_hi + offset, valid);
+            tcp_copy16(&s_klo[sr][col], k_lo + offset, valid);
+            tcp_copy16(&s_vhi[sr][col], v_hi + offset, valid);
+            tcp_copy16(&s_vlo[sr][col], v_lo + offset, valid);
+        }
+    };
+
+    if (block_lower < block_upper) {
+        load_stage(block_lower, 0);
+        tcp_commit();
+    }
+    unsigned int stage = 0;
+    for (unsigned long long tile = block_lower; tile < block_upper; tile += TCAP_KEYS) {
+        if (tile + TCAP_KEYS < block_upper) {
+            load_stage(tile + TCAP_KEYS, stage ^ 1);
+            tcp_commit();
+            tcp_wait_all_but_one();
+        } else {
+            tcp_wait_all();
+        }
+        __syncthreads();
+        unsigned int base = stage * TCAP_KEYS;
+
+        float s[4][4];
+#pragma unroll
+        for (int nt = 0; nt < 4; nt++)
+#pragma unroll
+            for (int i = 0; i < 4; i++) s[nt][i] = 0.0f;
+#pragma unroll
+        for (int ks = 0; ks < 4; ks++) {
+#pragma unroll
+            for (int np = 0; np < 2; np++) {
+                // Keys np*16 .. np*16+15: b0/b1 of n-tile 2np, then 2np+1.
+                unsigned int kr = base + np * 16 + (lane & 7) + (lane >> 4) * 8;
+                unsigned int kc = ks * 16 + ((lane >> 3) & 1) * 8;
+                unsigned int bh[4];
+                unsigned int bl[4];
+                tcp_ldmatrix_x4(bh, &s_khi[kr][kc]);
+                tcp_ldmatrix_x4(bl, &s_klo[kr][kc]);
+#pragma unroll
+                for (int half = 0; half < 2; half++) {
+                    int nt = 2 * np + half;
+                    tc_mma(s[nt], ql[ks], bh[2 * half], bh[2 * half + 1]);
+                    tc_mma(s[nt], qh[ks], bl[2 * half], bl[2 * half + 1]);
+                    tc_mma(s[nt], qh[ks], bh[2 * half], bh[2 * half + 1]);
+                }
+            }
+        }
+
+        float tile_max[2] = {neg_inf(), neg_inf()};
+#pragma unroll
+        for (int nt = 0; nt < 4; nt++)
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                int h = i >> 1;
+                unsigned long long key = tile + nt * 8 + 2 * t + (i & 1);
+                bool admitted = key >= lower[h] && key < upper[h] && key < kv_seq_len;
+                s[nt][i] = admitted ? s[nt][i] : neg_inf();
+                tile_max[h] = fmaxf(tile_max[h], s[nt][i]);
+            }
+        float keep[2];
+        float take[2];
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+            tile_max[h] = fmaxf(tile_max[h], __shfl_xor_sync(0xffffffffu, tile_max[h], 1));
+            tile_max[h] = fmaxf(tile_max[h], __shfl_xor_sync(0xffffffffu, tile_max[h], 2));
+        }
+        float new_max[2];
+        float tile_sum[2] = {0.0f, 0.0f};
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+            new_max[h] = fmaxf(max_value[h], tile_max[h]);
+        }
+#pragma unroll
+        for (int nt = 0; nt < 4; nt++)
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                int h = i >> 1;
+                float p = new_max[h] == neg_inf() ? 0.0f : expf(s[nt][i] - new_max[h]);
+                s[nt][i] = p;
+                tile_sum[h] += p;
+            }
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+            tile_sum[h] += __shfl_xor_sync(0xffffffffu, tile_sum[h], 1);
+            tile_sum[h] += __shfl_xor_sync(0xffffffffu, tile_sum[h], 2);
+            float kept = sum[h] > 0.0f ? sum[h] * expf(max_value[h] - new_max[h]) : 0.0f;
+            float total = kept + tile_sum[h];
+            keep[h] = total > 0.0f ? kept / total : 0.0f;
+            take[h] = total > 0.0f ? 1.0f / total : 0.0f;
+            sum[h] = total;
+            max_value[h] = new_max[h];
+        }
+#pragma unroll
+        for (int dt = 0; dt < 8; dt++)
+#pragma unroll
+            for (int i = 0; i < 4; i++) o[dt][i] *= keep[i >> 1];
+
+#pragma unroll
+        for (int j = 0; j < 2; j++) {
+            unsigned int ph[4];
+            unsigned int pl[4];
+            tca_split_pair(s[2 * j][0] * take[0], s[2 * j][1] * take[0], &ph[0], &pl[0]);
+            tca_split_pair(s[2 * j][2] * take[1], s[2 * j][3] * take[1], &ph[1], &pl[1]);
+            tca_split_pair(s[2 * j + 1][0] * take[0], s[2 * j + 1][1] * take[0], &ph[2], &pl[2]);
+            tca_split_pair(s[2 * j + 1][2] * take[1], s[2 * j + 1][3] * take[1], &ph[3], &pl[3]);
+            unsigned int vr = base + j * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
+#pragma unroll
+            for (int dp = 0; dp < 4; dp++) {
+                unsigned int vc = dp * 16 + (lane >> 4) * 8;
+                unsigned int bh[4];
+                unsigned int bl[4];
+                tcp_ldmatrix_x4_trans(bh, &s_vhi[vr][vc]);
+                tcp_ldmatrix_x4_trans(bl, &s_vlo[vr][vc]);
+#pragma unroll
+                for (int half = 0; half < 2; half++) {
+                    int dt = 2 * dp + half;
+                    tc_mma(o[dt], pl, bh[2 * half], bh[2 * half + 1]);
+                    tc_mma(o[dt], ph, bl[2 * half], bl[2 * half + 1]);
+                    tc_mma(o[dt], ph, bh[2 * half], bh[2 * half + 1]);
+                }
+            }
+        }
+        __syncthreads();
+        stage ^= 1;
+    }
+
+#pragma unroll
+    for (int dt = 0; dt < 8; dt++)
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int h = i >> 1;
+            if (row[h] < seq_len) {
+                out[row[h] * q_model_dim + q_offset + dt * 8 + 2 * t + (i & 1)] =
+                    sum[h] > 0.0f ? o[dt][i] : 0.0f;
+            }
+        }
 }
