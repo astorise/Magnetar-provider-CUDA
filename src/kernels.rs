@@ -301,6 +301,9 @@ pub struct CudaKernels {
 /// The current hi/lo split buffer and the ones it outgrew.
 type SplitScratch = (Option<CudaSlice<u16>>, Vec<CudaSlice<u16>>);
 
+/// A split's scratch lock and the device addresses of its hi and lo terms.
+type SplitTerms<'a> = (std::sync::MutexGuard<'a, SplitScratch>, u64, u64);
+
 /// The current split-attention scratch buffer and the ones it outgrew.
 type AttentionScratch = (Option<CudaSlice<f32>>, Vec<CudaSlice<f32>>);
 
@@ -618,10 +621,16 @@ impl CudaKernels {
     }
 
     /// Splits the contiguous f32 `a` of `len` values into its bfloat16 hi
-    /// and lo terms (`tc_split_kernel`), returning their device addresses.
-    /// Both stay valid until this Provider drops; the next split on this
-    /// stream overwrites them, after every queued reader.
-    fn split_bf16(&self, a: &CudaDeviceBuffer, len: u64) -> Result<Option<(u64, u64)>, CudaError> {
+    /// and lo terms (`tc_split_kernel`), returning their device addresses
+    /// with the scratch lock. The caller holds that lock until it has
+    /// queued the matmul reading them, so another thread's split cannot
+    /// land in between on the stream (Codex review on
+    /// astorise/Magnetar-provider-CUDA#27).
+    fn split_bf16(
+        &self,
+        a: &CudaDeviceBuffer,
+        len: u64,
+    ) -> Result<Option<SplitTerms<'_>>, CudaError> {
         let Some(func) = self.tensor_function("tc_split_kernel") else {
             return Ok(None);
         };
@@ -649,7 +658,7 @@ impl CudaKernels {
             shared_mem_bytes: 0,
         };
         unsafe { args.launch(config) }?;
-        Ok(Some((hi, lo)))
+        Ok(Some((scratch, hi, lo)))
     }
 
     fn function(&self, name: &'static str) -> Result<CudaFunction, CudaError> {
@@ -1629,7 +1638,7 @@ impl CudaKernels {
             && k % TCP_ALIGN == 0
             && n % TCP_ALIGN == 0
             && let Some(func) = self.tensor_function("gated_matmul_tcp_kernel")
-            && let Some((a_hi, a_lo)) = self.split_bf16(a, m * k)?
+            && let Some((_split_lock, a_hi, a_lo)) = self.split_bf16(a, m * k)?
         {
             let mut args = self.stream.launch_builder(&func);
             args.arg(&a_hi)
@@ -1800,7 +1809,7 @@ impl CudaKernels {
             && k % TCP_ALIGN == 0
             && n % TCP_ALIGN == 0
             && let Some(func) = self.tensor_function("matmul_tcp_kernel")
-            && let Some((a_hi, a_lo)) = self.split_bf16(a, m * k)?
+            && let Some((_split_lock, a_hi, a_lo)) = self.split_bf16(a, m * k)?
         {
             let mut args = self.stream.launch_builder(&func);
             args.arg(&a_hi)
