@@ -1453,14 +1453,20 @@ extern "C" __global__ void attention_split_gqa_kernel(
     }
     unsigned int count = (unsigned int)(last - first);
 
-    // Stage K, V (rows past `count` as zeros) and the group's queries.
-    for (unsigned int e = tid; e < ATTENTION_GQA_KEYS * ATTENTION_GQA_D; e += ATTENTION_GQA_THREADS) {
+    // Stage K, V (rows past `count` as zeros) and the group's queries. The
+    // loop has a fixed trip count and is unrolled in batches, so each
+    // thread has several loads in flight instead of one at a time.
+    const float* k_base = k + first * kv_model_dim + kv_offset;
+    const float* v_base = v + first * kv_model_dim + kv_offset;
+#pragma unroll 8
+    for (unsigned int it = 0; it < ATTENTION_GQA_KEYS * ATTENTION_GQA_D / ATTENTION_GQA_THREADS; it++) {
+        unsigned int e = tid + it * ATTENTION_GQA_THREADS;
         unsigned int r = e / ATTENTION_GQA_D;
         unsigned int d = e % ATTENTION_GQA_D;
         bool present = r < count;
-        unsigned long long index = (first + r) * kv_model_dim + kv_offset + d;
-        k_s[r][d] = present ? k[index] : 0.0f;
-        v_s[r][d] = present ? v[index] : 0.0f;
+        unsigned long long index = (unsigned long long)r * kv_model_dim + d;
+        k_s[r][d] = present ? k_base[index] : 0.0f;
+        v_s[r][d] = present ? v_base[index] : 0.0f;
     }
     for (unsigned int e = tid; e < group * ATTENTION_GQA_D; e += ATTENTION_GQA_THREADS) {
         q_s[e / ATTENTION_GQA_D][e % ATTENTION_GQA_D] = q[first_head * ATTENTION_GQA_D + e];
@@ -1523,10 +1529,13 @@ extern "C" __global__ void attention_split_gqa_kernel(
     }
 }
 
-// Merges each head's chunks from `attention_split_kernel`, in chunk order:
+// Merges each head's chunks from `attention_split_kernel` (or the grouped
+// `attention_split_gqa_kernel`), in chunk order:
 // out = sum_c o_c * (s_c * exp(m_c - M) / sum_c' s_c' * exp(m_c' - M)), with M the
 // largest chunk max. Empty chunks are skipped; a head with no admitted key
-// gets zeros.
+// gets zeros. The block shares the per-chunk work: the maximum and the
+// chunk weights are computed once per chunk (into dynamic shared memory,
+// `chunks` floats) instead of once per output dimension.
 extern "C" __global__ void attention_combine_kernel(
     const float* partial,
     float* out,
@@ -1534,33 +1543,57 @@ extern "C" __global__ void attention_combine_kernel(
     unsigned long long head_dimension,
     unsigned long long chunks
 ) {
+    extern __shared__ float chunk_weight[];
+    __shared__ float reduce[1024];
     unsigned long long head = blockIdx.x;
     if (head >= head_count) {
         return;
     }
+    unsigned int tid = threadIdx.x;
+    unsigned int threads = blockDim.x;
     const float* head_partial = partial + head * chunks * (head_dimension + 2);
-    float max_value = neg_inf();
-    for (unsigned long long c = 0; c < chunks; c++) {
+    float local_max = neg_inf();
+    for (unsigned long long c = tid; c < chunks; c += threads) {
         const float* p = head_partial + c * (head_dimension + 2);
         if (p[head_dimension + 1] > 0.0f) {
-            max_value = fmaxf(max_value, p[head_dimension]);
+            local_max = fmaxf(local_max, p[head_dimension]);
         }
     }
-    float total = 0.0f;
-    for (unsigned long long c = 0; c < chunks; c++) {
+    reduce[tid] = local_max;
+    __syncthreads();
+    for (unsigned int stride = 1; stride < threads; stride <<= 1) {
+        if (tid % (2 * stride) == 0 && tid + stride < threads) {
+            reduce[tid] = fmaxf(reduce[tid], reduce[tid + stride]);
+        }
+        __syncthreads();
+    }
+    float max_value = reduce[0];
+    __syncthreads();
+    for (unsigned long long c = tid; c < chunks; c += threads) {
         const float* p = head_partial + c * (head_dimension + 2);
-        if (p[head_dimension + 1] > 0.0f) {
-            total += p[head_dimension + 1] * expf(p[head_dimension] - max_value);
-        }
+        chunk_weight[c] = p[head_dimension + 1] > 0.0f
+            ? p[head_dimension + 1] * expf(p[head_dimension] - max_value)
+            : 0.0f;
     }
-    for (unsigned long long d = threadIdx.x; d < head_dimension; d += blockDim.x) {
+    __syncthreads();
+    // The total in chunk order, as before (one thread: `chunks` is small
+    // next to the dimensions' work).
+    if (tid == 0) {
+        float total = 0.0f;
+        for (unsigned long long c = 0; c < chunks; c++) {
+            total += chunk_weight[c];
+        }
+        reduce[0] = total;
+    }
+    __syncthreads();
+    float total = reduce[0];
+    for (unsigned long long d = tid; d < head_dimension; d += threads) {
         float acc = 0.0f;
         for (unsigned long long c = 0; c < chunks; c++) {
-            const float* p = head_partial + c * (head_dimension + 2);
-            if (p[head_dimension + 1] > 0.0f) {
+            if (chunk_weight[c] > 0.0f) {
                 // Each chunk's share of the softmax mass, at most 1: the
                 // sum stays a weighted mean of V rows.
-                acc += p[d] * (p[head_dimension + 1] * expf(p[head_dimension] - max_value) / total);
+                acc += head_partial[c * (head_dimension + 2) + d] * (chunk_weight[c] / total);
             }
         }
         out[head * head_dimension + d] = acc;

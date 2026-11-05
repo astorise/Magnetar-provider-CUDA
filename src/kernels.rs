@@ -129,6 +129,9 @@ const ATTENTION_GQA_KEYS: u64 = 64;
 const ATTENTION_GQA_D: u64 = 64;
 const ATTENTION_GQA_MAX_GROUP: u64 = 8;
 const ATTENTION_GQA_THREADS: u32 = 128;
+/// Dynamic shared memory `attention_combine_kernel` may take for its
+/// per-chunk weights: 48 KB less its 4 KB static reduction scratch.
+const ATTENTION_COMBINE_MAX_DYNAMIC_SHARED: u32 = 44 * 1024;
 /// `ATTENTION_TILE_QUERIES` in `kernels.cu`: queries per tiled-attention
 /// block, 4 threads each.
 const ATTENTION_TILE_QUERIES: u64 = 64;
@@ -2425,7 +2428,12 @@ impl CudaKernels {
                 1,
                 1,
             ),
-            shared_mem_bytes: 0,
+            // One weight per chunk; the static reduction scratch takes 4 KB
+            // of the 48 KB a block may use.
+            shared_mem_bytes: u32::try_from(chunks * 4)
+                .ok()
+                .filter(|bytes| *bytes <= ATTENTION_COMBINE_MAX_DYNAMIC_SHARED)
+                .ok_or_else(overflow)?,
         };
         unsafe { args.launch(config) }?;
         Ok(CudaDeviceBuffer {
