@@ -39,6 +39,9 @@ const TENSOR_KERNEL_SOURCE: &str = include_str!("tensor_kernels.cu");
 const TC_BLOCK_M: u64 = 64;
 const TC_BLOCK_N: u64 = 64;
 const TC_THREADS: u32 = 128;
+/// `TCA_QUERIES` in `tensor_kernels.cu`: queries per Tensor Core attention
+/// block.
+const TCA_QUERIES: u64 = 64;
 /// Set to `0` to keep long prefill matmuls off the Tensor Cores (the
 /// bit-identical CUDA-core tile Kernels then serve them).
 pub const TENSOR_CORES_ENV: &str = "MAGNETAR_CUDA_TENSOR_CORES";
@@ -1941,6 +1944,50 @@ impl CudaKernels {
 
         // Several query rows (a prefill), outside a capture: the tiled
         // Kernel compiled for its head dimension.
+        // Several query rows, 64-dimension heads, on a Device with Tensor
+        // Cores: `attention_tc_kernel`.
+        if seq_len >= 16
+            && head_dimension == 64
+            && !self.is_capturing()
+            && let Some(func) = self.tensor_function("attention_tc_kernel")
+        {
+            let overflow = || {
+                CudaError::new(
+                    CudaErrorCode::ShapeUnsupported,
+                    "attention launch size overflows a grid dimension",
+                )
+            };
+            let mut out_dev = self.alloc_output(q.slice.len())?;
+            let mut args = self.stream.launch_builder(&func);
+            args.arg(&q.slice)
+                .arg(&k.slice)
+                .arg(&v.slice)
+                .arg(&mut out_dev)
+                .arg(&seq_len)
+                .arg(&kv_seq_len)
+                .arg(&head_count)
+                .arg(&kv_head_count)
+                .arg(&q_model_dim)
+                .arg(&kv_model_dim)
+                .arg(&causal_flag)
+                .arg(&window_arg)
+                .arg(&query_position_offset);
+            let config = LaunchConfig {
+                grid_dim: (
+                    u32::try_from(seq_len.div_ceil(TCA_QUERIES)).map_err(|_| overflow())?,
+                    u32::try_from(head_count).map_err(|_| overflow())?,
+                    1,
+                ),
+                block_dim: (TC_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe { args.launch(config) }?;
+            return Ok(CudaDeviceBuffer {
+                slice: out_dev,
+                shape: q.shape.clone(),
+                bf16: None,
+            });
+        }
         let tiled = match head_dimension {
             4 => Some("attention_tiled_1_kernel"),
             8 => Some("attention_tiled_2_kernel"),

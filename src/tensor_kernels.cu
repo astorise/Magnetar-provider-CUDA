@@ -231,3 +231,272 @@ extern "C" __global__ void gated_matmul_tc_kernel(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Prefill attention on the Tensor Cores (head dimension 64)
+// ---------------------------------------------------------------------------
+//
+// Block (query tile, head) serves TCA_QUERIES queries with 4 warps of 16.
+// Keys are taken TCA_KEYS at a time: S = Q K^T and the block's share of P V
+// run as `m16n8k16` bfloat16 `mma` with f32 accumulation. Every f32 operand
+// enters as two bfloat16 terms (hi, lo) and each product as hi*hi + hi*lo +
+// lo*hi, which keeps about 16 significant bits. Softmax is online per query
+// row; each key tile's probabilities are divided by the new running sum
+// before they weight V, so the output stays a weighted mean of V rows.
+// The scale 1/8 (exact for 64 dimensions) is folded into Q.
+
+__device__ __forceinline__ float neg_inf() {
+    return __int_as_float(0xff800000);
+}
+
+#define TCA_QUERIES 64
+#define TCA_KEYS 64
+#define TCA_D 64
+#define TCA_PITCH (TCA_D + 8)
+
+__device__ __forceinline__ void tca_split(float value, unsigned short* hi, unsigned short* lo) {
+    unsigned short h = tc_float_to_bf16(value);
+    if ((h & 0x7FFF) == 0x7F80 && isfinite(value)) {
+        h = (unsigned short)(((unsigned int)__float_as_int(value)) >> 16);
+    }
+    *hi = h;
+    *lo = tc_float_to_bf16(value - tc_bf16_to_float(h));
+}
+
+__device__ __forceinline__ void tca_split_pair(float first, float second, unsigned int* hi, unsigned int* lo) {
+    unsigned short h0, l0, h1, l1;
+    tca_split(first, &h0, &l0);
+    tca_split(second, &h1, &l1);
+    *hi = (unsigned int)h0 | ((unsigned int)h1 << 16);
+    *lo = (unsigned int)l0 | ((unsigned int)l1 << 16);
+}
+
+__device__ __forceinline__ unsigned int tca_u32(const unsigned short* p) {
+    return *(const unsigned int*)p;
+}
+
+__device__ __forceinline__ void tca_keys_of(
+    unsigned long long query_position, int causal, long long window_size,
+    unsigned long long kv_seq_len, unsigned long long* lower, unsigned long long* upper
+) {
+    unsigned long long up = causal ? (query_position + 1) : kv_seq_len;
+    unsigned long long low = 0;
+    if (window_size >= 0) {
+        unsigned long long window = (unsigned long long)window_size;
+        unsigned long long back = window > 0 ? window - 1 : 0;
+        low = query_position > back ? query_position - back : 0;
+        if (low > up) {
+            low = up;
+        }
+    }
+    *lower = low;
+    *upper = up;
+}
+
+extern "C" __global__ void attention_tc_kernel(
+    const float* q,
+    const float* k,
+    const float* v,
+    float* out,
+    unsigned long long seq_len,
+    unsigned long long kv_seq_len,
+    unsigned long long head_count,
+    unsigned long long kv_head_count,
+    unsigned long long q_model_dim,
+    unsigned long long kv_model_dim,
+    int causal,
+    long long window_size,
+    unsigned long long query_position_offset
+) {
+    // Q is staged in the key buffers first, then each key tile.
+    __shared__ __align__(16) unsigned short s_hi[TCA_KEYS][TCA_PITCH];
+    __shared__ __align__(16) unsigned short s_lo[TCA_KEYS][TCA_PITCH];
+    __shared__ __align__(16) unsigned short vt_hi[TCA_D][TCA_PITCH];
+    __shared__ __align__(16) unsigned short vt_lo[TCA_D][TCA_PITCH];
+    unsigned int tid = threadIdx.x;
+    unsigned int warp = tid >> 5;
+    unsigned int lane = tid & 31;
+    unsigned int g = lane >> 2;
+    unsigned int t = lane & 3;
+    unsigned long long head = blockIdx.y;
+    unsigned long long tile_first = (unsigned long long)blockIdx.x * TCA_QUERIES;
+    unsigned long long group_size = head_count / kv_head_count;
+    unsigned long long q_offset = head * TCA_D;
+    unsigned long long kv_offset = (head / group_size) * TCA_D;
+    const float scale = 0.125f;
+
+    for (unsigned int e = tid; e < TCA_QUERIES * TCA_D; e += 128) {
+        unsigned int r = e / TCA_D;
+        unsigned int c = e % TCA_D;
+        unsigned long long qi = tile_first + r;
+        float value = qi < seq_len ? q[qi * q_model_dim + q_offset + c] * scale : 0.0f;
+        tca_split(value, &s_hi[r][c], &s_lo[r][c]);
+    }
+    __syncthreads();
+    unsigned int qh[4][4];
+    unsigned int ql[4][4];
+    unsigned int wr = warp * 16 + g;
+#pragma unroll
+    for (int ks = 0; ks < 4; ks++) {
+        unsigned int c0 = ks * 16 + 2 * t;
+        qh[ks][0] = tca_u32(&s_hi[wr][c0]);
+        qh[ks][1] = tca_u32(&s_hi[wr + 8][c0]);
+        qh[ks][2] = tca_u32(&s_hi[wr][c0 + 8]);
+        qh[ks][3] = tca_u32(&s_hi[wr + 8][c0 + 8]);
+        ql[ks][0] = tca_u32(&s_lo[wr][c0]);
+        ql[ks][1] = tca_u32(&s_lo[wr + 8][c0]);
+        ql[ks][2] = tca_u32(&s_lo[wr][c0 + 8]);
+        ql[ks][3] = tca_u32(&s_lo[wr + 8][c0 + 8]);
+    }
+
+    // This thread's two query rows (g and g + 8 of its warp).
+    unsigned long long last_query = tile_first + TCA_QUERIES - 1;
+    if (last_query >= seq_len) {
+        last_query = seq_len - 1;
+    }
+    unsigned long long row[2] = {tile_first + wr, tile_first + wr + 8};
+    unsigned long long lower[2];
+    unsigned long long upper[2];
+#pragma unroll
+    for (int h = 0; h < 2; h++) {
+        unsigned long long position = query_position_offset + (row[h] < seq_len ? row[h] : last_query);
+        tca_keys_of(position, causal, window_size, kv_seq_len, &lower[h], &upper[h]);
+    }
+    unsigned long long block_lower;
+    unsigned long long block_upper;
+    {
+        unsigned long long unused;
+        tca_keys_of(query_position_offset + tile_first, causal, window_size, kv_seq_len, &block_lower, &unused);
+        tca_keys_of(query_position_offset + last_query, causal, window_size, kv_seq_len, &unused, &block_upper);
+    }
+
+    float max_value[2] = {neg_inf(), neg_inf()};
+    float sum[2] = {0.0f, 0.0f};
+    float o[8][4];
+#pragma unroll
+    for (int dt = 0; dt < 8; dt++)
+#pragma unroll
+        for (int i = 0; i < 4; i++) o[dt][i] = 0.0f;
+
+    for (unsigned long long tile = block_lower; tile < block_upper; tile += TCA_KEYS) {
+        __syncthreads();
+        for (unsigned int e = tid; e < TCA_KEYS * TCA_D; e += 128) {
+            unsigned int r = e / TCA_D;
+            unsigned int c = e % TCA_D;
+            unsigned long long key = tile + r;
+            bool present = key < kv_seq_len;
+            float kv = present ? k[key * kv_model_dim + kv_offset + c] : 0.0f;
+            float vv = present ? v[key * kv_model_dim + kv_offset + c] : 0.0f;
+            tca_split(kv, &s_hi[r][c], &s_lo[r][c]);
+            tca_split(vv, &vt_hi[c][r], &vt_lo[c][r]);
+        }
+        __syncthreads();
+
+        float s[8][4];
+#pragma unroll
+        for (int nt = 0; nt < 8; nt++)
+#pragma unroll
+            for (int i = 0; i < 4; i++) s[nt][i] = 0.0f;
+#pragma unroll
+        for (int ks = 0; ks < 4; ks++) {
+            unsigned int c0 = ks * 16 + 2 * t;
+#pragma unroll
+            for (int nt = 0; nt < 8; nt++) {
+                unsigned int kr = nt * 8 + g;
+                unsigned int bh0 = tca_u32(&s_hi[kr][c0]);
+                unsigned int bh1 = tca_u32(&s_hi[kr][c0 + 8]);
+                unsigned int bl0 = tca_u32(&s_lo[kr][c0]);
+                unsigned int bl1 = tca_u32(&s_lo[kr][c0 + 8]);
+                tc_mma(s[nt], ql[ks], bh0, bh1);
+                tc_mma(s[nt], qh[ks], bl0, bl1);
+                tc_mma(s[nt], qh[ks], bh0, bh1);
+            }
+        }
+
+        // Masks, then each row's online softmax update.
+        float tile_max[2] = {neg_inf(), neg_inf()};
+#pragma unroll
+        for (int nt = 0; nt < 8; nt++)
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                int h = i >> 1;
+                unsigned long long key = tile + nt * 8 + 2 * t + (i & 1);
+                bool admitted = key >= lower[h] && key < upper[h] && key < kv_seq_len;
+                s[nt][i] = admitted ? s[nt][i] : neg_inf();
+                tile_max[h] = fmaxf(tile_max[h], s[nt][i]);
+            }
+        float keep[2];
+        float take[2];
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+            tile_max[h] = fmaxf(tile_max[h], __shfl_xor_sync(0xffffffffu, tile_max[h], 1));
+            tile_max[h] = fmaxf(tile_max[h], __shfl_xor_sync(0xffffffffu, tile_max[h], 2));
+        }
+        float new_max[2];
+        float tile_sum[2] = {0.0f, 0.0f};
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+            new_max[h] = fmaxf(max_value[h], tile_max[h]);
+        }
+#pragma unroll
+        for (int nt = 0; nt < 8; nt++)
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                int h = i >> 1;
+                float p = new_max[h] == neg_inf() ? 0.0f : expf(s[nt][i] - new_max[h]);
+                s[nt][i] = p;
+                tile_sum[h] += p;
+            }
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+            tile_sum[h] += __shfl_xor_sync(0xffffffffu, tile_sum[h], 1);
+            tile_sum[h] += __shfl_xor_sync(0xffffffffu, tile_sum[h], 2);
+            float kept = sum[h] > 0.0f ? sum[h] * expf(max_value[h] - new_max[h]) : 0.0f;
+            float total = kept + tile_sum[h];
+            keep[h] = total > 0.0f ? kept / total : 0.0f;
+            take[h] = total > 0.0f ? 1.0f / total : 0.0f;
+            sum[h] = total;
+            max_value[h] = new_max[h];
+        }
+#pragma unroll
+        for (int dt = 0; dt < 8; dt++)
+#pragma unroll
+            for (int i = 0; i < 4; i++) o[dt][i] *= keep[i >> 1];
+
+        // P V, P normalized by the running sum: two key n-tiles form one
+        // m16k16 A fragment.
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            unsigned int ph[4];
+            unsigned int pl[4];
+            tca_split_pair(s[2 * j][0] * take[0], s[2 * j][1] * take[0], &ph[0], &pl[0]);
+            tca_split_pair(s[2 * j][2] * take[1], s[2 * j][3] * take[1], &ph[1], &pl[1]);
+            tca_split_pair(s[2 * j + 1][0] * take[0], s[2 * j + 1][1] * take[0], &ph[2], &pl[2]);
+            tca_split_pair(s[2 * j + 1][2] * take[1], s[2 * j + 1][3] * take[1], &ph[3], &pl[3]);
+            unsigned int c0 = j * 16 + 2 * t;
+#pragma unroll
+            for (int dt = 0; dt < 8; dt++) {
+                unsigned int dr = dt * 8 + g;
+                unsigned int bh0 = tca_u32(&vt_hi[dr][c0]);
+                unsigned int bh1 = tca_u32(&vt_hi[dr][c0 + 8]);
+                unsigned int bl0 = tca_u32(&vt_lo[dr][c0]);
+                unsigned int bl1 = tca_u32(&vt_lo[dr][c0 + 8]);
+                tc_mma(o[dt], pl, bh0, bh1);
+                tc_mma(o[dt], ph, bl0, bl1);
+                tc_mma(o[dt], ph, bh0, bh1);
+            }
+        }
+    }
+
+    // No key admitted (an empty window) leaves the output zero.
+#pragma unroll
+    for (int dt = 0; dt < 8; dt++)
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int h = i >> 1;
+            if (row[h] < seq_len) {
+                out[row[h] * q_model_dim + q_offset + dt * 8 + 2 * t + (i & 1)] =
+                    sum[h] > 0.0f ? o[dt][i] : 0.0f;
+            }
+        }
+}
