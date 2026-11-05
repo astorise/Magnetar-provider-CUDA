@@ -49,6 +49,8 @@ const TCP_ALIGN: u64 = 8;
 /// `TCA_QUERIES` in `tensor_kernels.cu`: queries per Tensor Core attention
 /// block.
 const TCA_QUERIES: u64 = 64;
+/// `TCAP_KEYS` in `tensor_kernels.cu`: keys per Tensor Core attention stage.
+const TCAP_KEYS: u64 = 32;
 /// Set to `0` to keep long prefill matmuls off the Tensor Cores (the
 /// bit-identical CUDA-core tile Kernels then serve them).
 pub const TENSOR_CORES_ENV: &str = "MAGNETAR_CUDA_TENSOR_CORES";
@@ -121,14 +123,34 @@ const ATTENTION_THREADS: u32 = 128;
 const ATTENTION_CHUNK_KEYS: u64 = 128;
 /// `ATTENTION_SPLIT_THREADS` in `kernels.cu`.
 const ATTENTION_SPLIT_THREADS: u32 = 128;
-/// `ATTENTION_GQA_KEYS` / `ATTENTION_GQA_D` / `ATTENTION_GQA_MAX_GROUP` /
-/// `ATTENTION_GQA_THREADS` in `kernels.cu`: the grouped-query split decode
-/// attention, which serves 64-dimension heads with at most 8 query heads
-/// per KV head.
-const ATTENTION_GQA_KEYS: u64 = 64;
-const ATTENTION_GQA_D: u64 = 64;
+/// `ATTENTION_GQA_MAX_GROUP` / `ATTENTION_GQA_THREADS` in `kernels.cu`:
+/// the grouped-query split decode attention, which serves 64- and
+/// 128-dimension heads with at most 8 query heads per KV head.
 const ATTENTION_GQA_MAX_GROUP: u64 = 8;
 const ATTENTION_GQA_THREADS: u32 = 128;
+
+/// The grouped split decode attention for a head dimension: its kernel and
+/// keys per chunk (`attention_split_gqa_body`'s template arguments).
+fn grouped_decode_kernel(head_dimension: u64) -> Option<(&'static str, u64)> {
+    match head_dimension {
+        64 => Some(("attention_split_gqa_kernel", 64)),
+        128 => Some(("attention_split_gqa128_kernel", 32)),
+        _ => None,
+    }
+}
+
+/// The Tensor Core prefill attention for a head dimension: its kernel and
+/// dynamic shared memory, four stages (K hi/lo, V hi/lo) of 2 x 32 keys of
+/// `head_dimension + 8` halves (`attention_tcp_body`).
+fn tensor_core_prefill_attention(head_dimension: u64) -> Option<(&'static str, u32)> {
+    let name = match head_dimension {
+        64 => "attention_tcp_kernel",
+        128 => "attention_tcp128_kernel",
+        _ => return None,
+    };
+    let bytes = 4 * 2 * TCAP_KEYS * (head_dimension + 8) * 2;
+    Some((name, u32::try_from(bytes).ok()?))
+}
 /// Dynamic shared memory `attention_combine_kernel` may take for its
 /// per-chunk weights: 48 KB less its 4 KB static reduction scratch.
 const ATTENTION_COMBINE_MAX_DYNAMIC_SHARED: u32 = 44 * 1024;
@@ -2104,17 +2126,24 @@ impl CudaKernels {
             );
         }
 
-        // Several query rows, 64-dimension heads, on a Device with Tensor
-        // Cores: `attention_tcp_kernel` on K and V split once, when their
-        // rows align. Otherwise (and while capturing) the tiled Kernel
-        // compiled for the head dimension.
+        // Several query rows, 64- or 128-dimension heads, on a Device with
+        // Tensor Cores: `attention_tcp_kernel` / `attention_tcp128_kernel`
+        // on K and V split once, when their rows align. Otherwise (and
+        // while capturing) the tiled Kernel compiled for the head
+        // dimension.
         let kv_len = kv_seq_len * kv_model_dim;
         if seq_len >= 16
-            && head_dimension == 64
             && kv_model_dim % TCP_ALIGN == 0
             && kv_len > 0
             && !self.is_capturing()
-            && let Some(func) = self.tensor_function("attention_tcp_kernel")
+            && let Some((name, shared_bytes)) = tensor_core_prefill_attention(head_dimension)
+            && let Some(func) = self.tensor_function(name)
+            && func
+                .set_attribute(
+                    cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    i32::try_from(shared_bytes).unwrap_or(i32::MAX),
+                )
+                .is_ok()
             && let Some((_split_lock, terms)) = self.split_bf16_all(&[(k, kv_len), (v, kv_len)])?
         {
             let overflow = || {
@@ -2148,7 +2177,7 @@ impl CudaKernels {
                     1,
                 ),
                 block_dim: (TC_THREADS, 1, 1),
-                shared_mem_bytes: 0,
+                shared_mem_bytes: shared_bytes,
             };
             unsafe { args.launch(config) }?;
             return Ok(CudaDeviceBuffer {
@@ -2331,15 +2360,12 @@ impl CudaKernels {
         };
         // All query heads of a KV head in one block, reading its K and V
         // once, where the shapes allow it.
-        let grouped = head_dimension == ATTENTION_GQA_D
-            && kv_head_count > 0
-            && head_count % kv_head_count == 0
-            && head_count / kv_head_count <= ATTENTION_GQA_MAX_GROUP;
-        let chunk_keys = if grouped {
-            ATTENTION_GQA_KEYS
-        } else {
-            ATTENTION_CHUNK_KEYS
-        };
+        let grouped = grouped_decode_kernel(head_dimension).filter(|_| {
+            kv_head_count > 0
+                && head_count % kv_head_count == 0
+                && head_count / kv_head_count <= ATTENTION_GQA_MAX_GROUP
+        });
+        let chunk_keys = grouped.map_or(ATTENTION_CHUNK_KEYS, |(_, keys)| keys);
         let chunks = kv_rows.div_ceil(chunk_keys).max(1);
         let partial_len =
             usize::try_from(head_count * chunks * (head_dimension + 2)).map_err(|_| overflow())?;
@@ -2359,8 +2385,8 @@ impl CudaKernels {
         }
         let partial = scratch.0.as_mut().expect("allocated above");
         let mut out_dev = self.alloc_output(q.slice.len())?;
-        if grouped {
-            let split = self.function("attention_split_gqa_kernel")?;
+        if let Some((grouped_name, _)) = grouped {
+            let split = self.function(grouped_name)?;
             let mut args = self.stream.launch_builder(&split);
             args.arg(&q.slice)
                 .arg(&k.slice)
