@@ -304,6 +304,9 @@ type SplitScratch = (Option<CudaSlice<u16>>, Vec<CudaSlice<u16>>);
 /// A split's scratch lock and the device addresses of its hi and lo terms.
 type SplitTerms<'a> = (std::sync::MutexGuard<'a, SplitScratch>, u64, u64);
 
+/// A multi-input split's scratch lock and each input's (hi, lo) addresses.
+type SplitTermsAll<'a> = (std::sync::MutexGuard<'a, SplitScratch>, Vec<(u64, u64)>);
+
 /// The current split-attention scratch buffer and the ones it outgrew.
 type AttentionScratch = (Option<CudaSlice<f32>>, Vec<CudaSlice<f32>>);
 
@@ -623,7 +626,7 @@ impl CudaKernels {
     /// Splits the contiguous f32 `a` of `len` values into its bfloat16 hi
     /// and lo terms (`tc_split_kernel`), returning their device addresses
     /// with the scratch lock. The caller holds that lock until it has
-    /// queued the matmul reading them, so another thread's split cannot
+    /// queued the Kernel reading them, so another thread's split cannot
     /// land in between on the stream (Codex review on
     /// astorise/Magnetar-provider-CUDA#27).
     fn split_bf16(
@@ -631,34 +634,52 @@ impl CudaKernels {
         a: &CudaDeviceBuffer,
         len: u64,
     ) -> Result<Option<SplitTerms<'_>>, CudaError> {
+        Ok(self
+            .split_bf16_all(&[(a, len)])?
+            .map(|(lock, terms)| (lock, terms[0].0, terms[0].1)))
+    }
+
+    /// [`Self::split_bf16`] for several inputs into one scratch buffer:
+    /// each input's (hi, lo) addresses, in order, with the scratch lock.
+    fn split_bf16_all(
+        &self,
+        inputs: &[(&CudaDeviceBuffer, u64)],
+    ) -> Result<Option<SplitTermsAll<'_>>, CudaError> {
         let Some(func) = self.tensor_function("tc_split_kernel") else {
             return Ok(None);
         };
-        let Ok(total) = usize::try_from(len * 2) else {
+        let values: u64 = inputs.iter().map(|(_, len)| len).sum();
+        let Ok(total) = usize::try_from(values * 2) else {
             return Ok(None);
         };
         let mut scratch = self.split_scratch.lock().unwrap();
         if scratch.0.as_ref().is_none_or(|slice| slice.len() < total) {
-            self.forbid_in_capture("growing the matmul split buffer")?;
+            self.forbid_in_capture("growing the Tensor Core split buffer")?;
             // SAFETY: `tc_split_kernel` writes both terms of every value
-            // before a matmul on this same stream reads them.
+            // before a Kernel on this same stream reads them.
             let grown = unsafe { self.stream.alloc::<u16>(total.max(1 << 20)) }?;
             if let Some(outgrown) = scratch.0.replace(grown) {
                 scratch.1.push(outgrown);
             }
         }
         let buffer = scratch.0.as_mut().expect("allocated above");
-        let hi = buffer.device_ptr(&self.stream).0;
-        let lo = hi + len * 2;
-        let mut args = self.stream.launch_builder(&func);
-        args.arg(&a.slice).arg(&hi).arg(&lo).arg(&len);
-        let config = LaunchConfig {
-            grid_dim: (len.div_ceil(256).min(4096) as u32, 1, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe { args.launch(config) }?;
-        Ok(Some((scratch, hi, lo)))
+        let mut next = buffer.device_ptr(&self.stream).0;
+        let mut terms = Vec::with_capacity(inputs.len());
+        for &(input, len) in inputs {
+            let hi = next;
+            let lo = hi + len * 2;
+            next = lo + len * 2;
+            let mut args = self.stream.launch_builder(&func);
+            args.arg(&input.slice).arg(&hi).arg(&lo).arg(&len);
+            let config = LaunchConfig {
+                grid_dim: (len.div_ceil(256).clamp(1, 4096) as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe { args.launch(config) }?;
+            terms.push((hi, lo));
+        }
+        Ok(Some((scratch, terms)))
     }
 
     fn function(&self, name: &'static str) -> Result<CudaFunction, CudaError> {
@@ -2072,10 +2093,58 @@ impl CudaKernels {
             );
         }
 
-        // Several query rows (a prefill), outside a capture: the tiled
-        // Kernel compiled for its head dimension.
         // Several query rows, 64-dimension heads, on a Device with Tensor
-        // Cores: `attention_tc_kernel`.
+        // Cores: `attention_tcp_kernel` on K and V split once, when their
+        // rows align; else `attention_tc_kernel`.
+        let kv_len = kv_seq_len * kv_model_dim;
+        if seq_len >= 16
+            && head_dimension == 64
+            && kv_model_dim % TCP_ALIGN == 0
+            && kv_len > 0
+            && !self.is_capturing()
+            && let Some(func) = self.tensor_function("attention_tcp_kernel")
+            && let Some((_split_lock, terms)) = self.split_bf16_all(&[(k, kv_len), (v, kv_len)])?
+        {
+            let overflow = || {
+                CudaError::new(
+                    CudaErrorCode::ShapeUnsupported,
+                    "attention launch size overflows a grid dimension",
+                )
+            };
+            let [(k_hi, k_lo), (v_hi, v_lo)] = [terms[0], terms[1]];
+            let mut out_dev = self.alloc_output(q.slice.len())?;
+            let mut args = self.stream.launch_builder(&func);
+            args.arg(&q.slice)
+                .arg(&k_hi)
+                .arg(&k_lo)
+                .arg(&v_hi)
+                .arg(&v_lo)
+                .arg(&mut out_dev)
+                .arg(&seq_len)
+                .arg(&kv_seq_len)
+                .arg(&head_count)
+                .arg(&kv_head_count)
+                .arg(&q_model_dim)
+                .arg(&kv_model_dim)
+                .arg(&causal_flag)
+                .arg(&window_arg)
+                .arg(&query_position_offset);
+            let config = LaunchConfig {
+                grid_dim: (
+                    u32::try_from(seq_len.div_ceil(TCA_QUERIES)).map_err(|_| overflow())?,
+                    u32::try_from(head_count).map_err(|_| overflow())?,
+                    1,
+                ),
+                block_dim: (TC_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe { args.launch(config) }?;
+            return Ok(CudaDeviceBuffer {
+                slice: out_dev,
+                shape: q.shape.clone(),
+                bf16: None,
+            });
+        }
         if seq_len >= 16
             && head_dimension == 64
             && !self.is_capturing()
