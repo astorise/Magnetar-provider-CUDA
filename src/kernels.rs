@@ -39,6 +39,13 @@ const TENSOR_KERNEL_SOURCE: &str = include_str!("tensor_kernels.cu");
 const TC_BLOCK_M: u64 = 64;
 const TC_BLOCK_N: u64 = 64;
 const TC_THREADS: u32 = 128;
+/// `TCP_BLOCK_M` / `TCP_BLOCK_N` / `TCP_THREADS` in `tensor_kernels.cu`:
+/// the pipelined Tensor Core matmuls, which need `k` and `n` to be
+/// multiples of `TCP_ALIGN` (16-byte rows of bfloat16).
+const TCP_BLOCK_M: u64 = 128;
+const TCP_BLOCK_N: u64 = 64;
+const TCP_THREADS: u32 = 256;
+const TCP_ALIGN: u64 = 8;
 /// `TCA_QUERIES` in `tensor_kernels.cu`: queries per Tensor Core attention
 /// block.
 const TCA_QUERIES: u64 = 64;
@@ -285,7 +292,14 @@ pub struct CudaKernels {
     /// then every buffer it outgrew. A captured step may still read an
     /// outgrown one, so none is freed before this Provider.
     attention_scratch: std::sync::Mutex<AttentionScratch>,
+    /// The bfloat16 hi and lo terms of a pipelined Tensor Core matmul's
+    /// `a`: the current buffer, then every buffer it outgrew (kept until
+    /// this Provider drops, like the attention scratch).
+    split_scratch: std::sync::Mutex<SplitScratch>,
 }
+
+/// The current hi/lo split buffer and the ones it outgrew.
+type SplitScratch = (Option<CudaSlice<u16>>, Vec<CudaSlice<u16>>);
 
 /// The current split-attention scratch buffer and the ones it outgrew.
 type AttentionScratch = (Option<CudaSlice<f32>>, Vec<CudaSlice<f32>>);
@@ -392,6 +406,7 @@ impl CudaKernels {
             capture: std::sync::Mutex::new(None),
             embedding_flag: std::sync::Mutex::new(None),
             attention_scratch: std::sync::Mutex::new((None, Vec::new())),
+            split_scratch: std::sync::Mutex::new((None, Vec::new())),
         })
     }
 
@@ -600,6 +615,41 @@ impl CudaKernels {
         let function = module.load_function(name).ok()?;
         functions.insert(name, function.clone());
         Some(function)
+    }
+
+    /// Splits the contiguous f32 `a` of `len` values into its bfloat16 hi
+    /// and lo terms (`tc_split_kernel`), returning their device addresses.
+    /// Both stay valid until this Provider drops; the next split on this
+    /// stream overwrites them, after every queued reader.
+    fn split_bf16(&self, a: &CudaDeviceBuffer, len: u64) -> Result<Option<(u64, u64)>, CudaError> {
+        let Some(func) = self.tensor_function("tc_split_kernel") else {
+            return Ok(None);
+        };
+        let Ok(total) = usize::try_from(len * 2) else {
+            return Ok(None);
+        };
+        let mut scratch = self.split_scratch.lock().unwrap();
+        if scratch.0.as_ref().is_none_or(|slice| slice.len() < total) {
+            self.forbid_in_capture("growing the matmul split buffer")?;
+            // SAFETY: `tc_split_kernel` writes both terms of every value
+            // before a matmul on this same stream reads them.
+            let grown = unsafe { self.stream.alloc::<u16>(total.max(1 << 20)) }?;
+            if let Some(outgrown) = scratch.0.replace(grown) {
+                scratch.1.push(outgrown);
+            }
+        }
+        let buffer = scratch.0.as_mut().expect("allocated above");
+        let hi = buffer.device_ptr(&self.stream).0;
+        let lo = hi + len * 2;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(&a.slice).arg(&hi).arg(&lo).arg(&len);
+        let config = LaunchConfig {
+            grid_dim: (len.div_ceil(256).min(4096) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { args.launch(config) }?;
+        Ok(Some((hi, lo)))
     }
 
     fn function(&self, name: &'static str) -> Result<CudaFunction, CudaError> {
@@ -1570,7 +1620,42 @@ impl CudaKernels {
         let b_inner_stride = n;
         let (gate16, up16) = (self.bf16_address(gate), self.bf16_address(up));
         let mut out_dev = self.alloc_output((m * n) as usize)?;
-        // A long prefill against compact weights: the Tensor Cores.
+        // A long prefill against compact weights: the pipelined Tensor
+        // Core Kernel when the rows align, else the plain one.
+        if m >= MATMUL_TILE_MIN_ROWS
+            && gate16 != 0
+            && up16 != 0
+            && !transpose_a
+            && k % TCP_ALIGN == 0
+            && n % TCP_ALIGN == 0
+            && let Some(func) = self.tensor_function("gated_matmul_tcp_kernel")
+            && let Some((a_hi, a_lo)) = self.split_bf16(a, m * k)?
+        {
+            let mut args = self.stream.launch_builder(&func);
+            args.arg(&a_hi)
+                .arg(&a_lo)
+                .arg(&gate16)
+                .arg(&up16)
+                .arg(&mut out_dev)
+                .arg(&m)
+                .arg(&k)
+                .arg(&n);
+            let config = LaunchConfig {
+                grid_dim: (
+                    n.div_ceil(TCP_BLOCK_N) as u32,
+                    m.div_ceil(TCP_BLOCK_M) as u32,
+                    1,
+                ),
+                block_dim: (TCP_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe { args.launch(config) }?;
+            return Ok(CudaDeviceBuffer {
+                slice: out_dev,
+                shape: vec![m, n],
+                bf16: None,
+            });
+        }
         if m >= MATMUL_TILE_MIN_ROWS
             && gate16 != 0
             && up16 != 0
@@ -1701,7 +1786,48 @@ impl CudaKernels {
         }
         let b16 = self.bf16_address(b);
         let mut out_dev = self.alloc_output((m * n) as usize)?;
-        // A long prefill against a compact weight: the Tensor Cores.
+        let (addend_buffer, addend_mode) = match addend {
+            None => (a, 0i32),
+            Some(MatmulAddend::Row(bias)) => (bias, 1),
+            Some(MatmulAddend::Full(residual)) => (residual, 2),
+        };
+        // A long prefill against a compact weight: the pipelined Tensor
+        // Core Kernel when the rows align, else the plain one.
+        if m >= MATMUL_TILE_MIN_ROWS
+            && b16 != 0
+            && !transpose_a
+            && !transpose_b
+            && k % TCP_ALIGN == 0
+            && n % TCP_ALIGN == 0
+            && let Some(func) = self.tensor_function("matmul_tcp_kernel")
+            && let Some((a_hi, a_lo)) = self.split_bf16(a, m * k)?
+        {
+            let mut args = self.stream.launch_builder(&func);
+            args.arg(&a_hi)
+                .arg(&a_lo)
+                .arg(&b16)
+                .arg(&mut out_dev)
+                .arg(&m)
+                .arg(&k)
+                .arg(&n)
+                .arg(&addend_buffer.slice)
+                .arg(&addend_mode);
+            let config = LaunchConfig {
+                grid_dim: (
+                    n.div_ceil(TCP_BLOCK_N) as u32,
+                    m.div_ceil(TCP_BLOCK_M) as u32,
+                    1,
+                ),
+                block_dim: (TCP_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe { args.launch(config) }?;
+            return Ok(CudaDeviceBuffer {
+                slice: out_dev,
+                shape: vec![m, n],
+                bf16: None,
+            });
+        }
         if m >= MATMUL_TILE_MIN_ROWS
             && b16 != 0
             && a_inner_stride == 1
@@ -1709,11 +1835,6 @@ impl CudaKernels {
             && b_inner_stride == n
             && let Some(func) = self.tensor_function("matmul_tc_kernel")
         {
-            let (addend_buffer, addend_mode) = match addend {
-                None => (a, 0i32),
-                Some(MatmulAddend::Row(bias)) => (bias, 1),
-                Some(MatmulAddend::Full(residual)) => (residual, 2),
-            };
             let mut args = self.stream.launch_builder(&func);
             args.arg(&a.slice)
                 .arg(&b16)
