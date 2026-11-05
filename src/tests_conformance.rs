@@ -1141,8 +1141,13 @@ fn block_attention_matches_reference_cpu_on_decode_prefill_and_long_histories() 
         return;
     };
     // (seq_len, kv_seq_len, head_count, kv_head_count, head_dimension, window)
-    let cases: [(u64, u64, u64, u64, u64, Option<u64>); 11] = [
+    let cases: [(u64, u64, u64, u64, u64, Option<u64>); 14] = [
         (1, 300, 14, 2, 64, None),
+        // The grouped decode Kernel: one exact 64-key chunk, a long history
+        // ending in a partial chunk, and one query head per KV head.
+        (1, 64, 14, 2, 64, None),
+        (1, 4100, 14, 2, 64, None),
+        (1, 129, 2, 2, 64, Some(64)),
         (1, 1000, 14, 2, 64, Some(300)),
         (130, 130, 14, 2, 64, None),
         (200, 1000, 14, 2, 64, Some(150)),
@@ -1212,6 +1217,40 @@ fn block_attention_keeps_large_finite_values_finite() {
                 None,
                 None,
                 false,
+            )
+            .unwrap(),
+    );
+    for value in &actual.data {
+        assert!(
+            value.is_finite() && (value / 1e38 - 1.0).abs() < 1e-5,
+            "{value}"
+        );
+    }
+}
+
+/// The same for the grouped decode Kernel (64-dimension heads sharing a KV
+/// head): each chunk's output is a weighted mean of V rows.
+#[test]
+fn grouped_decode_attention_keeps_large_finite_values_finite() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let keys = 130u64;
+    let q = HostTensor::new([1, 4 * 64], vec![0.0; 4 * 64]).unwrap();
+    let k = HostTensor::new([keys, 64], vec![0.0; 64 * keys as usize]).unwrap();
+    let v = HostTensor::new([keys, 64], vec![1e38; 64 * keys as usize]).unwrap();
+    let actual = download(
+        &kernels,
+        &kernels
+            .attention(
+                &upload(&kernels, &q),
+                &upload(&kernels, &k),
+                &upload(&kernels, &v),
+                4,
+                64,
+                Some(1),
+                None,
+                true,
             )
             .unwrap(),
     );

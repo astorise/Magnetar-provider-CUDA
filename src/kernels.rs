@@ -121,6 +121,14 @@ const ATTENTION_THREADS: u32 = 128;
 const ATTENTION_CHUNK_KEYS: u64 = 128;
 /// `ATTENTION_SPLIT_THREADS` in `kernels.cu`.
 const ATTENTION_SPLIT_THREADS: u32 = 128;
+/// `ATTENTION_GQA_KEYS` / `ATTENTION_GQA_D` / `ATTENTION_GQA_MAX_GROUP` /
+/// `ATTENTION_GQA_THREADS` in `kernels.cu`: the grouped-query split decode
+/// attention, which serves 64-dimension heads with at most 8 query heads
+/// per KV head.
+const ATTENTION_GQA_KEYS: u64 = 64;
+const ATTENTION_GQA_D: u64 = 64;
+const ATTENTION_GQA_MAX_GROUP: u64 = 8;
+const ATTENTION_GQA_THREADS: u32 = 128;
 /// `ATTENTION_TILE_QUERIES` in `kernels.cu`: queries per tiled-attention
 /// block, 4 threads each.
 const ATTENTION_TILE_QUERIES: u64 = 64;
@@ -2318,7 +2326,18 @@ impl CudaKernels {
                 "attention launch size overflows a grid dimension",
             )
         };
-        let chunks = kv_rows.div_ceil(ATTENTION_CHUNK_KEYS).max(1);
+        // All query heads of a KV head in one block, reading its K and V
+        // once, where the shapes allow it.
+        let grouped = head_dimension == ATTENTION_GQA_D
+            && kv_head_count > 0
+            && head_count % kv_head_count == 0
+            && head_count / kv_head_count <= ATTENTION_GQA_MAX_GROUP;
+        let chunk_keys = if grouped {
+            ATTENTION_GQA_KEYS
+        } else {
+            ATTENTION_CHUNK_KEYS
+        };
+        let chunks = kv_rows.div_ceil(chunk_keys).max(1);
         let partial_len =
             usize::try_from(head_count * chunks * (head_dimension + 2)).map_err(|_| overflow())?;
         let mut scratch = self.attention_scratch.lock().unwrap();
@@ -2337,33 +2356,61 @@ impl CudaKernels {
         }
         let partial = scratch.0.as_mut().expect("allocated above");
         let mut out_dev = self.alloc_output(q.slice.len())?;
-        let split = self.function("attention_split_kernel")?;
-        let mut args = self.stream.launch_builder(&split);
-        args.arg(&q.slice)
-            .arg(&k.slice)
-            .arg(&v.slice)
-            .arg(&mut *partial)
-            .arg(&kv_seq_len)
-            .arg(&head_count)
-            .arg(&kv_head_count)
-            .arg(&head_dimension)
-            .arg(&q_model_dim)
-            .arg(&kv_model_dim)
-            .arg(&causal_flag)
-            .arg(&window_arg)
-            .arg(&query_position_offset)
-            .arg(&chunks)
-            .arg(&step_offset);
-        let config = LaunchConfig {
-            grid_dim: (
-                u32::try_from(chunks).map_err(|_| overflow())?,
-                u32::try_from(head_count).map_err(|_| overflow())?,
-                1,
-            ),
-            block_dim: (ATTENTION_SPLIT_THREADS, 1, 1),
-            shared_mem_bytes: u32::try_from(head_dimension * 4).map_err(|_| overflow())?,
-        };
-        unsafe { args.launch(config) }?;
+        if grouped {
+            let split = self.function("attention_split_gqa_kernel")?;
+            let mut args = self.stream.launch_builder(&split);
+            args.arg(&q.slice)
+                .arg(&k.slice)
+                .arg(&v.slice)
+                .arg(&mut *partial)
+                .arg(&kv_seq_len)
+                .arg(&head_count)
+                .arg(&kv_head_count)
+                .arg(&kv_model_dim)
+                .arg(&causal_flag)
+                .arg(&window_arg)
+                .arg(&query_position_offset)
+                .arg(&chunks)
+                .arg(&step_offset);
+            let config = LaunchConfig {
+                grid_dim: (
+                    u32::try_from(chunks).map_err(|_| overflow())?,
+                    u32::try_from(kv_head_count).map_err(|_| overflow())?,
+                    1,
+                ),
+                block_dim: (ATTENTION_GQA_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe { args.launch(config) }?;
+        } else {
+            let split = self.function("attention_split_kernel")?;
+            let mut args = self.stream.launch_builder(&split);
+            args.arg(&q.slice)
+                .arg(&k.slice)
+                .arg(&v.slice)
+                .arg(&mut *partial)
+                .arg(&kv_seq_len)
+                .arg(&head_count)
+                .arg(&kv_head_count)
+                .arg(&head_dimension)
+                .arg(&q_model_dim)
+                .arg(&kv_model_dim)
+                .arg(&causal_flag)
+                .arg(&window_arg)
+                .arg(&query_position_offset)
+                .arg(&chunks)
+                .arg(&step_offset);
+            let config = LaunchConfig {
+                grid_dim: (
+                    u32::try_from(chunks).map_err(|_| overflow())?,
+                    u32::try_from(head_count).map_err(|_| overflow())?,
+                    1,
+                ),
+                block_dim: (ATTENTION_SPLIT_THREADS, 1, 1),
+                shared_mem_bytes: u32::try_from(head_dimension * 4).map_err(|_| overflow())?,
+            };
+            unsafe { args.launch(config) }?;
+        }
         let combine = self.function("attention_combine_kernel")?;
         let mut args = self.stream.launch_builder(&combine);
         args.arg(&*partial)

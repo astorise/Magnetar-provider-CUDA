@@ -1379,6 +1379,150 @@ extern "C" __global__ void attention_split_kernel(
     }
 }
 
+// Split-key attention for one query row, all query heads of one KV head
+// together (grouped-query attention, 64-dimension heads, at most
+// ATTENTION_GQA_MAX_GROUP query heads per KV head). Block (chunk, kv_head)
+// stages ATTENTION_GQA_KEYS rows of K and V once, with coalesced loads,
+// scores them for every query head of the group, and writes each head's
+// partial in `attention_split_kernel`'s layout, so
+// `attention_combine_kernel` merges them unchanged. Weights are normalized
+// within the chunk before they weight V, as there.
+#define ATTENTION_GQA_KEYS 64
+#define ATTENTION_GQA_D 64
+#define ATTENTION_GQA_MAX_GROUP 8
+#define ATTENTION_GQA_THREADS 128
+extern "C" __global__ void attention_split_gqa_kernel(
+    const float* q,
+    const float* k,
+    const float* v,
+    float* partial,
+    unsigned long long kv_seq_len,
+    unsigned long long head_count,
+    unsigned long long kv_head_count,
+    unsigned long long kv_model_dim,
+    int causal,
+    long long window_size, // -1 means "no window"
+    unsigned long long query_position_offset,
+    unsigned long long chunks,
+    const unsigned long long* step_offset
+) {
+    // K rows padded to 65 floats: a warp scoring 32 consecutive keys reads
+    // 32 distinct banks.
+    __shared__ float k_s[ATTENTION_GQA_KEYS][ATTENTION_GQA_D + 1];
+    __shared__ float v_s[ATTENTION_GQA_KEYS][ATTENTION_GQA_D];
+    __shared__ float q_s[ATTENTION_GQA_MAX_GROUP][ATTENTION_GQA_D];
+    __shared__ float p_s[ATTENTION_GQA_MAX_GROUP][ATTENTION_GQA_KEYS];
+    __shared__ float stats[ATTENTION_GQA_MAX_GROUP][2];
+    if (step_offset) {
+        kv_seq_len += *step_offset;
+        query_position_offset += *step_offset;
+    }
+    unsigned long long chunk = blockIdx.x;
+    unsigned long long kv_head = blockIdx.y;
+    unsigned int tid = threadIdx.x;
+    unsigned int lane = tid & 31;
+    unsigned int warp = tid >> 5;
+    unsigned int group = (unsigned int)(head_count / kv_head_count);
+    unsigned long long first_head = kv_head * group;
+    unsigned long long kv_offset = kv_head * ATTENTION_GQA_D;
+
+    unsigned long long query_position = query_position_offset;
+    unsigned long long key_upper = causal ? (query_position + 1) : kv_seq_len;
+    unsigned long long key_lower = 0;
+    if (window_size >= 0) {
+        unsigned long long window = (unsigned long long)window_size;
+        unsigned long long back = window > 0 ? window - 1 : 0;
+        key_lower = query_position > back ? query_position - back : 0;
+        if (key_lower > key_upper) {
+            key_lower = key_upper;
+        }
+    }
+    unsigned long long first = key_lower + chunk * ATTENTION_GQA_KEYS;
+    unsigned long long last = first + ATTENTION_GQA_KEYS;
+    if (last > key_upper) {
+        last = key_upper;
+    }
+    if (first >= last) {
+        for (unsigned int e = tid; e < group * (ATTENTION_GQA_D + 2); e += ATTENTION_GQA_THREADS) {
+            unsigned int g = e / (ATTENTION_GQA_D + 2);
+            unsigned int d = e % (ATTENTION_GQA_D + 2);
+            float* out = partial + ((first_head + g) * chunks + chunk) * (ATTENTION_GQA_D + 2);
+            out[d] = d == ATTENTION_GQA_D ? neg_inf() : 0.0f;
+        }
+        return;
+    }
+    unsigned int count = (unsigned int)(last - first);
+
+    // Stage K, V (rows past `count` as zeros) and the group's queries.
+    for (unsigned int e = tid; e < ATTENTION_GQA_KEYS * ATTENTION_GQA_D; e += ATTENTION_GQA_THREADS) {
+        unsigned int r = e / ATTENTION_GQA_D;
+        unsigned int d = e % ATTENTION_GQA_D;
+        bool present = r < count;
+        unsigned long long index = (first + r) * kv_model_dim + kv_offset + d;
+        k_s[r][d] = present ? k[index] : 0.0f;
+        v_s[r][d] = present ? v[index] : 0.0f;
+    }
+    for (unsigned int e = tid; e < group * ATTENTION_GQA_D; e += ATTENTION_GQA_THREADS) {
+        q_s[e / ATTENTION_GQA_D][e % ATTENTION_GQA_D] = q[first_head * ATTENTION_GQA_D + e];
+    }
+    __syncthreads();
+
+    // Scores: pair (g, j) for key j of head g; a warp takes 32 keys of one
+    // head. The scale 1/8 is exact for 64 dimensions.
+    for (unsigned int pair = tid; pair < group * ATTENTION_GQA_KEYS; pair += ATTENTION_GQA_THREADS) {
+        unsigned int g = pair / ATTENTION_GQA_KEYS;
+        unsigned int j = pair % ATTENTION_GQA_KEYS;
+        float dot = 0.0f;
+#pragma unroll 16
+        for (unsigned int d = 0; d < ATTENTION_GQA_D; d++) {
+            dot += q_s[g][d] * k_s[j][d];
+        }
+        p_s[g][j] = j < count ? dot * 0.125f : neg_inf();
+    }
+    __syncthreads();
+
+    // Softmax per head: a warp per head, two keys per lane.
+    for (unsigned int g = warp; g < group; g += ATTENTION_GQA_THREADS / 32) {
+        float s0 = p_s[g][lane];
+        float s1 = p_s[g][lane + 32];
+        float max_value = fmaxf(s0, s1);
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            max_value = fmaxf(max_value, __shfl_xor_sync(0xffffffffu, max_value, offset));
+        }
+        float w0 = expf(s0 - max_value);
+        float w1 = expf(s1 - max_value);
+        float sum = w0 + w1;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum += __shfl_xor_sync(0xffffffffu, sum, offset);
+        }
+        p_s[g][lane] = w0 / sum;
+        p_s[g][lane + 32] = w1 / sum;
+        if (lane == 0) {
+            stats[g][0] = max_value;
+            stats[g][1] = sum;
+        }
+    }
+    __syncthreads();
+
+    // Weighted sums of V: output (g, d), a warp covering 32 dimensions of
+    // one head.
+    for (unsigned int e = tid; e < group * ATTENTION_GQA_D; e += ATTENTION_GQA_THREADS) {
+        unsigned int g = e / ATTENTION_GQA_D;
+        unsigned int d = e % ATTENTION_GQA_D;
+        float acc = 0.0f;
+#pragma unroll 16
+        for (unsigned int j = 0; j < ATTENTION_GQA_KEYS; j++) {
+            acc += p_s[g][j] * v_s[j][d];
+        }
+        float* out = partial + ((first_head + g) * chunks + chunk) * (ATTENTION_GQA_D + 2);
+        out[d] = acc;
+        if (d == 0) {
+            out[ATTENTION_GQA_D] = stats[g][0];
+            out[ATTENTION_GQA_D + 1] = stats[g][1];
+        }
+    }
+}
+
 // Merges each head's chunks from `attention_split_kernel`, in chunk order:
 // out = sum_c o_c * (s_c * exp(m_c - M) / sum_c' s_c' * exp(m_c' - M)), with M the
 // largest chunk max. Empty chunks are skipped; a head with no admitted key
