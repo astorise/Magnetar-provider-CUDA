@@ -52,12 +52,6 @@ const TCA_QUERIES: u64 = 64;
 /// Set to `0` to keep long prefill matmuls off the Tensor Cores (the
 /// bit-identical CUDA-core tile Kernels then serve them).
 pub const TENSOR_CORES_ENV: &str = "MAGNETAR_CUDA_TENSOR_CORES";
-/// Set to `bf16` to feed the pipelined Tensor Core matmuls one bfloat16
-/// term per activation instead of two: half their Tensor Core work, about
-/// 8 significant bits of each activation instead of 16. An opt-in profile,
-/// not the default; the attention and the plain Tensor Core matmuls keep
-/// their split terms.
-pub const TENSOR_CORE_ACTIVATIONS_ENV: &str = "MAGNETAR_CUDA_TENSOR_CORE_ACTIVATIONS";
 
 /// What a fused matmul adds to its product.
 #[derive(Clone, Copy)]
@@ -273,10 +267,6 @@ pub struct CudaKernels {
     /// capability 8.0 or later), they compiled, and
     /// [`TENSOR_CORES_ENV`] does not turn them off.
     tensor_module: Option<Arc<CudaModule>>,
-    /// Whether the pipelined Tensor Core matmuls feed each activation as
-    /// two bfloat16 terms (the default) or one
-    /// ([`TENSOR_CORE_ACTIVATIONS_ENV`]).
-    tensor_split_activations: bool,
     /// Counts real host<->device crossings (`upload`/`download` calls
     /// only, never a Kernel launch itself) -- used by tests to prove two
     /// chained Kernel invocations do not round-trip through the host
@@ -415,8 +405,6 @@ impl CudaKernels {
             stream,
             module,
             tensor_module,
-            tensor_split_activations: std::env::var(TENSOR_CORE_ACTIVATIONS_ENV).as_deref()
-                != Ok("bf16"),
             upload_count: AtomicU64::new(0),
             download_count: AtomicU64::new(0),
             functions: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -621,12 +609,6 @@ impl CudaKernels {
     /// Whether long prefill matmuls run on the Tensor Cores.
     pub fn has_tensor_cores(&self) -> bool {
         self.tensor_module.is_some()
-    }
-
-    /// Whether the pipelined Tensor Core matmuls feed each activation as
-    /// two bfloat16 terms (see [`TENSOR_CORE_ACTIVATIONS_ENV`]).
-    pub fn tensor_core_split_activations(&self) -> bool {
-        self.tensor_split_activations
     }
 
     /// A Tensor Core Kernel function, when the Tensor Core module loaded.
@@ -1679,7 +1661,6 @@ impl CudaKernels {
             && let Some(func) = self.tensor_function("gated_matmul_tcp_kernel")
             && let Some((_split_lock, a_hi, a_lo)) = self.split_bf16(a, m * k)?
         {
-            let split = i32::from(self.tensor_split_activations);
             let mut args = self.stream.launch_builder(&func);
             args.arg(&a_hi)
                 .arg(&a_lo)
@@ -1688,8 +1669,7 @@ impl CudaKernels {
                 .arg(&mut out_dev)
                 .arg(&m)
                 .arg(&k)
-                .arg(&n)
-                .arg(&split);
+                .arg(&n);
             let config = LaunchConfig {
                 grid_dim: (
                     n.div_ceil(TCP_BLOCK_N) as u32,
@@ -1852,7 +1832,6 @@ impl CudaKernels {
             && let Some(func) = self.tensor_function("matmul_tcp_kernel")
             && let Some((_split_lock, a_hi, a_lo)) = self.split_bf16(a, m * k)?
         {
-            let split = i32::from(self.tensor_split_activations);
             let mut args = self.stream.launch_builder(&func);
             args.arg(&a_hi)
                 .arg(&a_lo)
@@ -1862,8 +1841,7 @@ impl CudaKernels {
                 .arg(&k)
                 .arg(&n)
                 .arg(&addend_buffer.slice)
-                .arg(&addend_mode)
-                .arg(&split);
+                .arg(&addend_mode);
             let config = LaunchConfig {
                 grid_dim: (
                     n.div_ceil(TCP_BLOCK_N) as u32,

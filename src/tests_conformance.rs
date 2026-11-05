@@ -807,10 +807,6 @@ fn tensor_core_matmul_keeps_f32_activation_precision() {
     if !kernels.has_tensor_cores() {
         return;
     }
-    // The opt-in one-term profile drops the low term on purpose.
-    if !kernels.tensor_core_split_activations() {
-        return;
-    }
     for (m, k, n) in [(70u64, 900u64, 130u64), (200, 904, 136)] {
         check_activation_precision(&kernels, m, k, n);
     }
@@ -869,17 +865,10 @@ fn tensor_core_matmul_keeps_activations_near_f32_max_finite() {
         .unwrap();
     assert!(b.is_compact());
     let expected = f64::from(f32::MAX) * f64::from(small) * k as f64;
-    // Two bfloat16 terms keep about 16 significant bits; the opt-in
-    // one-term profile keeps the truncated hi term alone, within 2^-8.
-    let tolerance = if kernels.tensor_core_split_activations() {
-        1e-4
-    } else {
-        2f64.powi(-7)
-    };
     let actual = download(&kernels, &kernels.matmul(&a, &b, false, false).unwrap());
     for value in &actual.data {
         assert!(
-            value.is_finite() && ((f64::from(*value) - expected) / expected).abs() < tolerance,
+            value.is_finite() && ((f64::from(*value) - expected) / expected).abs() < 1e-4,
             "{value} vs {expected}"
         );
     }
