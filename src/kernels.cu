@@ -1535,7 +1535,8 @@ extern "C" __global__ void attention_split_gqa_kernel(
 // largest chunk max. Empty chunks are skipped; a head with no admitted key
 // gets zeros. The block shares the per-chunk work: the maximum and the
 // chunk weights are computed once per chunk (into dynamic shared memory,
-// `chunks` floats) instead of once per output dimension.
+// `chunks` floats) instead of once per output dimension, and the weighted
+// sum of each dimension is split across lanes of chunks.
 extern "C" __global__ void attention_combine_kernel(
     const float* partial,
     float* out,
@@ -1587,16 +1588,40 @@ extern "C" __global__ void attention_combine_kernel(
     }
     __syncthreads();
     float total = reduce[0];
-    for (unsigned long long d = tid; d < head_dimension; d += threads) {
+    // Thread t sums dimension t % head_dimension over every `lanes`-th
+    // chunk from t / head_dimension, several loads in flight; the lanes'
+    // sums are then added in lane order, so the result does not depend on
+    // scheduling.
+    unsigned int lanes = threads / (unsigned int)head_dimension;
+    if (lanes == 0) {
+        lanes = 1;
+    }
+    __syncthreads();
+    for (unsigned long long d0 = 0; d0 < head_dimension; d0 += threads / lanes) {
+        unsigned long long d = d0 + tid % (threads / lanes);
+        unsigned int lane = tid / (threads / lanes);
         float acc = 0.0f;
-        for (unsigned long long c = 0; c < chunks; c++) {
-            if (chunk_weight[c] > 0.0f) {
-                // Each chunk's share of the softmax mass, at most 1: the
-                // sum stays a weighted mean of V rows.
-                acc += head_partial[c * (head_dimension + 2) + d] * (chunk_weight[c] / total);
+        if (d < head_dimension && lane < lanes) {
+#pragma unroll 4
+            for (unsigned long long c = lane; c < chunks; c += lanes) {
+                float w = chunk_weight[c];
+                if (w > 0.0f) {
+                    // Each chunk's share of the softmax mass, at most 1:
+                    // the sum stays a weighted mean of V rows.
+                    acc += head_partial[c * (head_dimension + 2) + d] * (w / total);
+                }
             }
         }
-        out[head * head_dimension + d] = acc;
+        reduce[tid] = acc;
+        __syncthreads();
+        if (lane == 0 && d < head_dimension) {
+            float sum = 0.0f;
+            for (unsigned int l = 0; l < lanes; l++) {
+                sum += reduce[l * (threads / lanes) + tid % (threads / lanes)];
+            }
+            out[head * head_dimension + d] = sum;
+        }
+        __syncthreads();
     }
 }
 

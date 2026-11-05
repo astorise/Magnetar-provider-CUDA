@@ -2423,8 +2423,15 @@ impl CudaKernels {
             .arg(&chunks);
         let config = LaunchConfig {
             grid_dim: (u32::try_from(head_count).map_err(|_| overflow())?, 1, 1),
+            // Lanes of chunks per output dimension: up to 8, within 256
+            // threads for small heads, one lane past 1024 dimensions.
             block_dim: (
-                u32::try_from(head_dimension.min(1024)).map_err(|_| overflow())?,
+                u32::try_from(if head_dimension > 1024 {
+                    1024
+                } else {
+                    head_dimension * (256 / head_dimension).clamp(1, 8)
+                })
+                .map_err(|_| overflow())?,
                 1,
                 1,
             ),
