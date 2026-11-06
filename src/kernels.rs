@@ -579,9 +579,10 @@ impl CudaKernels {
 
     /// The device address of `buffer`'s allocation, as a capture records it.
     pub fn address(&self, buffer: &CudaDeviceBuffer) -> u64 {
-        match &buffer.bf16 {
-            Some(bf16) => bf16.device_ptr(&self.stream).0,
-            None => buffer.slice.device_ptr(&self.stream).0,
+        match (&buffer.bf16, &buffer.q8) {
+            (Some(bf16), _) => bf16.device_ptr(&self.stream).0,
+            (None, Some(q8)) => q8.quants.device_ptr(&self.stream).0,
+            (None, None) => buffer.slice.device_ptr(&self.stream).0,
         }
     }
 
@@ -1390,7 +1391,17 @@ impl CudaKernels {
             .arg(&table16)
             .arg(&table_q8)
             .arg(&table_q8_scales);
-        let launched = unsafe { args.launch(LaunchConfig::for_num_elems(num_ids as u32)) };
+        let launched =
+            unsafe { args.launch(LaunchConfig::for_num_elems(num_ids as u32)) }.map_err(|error| {
+                CudaError::new(
+                    CudaErrorCode::ExecutionFailed,
+                    format!(
+                        "embedding_lookup_kernel launch ({num_ids} ids, table {vocab}x{dim}, \
+                         packed {}): {error}",
+                        table.is_q8()
+                    ),
+                )
+            });
         *flag_slot = Some(invalid_id_flag);
         drop(flag_slot);
         launched?;
@@ -1410,7 +1421,16 @@ impl CudaKernels {
         // can only be observed by downloading this one-element flag -- the
         // same device-computed-flag pattern `softmax_rows` already uses
         // below, not a blanket per-kernel host round-trip.
-        self.check_embedding_flag()?;
+        self.check_embedding_flag().map_err(|error| {
+            CudaError::new(
+                CudaErrorCode::ExecutionFailed,
+                format!(
+                    "embedding lookup ({num_ids} ids, table {vocab}x{dim}, packed {}) \
+                     completion: {error}",
+                    table.is_q8()
+                ),
+            )
+        })?;
         Ok(CudaDeviceBuffer {
             slice: out_dev,
             shape: vec![num_ids, dim],

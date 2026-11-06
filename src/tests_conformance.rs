@@ -1934,3 +1934,84 @@ fn q8_packed_gated_matmul_and_embedding_match_reference_cpu() {
         .unwrap();
     assert_eq!(download(&kernels, &actual).data, expected.data);
 }
+
+/// The real Qwen2.5-0.5B shapes (`execute-direct-quantized-weights`): a
+/// packed `[151936, 896]` embedding table read row by row, and the tied
+/// lm_head as the same bytes in transposed storage (`[896, 151936]`
+/// logically) through the decode matmul, checked against the dequantized
+/// values on sampled rows and columns.
+#[test]
+fn q8_packed_weights_at_real_checkpoint_sizes() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let (vocab, hidden) = (151_936_u64, 896_u64);
+    let blocks = (vocab * hidden / 32) as usize;
+    let mut bytes = Vec::with_capacity(blocks * 34);
+    for block in 0..blocks {
+        // d = 2^-7 * (1 + (block % 7) / 8), exactly an f16.
+        let d_bits: u16 = (8 << 10) | (((block % 7) as u16) << 7);
+        bytes.extend(d_bits.to_le_bytes());
+        bytes.extend((0..32).map(|i| (((block * 31 + i * 7) % 255) as i32 - 127) as i8 as u8));
+    }
+    let value = |row: u64, col: u64| {
+        let index = (row * hidden + col) as usize;
+        let block = index / 32;
+        let d = (1.0 + (block % 7) as f32 / 8.0) / 128.0;
+        let q = ((block * 31 + (index % 32) * 7) % 255) as i32 - 127;
+        d * q as f32
+    };
+    let table = PackedWeight::new(
+        PackedWeightFormat::Q8_0,
+        vocab,
+        hidden,
+        false,
+        bytes.clone(),
+    )
+    .unwrap();
+    let lm_head = PackedWeight::new(PackedWeightFormat::Q8_0, vocab, hidden, true, bytes).unwrap();
+
+    let table_dev = kernels.upload_packed_weight(&table).unwrap();
+    let ids = [0_u64, 1, 77_777, vocab - 1, 4242];
+    let ids_tensor = HostTensor::new(
+        [ids.len() as u64],
+        ids.iter().map(|&id| id as f32).collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let rows = download(
+        &kernels,
+        &kernels
+            .embedding_lookup(&table_dev, &upload(&kernels, &ids_tensor))
+            .unwrap(),
+    );
+    for (r, &id) in ids.iter().enumerate() {
+        for col in 0..hidden {
+            assert_eq!(
+                rows.data[r * hidden as usize + col as usize],
+                value(id, col)
+            );
+        }
+    }
+
+    let lm_head_dev = kernels.upload_packed_weight(&lm_head).unwrap();
+    let a = activations(5, hidden, 3);
+    let logits = download(
+        &kernels,
+        &kernels
+            .matmul(&upload(&kernels, &a), &lm_head_dev, false, false)
+            .unwrap(),
+    );
+    assert_eq!(logits.shape, vec![5, vocab]);
+    for r in 0..5_u64 {
+        for col in [0_u64, 1, 31, 32, 99_999, vocab - 1] {
+            let expected: f32 = (0..hidden)
+                .map(|k| a.data[(r * hidden + k) as usize] * value(col, k))
+                .sum();
+            let actual = logits.data[(r * vocab + col) as usize];
+            assert!(
+                (actual - expected).abs() <= 1e-3,
+                "[{r}, {col}]: {actual} vs {expected}"
+            );
+        }
+    }
+}
