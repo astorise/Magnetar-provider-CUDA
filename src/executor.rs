@@ -40,6 +40,7 @@ use magnetar_runtime::memory::{
 use magnetar_runtime::operator::{
     OperatorAttributeValue, OperatorSpec, RopeBandedFrequencyScaling,
 };
+use magnetar_runtime::packed_weight::{PackedWeight, PackedWeightWrite};
 use magnetar_runtime::provider::{
     ProviderExecutionApi, StepCaptureId, StepCaptureRequest, StepReplayError, TensorValue,
     TensorValueAdmissionError,
@@ -352,6 +353,22 @@ impl CudaExecutor {
         let buffer = self.kernels.upload_weight(&tensor)?;
         self.storage.lock().unwrap().insert(id, buffer);
         Ok(())
+    }
+
+    /// See [`ProviderExecutionApi::write_packed_weight_tensor`]: a `Q8_0`
+    /// weight is stored packed ([`CudaKernels::upload_packed_weight`])
+    /// unless [`crate::kernels::PACKED_WEIGHTS_ENV`] is `0`.
+    pub fn write_packed_weight_tensor(
+        &self,
+        id: TensorResourceId,
+        weight: &PackedWeight,
+    ) -> Result<PackedWeightWrite, CudaError> {
+        if std::env::var(crate::kernels::PACKED_WEIGHTS_ENV).as_deref() == Ok("0") {
+            return Ok(PackedWeightWrite::Declined);
+        }
+        let buffer = self.kernels.upload_packed_weight(weight)?;
+        self.storage.lock().unwrap().insert(id, buffer);
+        Ok(PackedWeightWrite::Stored)
     }
 
     pub fn write_tensor(&self, id: TensorResourceId, tensor: HostTensor) -> Result<(), CudaError> {
@@ -871,6 +888,7 @@ impl CudaExecutor {
                     slice,
                     shape,
                     bf16: None,
+                    q8: None,
                 },
             );
         }
@@ -1597,6 +1615,22 @@ impl ProviderExecutionApi for CudaExecutor {
                 self.provider_binding(),
                 Some(self.device_binding()),
                 format!("CUDA device upload failed: {error}"),
+            )
+        })
+    }
+
+    fn write_packed_weight_tensor(
+        &self,
+        id: TensorResourceId,
+        weight: PackedWeight,
+    ) -> Result<PackedWeightWrite, ProviderExecutionError> {
+        CudaExecutor::write_packed_weight_tensor(self, id, &weight).map_err(|error| {
+            ProviderExecutionError::new(
+                ProviderExecutionErrorCode::MaterializationFailed,
+                ProviderExecutionPhase::Submit,
+                self.provider_binding(),
+                Some(self.device_binding()),
+                format!("CUDA packed weight upload failed: {error}"),
             )
         })
     }

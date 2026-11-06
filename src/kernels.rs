@@ -25,6 +25,7 @@ use cudarc::driver::{
 use cudarc::nvrtc::compile_ptx;
 use magnetar_runtime::HostTensor;
 use magnetar_runtime::operator::RopeBandedFrequencyScaling;
+use magnetar_runtime::packed_weight::{PackedWeight, PackedWeightFormat};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -55,6 +56,10 @@ const TCAP_KEYS: u64 = 32;
 /// Set to `0` to keep long prefill matmuls off the Tensor Cores (the
 /// bit-identical CUDA-core tile Kernels then serve them).
 pub const TENSOR_CORES_ENV: &str = "MAGNETAR_CUDA_TENSOR_CORES";
+/// Set to `0` to decline packed weights (`execute-direct-quantized-weights`):
+/// Model Loading then hands this Provider their dequantized f32 values, the
+/// disable control for direct quantized execution.
+pub const PACKED_WEIGHTS_ENV: &str = "MAGNETAR_CUDA_PACKED_WEIGHTS";
 
 /// What a fused matmul adds to its product.
 #[derive(Clone, Copy)]
@@ -241,14 +246,30 @@ pub struct CudaDeviceBuffer {
     /// embedding lookup's table. They convert each value back to the same
     /// f32 exactly, so their results are unchanged.
     pub(crate) bf16: Option<CudaSlice<u16>>,
+    /// A packed `Q8_0` weight (`execute-direct-quantized-weights`), stored
+    /// as the checkpoint stored it: no Kernel reads `slice` then either.
+    pub(crate) q8: Option<CudaQ8Weight>,
+}
+
+/// A `Q8_0` matrix on the device: its signed 8-bit quants in stored
+/// row-major order and one `f32` scale per 32-value block (the block's
+/// `f16` scale, converted exactly). The logical matrix (the buffer's
+/// `shape`) is the stored one, or its transpose when `transposed`.
+pub struct CudaQ8Weight {
+    pub(crate) quants: CudaSlice<i8>,
+    pub(crate) scales: CudaSlice<f32>,
+    pub(crate) stored_rows: u64,
+    pub(crate) stored_cols: u64,
+    pub(crate) transposed: bool,
 }
 
 impl CudaDeviceBuffer {
     /// Elements, compact or not.
     pub fn len(&self) -> usize {
-        match &self.bf16 {
-            Some(bf16) => bf16.len(),
-            None => self.slice.len(),
+        match (&self.bf16, &self.q8) {
+            (Some(bf16), _) => bf16.len(),
+            (None, Some(q8)) => q8.quants.len(),
+            (None, None) => self.slice.len(),
         }
     }
 
@@ -256,11 +277,26 @@ impl CudaDeviceBuffer {
         self.len() == 0
     }
 
-    /// Whether the values are stored as bfloat16 bits.
+    /// Whether the values are stored compact: as bfloat16 bits or as a
+    /// packed `Q8_0` weight. Only Kernels that read a compact operand
+    /// accept one.
     pub fn is_compact(&self) -> bool {
-        self.bf16.is_some()
+        self.bf16.is_some() || self.q8.is_some()
+    }
+
+    /// Whether the values are a packed `Q8_0` weight.
+    pub fn is_q8(&self) -> bool {
+        self.q8.is_some()
     }
 }
+
+/// Rows of a matmul against a packed `Q8_0` weight served by
+/// `q8_matmul_rows_kernel` (decode steps and short prompts); a longer
+/// matmul dequantizes the weight to f32 for the duration of the call.
+const Q8_MATMUL_MAX_ROWS: u64 = 64;
+/// `Q8_MATMUL_ROWS` / `Q8_MATMUL_WARPS` in `kernels.cu`.
+const Q8_MATMUL_ROWS: u64 = 8;
+const Q8_MATMUL_WARPS: u32 = 4;
 
 /// Weights at least this large are stored compact when every value is
 /// exactly a bfloat16 value; smaller tensors (biases, norm weights,
@@ -738,6 +774,7 @@ impl CudaKernels {
             slice,
             shape: tensor.shape.clone(),
             bf16: None,
+            q8: None,
         })
     }
 
@@ -760,6 +797,7 @@ impl CudaKernels {
             slice: self.stream.alloc_zeros::<f32>(len)?,
             shape: shape.to_vec(),
             bf16: None,
+            q8: None,
         })
     }
 
@@ -803,14 +841,83 @@ impl CudaKernels {
             slice,
             shape: tensor.shape.clone(),
             bf16: Some(bf16),
+            q8: None,
         })
     }
 
     /// The same values as a compact `buffer`, stored as f32: for a Kernel
     /// that only reads f32 operands.
     pub fn expand(&self, buffer: &CudaDeviceBuffer) -> Result<CudaDeviceBuffer, CudaError> {
+        if buffer.is_q8() {
+            return self.dequantize_q8(buffer);
+        }
         let tensor = self.download(buffer)?;
         self.upload(&tensor)
+    }
+
+    /// Stores a packed weight as the checkpoint stored it
+    /// (`execute-direct-quantized-weights`): its `Q8_0` quants and one f32
+    /// scale per block, with the buffer shaped as the logical matrix.
+    pub fn upload_packed_weight(
+        &self,
+        weight: &PackedWeight,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        match weight.format() {
+            PackedWeightFormat::Q8_0 => {}
+        }
+        self.forbid_in_capture("a host-to-device upload")?;
+        let blocks = weight.bytes().as_chunks::<34>().0;
+        let mut quants = Vec::with_capacity(blocks.len() * 32);
+        let mut scales = Vec::with_capacity(blocks.len());
+        for block in blocks {
+            scales.push(half_precision::f16_to_f32(u16::from_le_bytes([
+                block[0], block[1],
+            ])));
+            quants.extend(block[2..].iter().map(|&q| q as i8));
+        }
+        let quants = self.stream.clone_htod(&quants)?;
+        let scales = self.stream.clone_htod(&scales)?;
+        // The f32 placeholder no Kernel reads.
+        let slice = self.stream.alloc_zeros::<f32>(1)?;
+        self.upload_count.fetch_add(1, Ordering::Relaxed);
+        Ok(CudaDeviceBuffer {
+            slice,
+            shape: weight.logical_shape().to_vec(),
+            bf16: None,
+            q8: Some(CudaQ8Weight {
+                quants,
+                scales,
+                stored_rows: weight.stored_rows(),
+                stored_cols: weight.stored_cols(),
+                transposed: weight.transposed(),
+            }),
+        })
+    }
+
+    /// A packed `Q8_0` buffer's logical matrix as f32, dequantized on the
+    /// Device.
+    pub fn dequantize_q8(&self, buffer: &CudaDeviceBuffer) -> Result<CudaDeviceBuffer, CudaError> {
+        let q8 = buffer.q8.as_ref().ok_or_else(|| {
+            CudaError::new(CudaErrorCode::DTypeUnsupported, "not a packed weight")
+        })?;
+        let elements = q8.stored_rows * q8.stored_cols;
+        let mut out = self.alloc_output(elements as usize)?;
+        let transposed = u32::from(q8.transposed);
+        let func = self.function("q8_dequantize_kernel")?;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(&q8.quants)
+            .arg(&q8.scales)
+            .arg(&mut out)
+            .arg(&q8.stored_rows)
+            .arg(&q8.stored_cols)
+            .arg(&transposed);
+        unsafe { args.launch(LaunchConfig::for_num_elems(elements as u32)) }?;
+        Ok(CudaDeviceBuffer {
+            slice: out,
+            shape: buffer.shape.clone(),
+            bf16: None,
+            q8: None,
+        })
     }
 
     /// Downloads a device buffer to host-visible bytes. The only
@@ -820,6 +927,9 @@ impl CudaKernels {
     /// as an automatic step of every Kernel invocation.
     pub fn download(&self, buffer: &CudaDeviceBuffer) -> Result<HostTensor, CudaError> {
         self.forbid_in_capture("a device-to-host download")?;
+        if buffer.is_q8() {
+            return self.download(&self.dequantize_q8(buffer)?);
+        }
         let data = match &buffer.bf16 {
             Some(bf16) => {
                 let bits = self.stream.clone_dtoh(bf16)?;
@@ -1051,6 +1161,12 @@ impl CudaKernels {
     pub fn clone_buffer(&self, buffer: &CudaDeviceBuffer) -> Result<CudaDeviceBuffer, CudaError> {
         self.forbid_in_capture("a buffer copy")?;
         let slice = self.stream.clone_dtod(&buffer.slice)?;
+        if buffer.is_q8() {
+            return Err(CudaError::new(
+                CudaErrorCode::DTypeUnsupported,
+                "a packed weight is never copied",
+            ));
+        }
         let bf16 = match &buffer.bf16 {
             Some(bf16) => Some(self.stream.clone_dtod(bf16)?),
             None => None,
@@ -1059,6 +1175,7 @@ impl CudaKernels {
             slice,
             shape: buffer.shape.clone(),
             bf16,
+            q8: None,
         })
     }
 
@@ -1085,6 +1202,7 @@ impl CudaKernels {
                 slice: out_dev,
                 shape: a.shape.clone(),
                 bf16: None,
+                q8: None,
             });
         }
         let cols = *a.shape.last().ok_or_else(|| {
@@ -1122,6 +1240,7 @@ impl CudaKernels {
             slice: out_dev,
             shape: a.shape.clone(),
             bf16: None,
+            q8: None,
         })
     }
 
@@ -1142,6 +1261,7 @@ impl CudaKernels {
             slice: out_dev,
             shape: a.shape.clone(),
             bf16: None,
+            q8: None,
         })
     }
 
@@ -1204,6 +1324,7 @@ impl CudaKernels {
             slice: out_dev,
             shape,
             bf16: None,
+            q8: None,
         })
     }
 
@@ -1219,6 +1340,7 @@ impl CudaKernels {
             slice: out_dev,
             shape: input.shape.clone(),
             bf16: None,
+            q8: None,
         })
     }
 
@@ -1229,7 +1351,18 @@ impl CudaKernels {
     ) -> Result<CudaDeviceBuffer, CudaError> {
         let (vocab, dim) = rows_cols_buf(table)?;
         Self::require_f32(&[ids], "the embedding lookup's ids")?;
+        // A packed table read row by row must be stored untransposed.
+        if table.q8.as_ref().is_some_and(|q8| q8.transposed) {
+            return self.embedding_lookup(&self.dequantize_q8(table)?, ids);
+        }
         let table16 = self.bf16_address(table);
+        let (table_q8, table_q8_scales) = match &table.q8 {
+            Some(q8) => (
+                q8.quants.device_ptr(&self.stream).0,
+                q8.scales.device_ptr(&self.stream).0,
+            ),
+            None => (0, 0),
+        };
         let num_ids = ids.slice.len() as u64;
         // Rows of invalid ids stay unwritten, but those fail the lookup.
         let mut out_dev = self.alloc_output(ids.slice.len() * dim as usize)?;
@@ -1254,7 +1387,9 @@ impl CudaKernels {
             .arg(&num_ids)
             .arg(&vocab)
             .arg(&mut invalid_id_flag)
-            .arg(&table16);
+            .arg(&table16)
+            .arg(&table_q8)
+            .arg(&table_q8_scales);
         let launched = unsafe { args.launch(LaunchConfig::for_num_elems(num_ids as u32)) };
         *flag_slot = Some(invalid_id_flag);
         drop(flag_slot);
@@ -1268,6 +1403,7 @@ impl CudaKernels {
                 slice: out_dev,
                 shape: vec![num_ids, dim],
                 bf16: None,
+                q8: None,
             });
         }
         // Data-dependent failure (an out-of-range or non-integer token id)
@@ -1279,6 +1415,7 @@ impl CudaKernels {
             slice: out_dev,
             shape: vec![num_ids, dim],
             bf16: None,
+            q8: None,
         })
     }
 
@@ -1361,6 +1498,7 @@ impl CudaKernels {
             slice: out_dev,
             shape: input.shape.clone(),
             bf16: None,
+            q8: None,
         })
     }
 
@@ -1519,6 +1657,7 @@ impl CudaKernels {
             slice: out_dev,
             shape: input.shape.clone(),
             bf16: None,
+            q8: None,
         })
     }
 
@@ -1548,6 +1687,7 @@ impl CudaKernels {
             slice: out_dev,
             shape: input.shape.clone(),
             bf16: None,
+            q8: None,
         })
     }
 
@@ -1683,6 +1823,7 @@ impl CudaKernels {
             slice: out_dev,
             shape: gate.shape.clone(),
             bf16: None,
+            q8: None,
         })
     }
 
@@ -1714,7 +1855,8 @@ impl CudaKernels {
         } else {
             (a_rows, a_cols)
         };
-        if transpose_b || m > MATMUL_SPLIT_K_MAX_ROWS || k != b_rows {
+        // Packed weights: each projection through the packed matmul.
+        if transpose_b || m > MATMUL_SPLIT_K_MAX_ROWS || k != b_rows || gate.is_q8() || up.is_q8() {
             let gate_out = self.matmul(a, gate, transpose_a, transpose_b)?;
             let up_out = self.matmul(a, up, transpose_a, transpose_b)?;
             return self.silu_mul(&gate_out, &up_out);
@@ -1763,6 +1905,7 @@ impl CudaKernels {
                 slice: out_dev,
                 shape: vec![m, n],
                 bf16: None,
+                q8: None,
             });
         }
         if m >= MATMUL_TILE_MIN_ROWS
@@ -1794,6 +1937,7 @@ impl CudaKernels {
                 slice: out_dev,
                 shape: vec![m, n],
                 bf16: None,
+                q8: None,
             });
         }
         let (name, grid_dim) = split_k_rows(
@@ -1829,6 +1973,53 @@ impl CudaKernels {
             slice: out_dev,
             shape: vec![m, n],
             bf16: None,
+            q8: None,
+        })
+    }
+
+    /// `q8_matmul_rows_kernel`: `a` (`m` contiguous rows of `k`) times the
+    /// packed, transposed-storage weight `q8` (`[k, n]` logically).
+    fn q8_matmul_rows(
+        &self,
+        a: &CudaDeviceBuffer,
+        q8: &CudaQ8Weight,
+        m: u64,
+        k: u64,
+        n: u64,
+        addend: Option<MatmulAddend<'_>>,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        let mut out_dev = self.alloc_output((m * n) as usize)?;
+        let (addend_buffer, addend_mode) = match addend {
+            None => (a, 0i32),
+            Some(MatmulAddend::Row(bias)) => (bias, 1),
+            Some(MatmulAddend::Full(residual)) => (residual, 2),
+        };
+        let func = self.function("q8_matmul_rows_kernel")?;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(&a.slice)
+            .arg(&q8.quants)
+            .arg(&q8.scales)
+            .arg(&mut out_dev)
+            .arg(&m)
+            .arg(&k)
+            .arg(&n)
+            .arg(&addend_buffer.slice)
+            .arg(&addend_mode);
+        let config = LaunchConfig {
+            grid_dim: (
+                n.div_ceil(u64::from(Q8_MATMUL_WARPS)) as u32,
+                m.div_ceil(Q8_MATMUL_ROWS) as u32,
+                1,
+            ),
+            block_dim: (32, Q8_MATMUL_WARPS, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { args.launch(config) }?;
+        Ok(CudaDeviceBuffer {
+            slice: out_dev,
+            shape: vec![m, n],
+            bf16: None,
+            q8: None,
         })
     }
 
@@ -1893,6 +2084,16 @@ impl CudaKernels {
         if let Some(MatmulAddend::Row(addend) | MatmulAddend::Full(addend)) = addend {
             Self::require_f32(&[addend], "a fused matmul's addend")?;
         }
+        if let Some(q8) = &b.q8 {
+            // Read packed: a transposed-storage weight (each output
+            // column's quants contiguous) against a few contiguous rows.
+            if q8.transposed && !transpose_a && !transpose_b && m <= Q8_MATMUL_MAX_ROWS {
+                return self.q8_matmul_rows(a, q8, m, k, n, addend);
+            }
+            // Otherwise against the f32 weight, for this call only.
+            let dense = self.dequantize_q8(b)?;
+            return self.matmul_with_addend(a, &dense, addend, transpose_a, transpose_b);
+        }
         let b16 = self.bf16_address(b);
         let mut out_dev = self.alloc_output((m * n) as usize)?;
         let (addend_buffer, addend_mode) = match addend {
@@ -1935,6 +2136,7 @@ impl CudaKernels {
                 slice: out_dev,
                 shape: vec![m, n],
                 bf16: None,
+                q8: None,
             });
         }
         if m >= MATMUL_TILE_MIN_ROWS
@@ -1968,6 +2170,7 @@ impl CudaKernels {
                 slice: out_dev,
                 shape: vec![m, n],
                 bf16: None,
+                q8: None,
             });
         }
         if b_col_stride == 1 && m <= MATMUL_SPLIT_K_MAX_ROWS {
@@ -2009,6 +2212,7 @@ impl CudaKernels {
                 slice: out_dev,
                 shape: vec![m, n],
                 bf16: None,
+                q8: None,
             });
         }
         let func = self.function("matmul_kernel")?;
@@ -2029,6 +2233,7 @@ impl CudaKernels {
             slice: out_dev,
             shape: vec![m, n],
             bf16: None,
+            q8: None,
         };
         match addend {
             Some(MatmulAddend::Row(addend) | MatmulAddend::Full(addend)) => {
@@ -2230,6 +2435,7 @@ impl CudaKernels {
                 slice: out_dev,
                 shape: q.shape.clone(),
                 bf16: None,
+                q8: None,
             });
         }
         let tiled = match head_dimension {
@@ -2283,6 +2489,7 @@ impl CudaKernels {
                 slice: out_dev,
                 shape: q.shape.clone(),
                 bf16: None,
+                q8: None,
             });
         }
 
@@ -2338,6 +2545,7 @@ impl CudaKernels {
                 slice: out_dev,
                 shape: q.shape.clone(),
                 bf16: None,
+                q8: None,
             });
         }
         if self.is_capturing() {
@@ -2366,6 +2574,7 @@ impl CudaKernels {
             slice: out_dev,
             shape: q.shape.clone(),
             bf16: None,
+            q8: None,
         })
     }
 }
@@ -2520,6 +2729,7 @@ impl CudaKernels {
             slice: out_dev,
             shape: q.shape.clone(),
             bf16: None,
+            q8: None,
         })
     }
 }

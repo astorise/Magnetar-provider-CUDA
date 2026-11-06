@@ -14,6 +14,7 @@
 //! `CudaExecutor` itself uses, not an implicit per-kernel round trip.
 
 use magnetar_runtime::HostTensor;
+use magnetar_runtime::packed_weight::{PackedWeight, PackedWeightFormat};
 
 use crate::half_precision;
 use crate::kernels::{CudaDeviceBuffer, CudaHalfDType, CudaKernels};
@@ -1779,4 +1780,157 @@ fn decode_matmul_bandwidth() {
             gb(k * n * 2, bf16_ms),
         );
     }
+}
+
+/// A deterministic packed `Q8_0` matrix of `stored_rows` x `stored_cols`
+/// (`execute-direct-quantized-weights`), with varied scales and quants
+/// covering the full signed 8-bit range.
+fn packed_q8(stored_rows: u64, stored_cols: u64, transposed: bool, seed: u32) -> PackedWeight {
+    let blocks = stored_rows * stored_cols / 32;
+    let mut bytes = Vec::with_capacity(blocks as usize * 34);
+    let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state
+    };
+    for _ in 0..blocks {
+        // f16 scales between about 2^-9 and 2^-5.
+        let exponent = 6 + (next() % 5) as u16;
+        let d_bits = (exponent << 10) | (next() % 1024) as u16;
+        bytes.extend(d_bits.to_le_bytes());
+        bytes.extend(
+            (0..32)
+                .map(|_| (next() % 255) as i32 - 127)
+                .map(|q| q as i8 as u8),
+        );
+    }
+    PackedWeight::new(
+        PackedWeightFormat::Q8_0,
+        stored_rows,
+        stored_cols,
+        transposed,
+        bytes,
+    )
+    .unwrap()
+}
+
+fn activations(rows: u64, cols: u64, seed: u32) -> HostTensor {
+    let data = (0..rows * cols)
+        .map(|i| {
+            (((i as u32).wrapping_mul(2_246_822_519).wrapping_add(seed) % 2001) as f32 - 1000.0)
+                / 1000.0
+        })
+        .collect::<Vec<_>>();
+    HostTensor::new([rows, cols], data).unwrap()
+}
+
+/// `actual` against `expected` with a tolerance scaled to the products'
+/// magnitude: the packed kernels sum in another order than the Reference.
+fn assert_close_scaled(actual: &HostTensor, expected: &HostTensor, scale: f32) {
+    assert_eq!(actual.shape, expected.shape);
+    for (index, (a, e)) in actual.data.iter().zip(&expected.data).enumerate() {
+        assert!(
+            (a - e).abs() <= 1e-5 + 1e-5 * scale,
+            "index {index}: {a} vs {e}"
+        );
+    }
+}
+
+/// The packed `Q8_0` matmul (decode rows read packed, longer ones
+/// dequantized for the call) matches the Reference CPU matmul of the
+/// dequantized weight, with and without a bias or residual addend, and
+/// download/expand give back exactly the dequantized weight.
+#[test]
+fn q8_packed_matmul_matches_reference_cpu() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let (k, n) = (256_u64, 96_u64);
+    // Stored as n rows of k quants: the graph sees [k, n].
+    let packed = packed_q8(n, k, true, 7);
+    let dense = packed.dequantize();
+    let weight = kernels.upload_packed_weight(&packed).unwrap();
+    assert!(weight.is_q8() && weight.is_compact());
+    assert_eq!(weight.shape, vec![k, n]);
+    assert_eq!(download(&kernels, &weight).data, dense.data);
+    assert_eq!(
+        download(&kernels, &kernels.expand(&weight).unwrap()).data,
+        dense.data
+    );
+
+    let bias = HostTensor::new([n], (0..n).map(|i| i as f32 * 0.01).collect::<Vec<_>>()).unwrap();
+    for m in [1_u64, 3, 8, 64, 65] {
+        let a = activations(m, k, m as u32);
+        let expected = magnetar_provider_cpu::matmul(&a, &dense, false, false).unwrap();
+        let a_dev = upload(&kernels, &a);
+        let actual = download(
+            &kernels,
+            &kernels.matmul(&a_dev, &weight, false, false).unwrap(),
+        );
+        assert_close_scaled(&actual, &expected, k as f32);
+
+        let with_bias = kernels
+            .matmul_bias(&a_dev, &weight, &upload(&kernels, &bias), false, false)
+            .unwrap();
+        let expected_bias = magnetar_provider_cpu::add(&expected, &bias).unwrap();
+        assert_close_scaled(&download(&kernels, &with_bias), &expected_bias, k as f32);
+
+        let residual = activations(m, n, 99);
+        let with_residual = kernels
+            .matmul_residual(&a_dev, &weight, &upload(&kernels, &residual), false, false)
+            .unwrap();
+        let expected_residual = magnetar_provider_cpu::add(&expected, &residual).unwrap();
+        assert_close_scaled(
+            &download(&kernels, &with_residual),
+            &expected_residual,
+            k as f32,
+        );
+    }
+}
+
+/// `gated-matmul` against packed gate and up weights, and an embedding
+/// lookup from a packed (untransposed) table, match the Reference CPU on
+/// the dequantized weights.
+#[test]
+fn q8_packed_gated_matmul_and_embedding_match_reference_cpu() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let (k, n) = (128_u64, 64_u64);
+    let gate = packed_q8(n, k, true, 11);
+    let up = packed_q8(n, k, true, 12);
+    for m in [1_u64, 70] {
+        let a = activations(m, k, 5);
+        let expected = magnetar_provider_cpu::mul(
+            &magnetar_provider_cpu::silu(
+                &magnetar_provider_cpu::matmul(&a, &gate.dequantize(), false, false).unwrap(),
+            ),
+            &magnetar_provider_cpu::matmul(&a, &up.dequantize(), false, false).unwrap(),
+        )
+        .unwrap();
+        let actual = kernels
+            .gated_matmul(
+                &upload(&kernels, &a),
+                &kernels.upload_packed_weight(&gate).unwrap(),
+                &kernels.upload_packed_weight(&up).unwrap(),
+                false,
+                false,
+            )
+            .unwrap();
+        assert_close_scaled(&download(&kernels, &actual), &expected, k as f32);
+    }
+
+    // A [vocab = 6, hidden = 64] table, rows read packed.
+    let table = packed_q8(6, 64, false, 13);
+    let ids = HostTensor::new([4], vec![5.0, 0.0, 3.0, 5.0]).unwrap();
+    let expected = magnetar_provider_cpu::embedding_lookup(&table.dequantize(), &ids).unwrap();
+    let actual = kernels
+        .embedding_lookup(
+            &kernels.upload_packed_weight(&table).unwrap(),
+            &upload(&kernels, &ids),
+        )
+        .unwrap();
+    assert_eq!(download(&kernels, &actual).data, expected.data);
 }

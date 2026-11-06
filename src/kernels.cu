@@ -77,7 +77,12 @@ extern "C" __global__ void embedding_lookup_kernel(
     unsigned long long vocab,
     int* invalid_id_flag,
     // The table's bfloat16 bits when it is compact; `table` is then unused.
-    const unsigned short* table16
+    const unsigned short* table16,
+    // A packed Q8_0 table (`execute-direct-quantized-weights`), stored
+    // untransposed: its quants and per-32-value scales; `table` is then
+    // unused.
+    const signed char* table_q8,
+    const float* table_q8_scales
 ) {
     unsigned long long row = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= num_ids) {
@@ -94,6 +99,13 @@ extern "C" __global__ void embedding_lookup_kernel(
         return;
     }
     float* dst = out + row * dim;
+    if (table_q8) {
+        unsigned long long base = id * dim;
+        for (unsigned long long i = 0; i < dim; i++) {
+            dst[i] = (float)table_q8[base + i] * table_q8_scales[(base + i) >> 5];
+        }
+        return;
+    }
     if (table16) {
         const unsigned short* src16 = table16 + id * dim;
         for (unsigned long long i = 0; i < dim; i++) {
@@ -104,6 +116,103 @@ extern "C" __global__ void embedding_lookup_kernel(
     const float* src = table + id * dim;
     for (unsigned long long i = 0; i < dim; i++) {
         dst[i] = src[i];
+    }
+}
+
+// Packed Q8_0 weights (`execute-direct-quantized-weights`): signed 8-bit
+// quants in stored row-major order, one f32 scale per 32 consecutive
+// quants (a row is a whole number of blocks).
+
+// One thread per stored value: the logical matrix as f32, the stored one
+// or (`transposed`) its transpose.
+extern "C" __global__ void q8_dequantize_kernel(
+    const signed char* quants,
+    const float* scales,
+    float* out,
+    unsigned long long stored_rows,
+    unsigned long long stored_cols,
+    unsigned int transposed
+) {
+    unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= stored_rows * stored_cols) {
+        return;
+    }
+    float value = (float)quants[idx] * scales[idx >> 5];
+    if (transposed) {
+        unsigned long long r = idx / stored_cols;
+        unsigned long long c = idx % stored_cols;
+        out[c * stored_rows + r] = value;
+    } else {
+        out[idx] = value;
+    }
+}
+
+// Rows of `a` one block of `q8_matmul_rows_kernel` serves.
+#define Q8_MATMUL_ROWS 8
+// Output columns (one warp each) per block of `q8_matmul_rows_kernel`.
+#define Q8_MATMUL_WARPS 4
+
+// out[r, c] = sum_k a[r, k] * W[k, c] (+ addend) for a contiguous `a` of
+// `k` columns and a packed weight W stored transposed: stored row c holds
+// column c's `k` quants. One warp per output column reads that row once,
+// four consecutive quants per lane per step (contiguous across the warp),
+// for up to Q8_MATMUL_ROWS rows of `a`; each lane's four products are
+// summed in f32 and scaled by their block's scale. The decode-step matmul:
+// the weight is read packed, at about half the bytes of bfloat16.
+extern "C" __global__ void q8_matmul_rows_kernel(
+    const float* a,
+    const signed char* quants,
+    const float* scales,
+    float* out,
+    unsigned long long m,
+    unsigned long long k,
+    unsigned long long n,
+    const float* addend,
+    int addend_mode
+) {
+    unsigned long long col = (unsigned long long)blockIdx.x * Q8_MATMUL_WARPS + threadIdx.y;
+    unsigned long long first_row = (unsigned long long)blockIdx.y * Q8_MATMUL_ROWS;
+    if (col >= n || first_row >= m) {
+        return;
+    }
+    unsigned int rows = (unsigned int)min((unsigned long long)Q8_MATMUL_ROWS, m - first_row);
+    unsigned int lane = threadIdx.x;
+    const signed char* w = quants + col * k;
+    const float* w_scales = scales + col * (k >> 5);
+    float acc[Q8_MATMUL_ROWS];
+#pragma unroll
+    for (int r = 0; r < Q8_MATMUL_ROWS; r++) {
+        acc[r] = 0.0f;
+    }
+    // Each step covers 128 quants: four blocks, eight lanes per block.
+    for (unsigned long long i = (unsigned long long)lane * 4; i < k; i += 128) {
+        char4 q = *reinterpret_cast<const char4*>(w + i);
+        float d = w_scales[i >> 5];
+#pragma unroll
+        for (int r = 0; r < Q8_MATMUL_ROWS; r++) {
+            if (r < (int)rows) {
+                float4 x = *reinterpret_cast<const float4*>(a + (first_row + r) * k + i);
+                acc[r] += d * (x.x * (float)q.x + x.y * (float)q.y + x.z * (float)q.z
+                    + x.w * (float)q.w);
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < Q8_MATMUL_ROWS; r++) {
+        float sum = acc[r];
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum += __shfl_xor_sync(0xffffffffu, sum, offset);
+        }
+        if (lane == 0 && r < (int)rows) {
+            unsigned long long row = first_row + r;
+            if (addend_mode == 1) {
+                sum += addend[col];
+            } else if (addend_mode == 2) {
+                sum += addend[row * n + col];
+            }
+            out[row * n + col] = sum;
+        }
     }
 }
 
