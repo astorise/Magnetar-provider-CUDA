@@ -2038,16 +2038,27 @@ fn q8_packed_decode_step_captures_and_a_failed_capture_leaves_the_stream_usable(
         .upload_packed_weight(&packed_q8(6, k, false, 23))
         .unwrap();
     let ids = upload(&kernels, &HostTensor::new([1], vec![4.0]).unwrap());
-    let step = || {
+    // Outputs are allocated before and offered, as the executor does:
+    // nothing allocates or frees while capturing.
+    let outputs = || {
+        let alloc = |len| kernels.stream().alloc_zeros::<f32>(len).unwrap();
+        (alloc(k as usize), alloc(n as usize))
+    };
+    let step = |(hidden_out, gated_out)| {
+        let offered = kernels.offer_output(Some(hidden_out));
         let hidden = kernels.embedding_lookup(&table, &ids)?;
+        drop(offered);
+        let offered = kernels.offer_output(Some(gated_out));
         let out = kernels.gated_matmul(&hidden, &gate, &up, false, false)?;
+        drop(offered);
         Ok::<_, crate::error::CudaError>((hidden, out))
     };
-    let (_, eager) = step().unwrap();
+    let (_, eager) = step(outputs()).unwrap();
     let expected = download(&kernels, &eager);
 
+    let buffers = outputs();
     kernels.begin_capture(Default::default()).unwrap();
-    let (_hidden, captured) = step().unwrap();
+    let (_hidden, captured) = step(buffers).unwrap();
     let mut graph = kernels.end_capture().unwrap();
     kernels.launch_captured(&mut graph, 0).unwrap();
     assert_eq!(download(&kernels, &captured).data, expected.data);
@@ -2060,6 +2071,6 @@ fn q8_packed_decode_step_captures_and_a_failed_capture_leaves_the_stream_usable(
         "a host upload cannot be captured"
     );
     kernels.abort_capture();
-    let (_, again) = step().unwrap();
+    let (_, again) = step(outputs()).unwrap();
     assert_eq!(download(&kernels, &again).data, expected.data);
 }
