@@ -24,7 +24,7 @@ use cudarc::driver::{
 };
 use cudarc::nvrtc::compile_ptx;
 use magnetar_runtime::HostTensor;
-use magnetar_runtime::operator::RopeLlama3Scaling;
+use magnetar_runtime::operator::RopeBandedFrequencyScaling;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1419,8 +1419,8 @@ impl CudaKernels {
         )
     }
 
-    /// [`Self::rope_with_pairing`] with optional Llama 3 per-frequency
-    /// scaling (`frequency_scaling = "llama3"`).
+    /// [`Self::rope_with_pairing`] with optional banded per-frequency
+    /// scaling (`frequency_scaling = "banded"`).
     #[allow(clippy::too_many_arguments)]
     pub fn rope_with_frequency_scaling(
         &self,
@@ -1431,7 +1431,7 @@ impl CudaKernels {
         position_offset: u64,
         head_count: u64,
         pairing: CudaRopePairing,
-        frequency_scaling: Option<&RopeLlama3Scaling>,
+        frequency_scaling: Option<&RopeBandedFrequencyScaling>,
     ) -> Result<CudaDeviceBuffer, CudaError> {
         Self::require_f32(&[input], "rope")?;
         if let Some(scaling) = frequency_scaling {
@@ -1440,7 +1440,7 @@ impl CudaKernels {
                 .map_err(|reason| CudaError::new(CudaErrorCode::ShapeUnsupported, reason))?;
         }
         // `0` disables the scaling in the Kernel.
-        let (llama3_factor, low_freq_factor, high_freq_factor, original_context_length) =
+        let (banded_factor, low_freq_factor, high_freq_factor, original_context_length) =
             frequency_scaling.map_or((0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32), |scaling| {
                 (
                     scaling.factor as f32,
@@ -1510,7 +1510,7 @@ impl CudaKernels {
             .arg(&head_count)
             .arg(&half_split)
             .arg(&step_offset)
-            .arg(&llama3_factor)
+            .arg(&banded_factor)
             .arg(&low_freq_factor)
             .arg(&high_freq_factor)
             .arg(&original_context_length);

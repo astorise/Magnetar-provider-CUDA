@@ -1482,14 +1482,14 @@ fn rope_half_split_matches_reference_cpu() {
     }
 }
 
-/// Llama 3 per-frequency scaling matches the CPU Provider, across the
+/// Banded per-frequency scaling matches the CPU Provider, across the
 /// kept, smoothed and divided frequency bands, interleaved and half-split.
 #[test]
-fn rope_llama3_frequency_scaling_matches_reference_cpu() {
+fn rope_banded_frequency_scaling_matches_reference_cpu() {
     let Some(kernels) = kernels_or_skip() else {
         return;
     };
-    let scaling = magnetar_runtime::operator::RopeLlama3Scaling {
+    let scaling = magnetar_runtime::operator::RopeBandedFrequencyScaling {
         factor: 8.0,
         low_freq_factor: 1.0,
         high_freq_factor: 4.0,

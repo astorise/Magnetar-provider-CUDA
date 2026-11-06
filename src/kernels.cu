@@ -182,10 +182,10 @@ extern "C" __global__ void rope_kernel(
     // A captured step's replay offset (`capture-and-replay-cuda-graphs`),
     // added to `position_offset`; null outside a capture.
     const unsigned long long* step_offset,
-    // Llama 3 per-frequency scaling (`frequency_scaling = "llama3"`);
-    // `llama3_factor == 0` leaves the frequencies unscaled. Same f32
-    // operations, in the same order, as `RopeLlama3Scaling::scale_frequency`.
-    float llama3_factor,
+    // Banded per-frequency scaling (`frequency_scaling = "banded"`);
+    // `banded_factor == 0` leaves the frequencies unscaled. Same f32
+    // operations, in the same order, as `RopeBandedFrequencyScaling::scale_frequency`.
+    float banded_factor,
     float low_freq_factor,
     float high_freq_factor,
     float original_context_length
@@ -206,16 +206,16 @@ extern "C" __global__ void rope_kernel(
     }
     float position = (float)(position_offset + row) * scale;
     float frequency = powf(base, -2.0f * (float)pair / (float)dimension);
-    if (llama3_factor > 0.0f) {
+    if (banded_factor > 0.0f) {
         float wavelength = 6.283185307179586f / frequency;
         if (wavelength < original_context_length / high_freq_factor) {
             // High frequencies are kept.
         } else if (wavelength > original_context_length / low_freq_factor) {
-            frequency = frequency / llama3_factor;
+            frequency = frequency / banded_factor;
         } else {
             float smooth = (original_context_length / wavelength - low_freq_factor)
                 / (high_freq_factor - low_freq_factor);
-            frequency = (1.0f - smooth) * frequency / llama3_factor + smooth * frequency;
+            frequency = (1.0f - smooth) * frequency / banded_factor + smooth * frequency;
         }
     }
     float angle = position * frequency;
