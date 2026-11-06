@@ -251,7 +251,6 @@ __device__ __forceinline__ float neg_inf() {
 
 #define TCA_QUERIES 64
 #define TCA_D 64
-#define TCA_PITCH (TCA_D + 8)
 
 __device__ __forceinline__ void tca_split(float value, unsigned short* hi, unsigned short* lo) {
     unsigned short h = tc_float_to_bf16(value);
@@ -555,7 +554,8 @@ extern "C" __global__ void gated_matmul_tcp_kernel(
 
 #define TCAP_KEYS 32
 
-extern "C" __global__ void attention_tcp_kernel(
+template <int D>
+__device__ __forceinline__ void attention_tcp_body(
     const float* q,
     const unsigned short* k_hi,
     const unsigned short* k_lo,
@@ -572,11 +572,16 @@ extern "C" __global__ void attention_tcp_kernel(
     long long window_size,
     unsigned long long query_position_offset
 ) {
-    // Q is staged in the two K stages first (64 rows), then each key tile.
-    __shared__ __align__(16) unsigned short s_khi[2 * TCAP_KEYS][TCA_PITCH];
-    __shared__ __align__(16) unsigned short s_klo[2 * TCAP_KEYS][TCA_PITCH];
-    __shared__ __align__(16) unsigned short s_vhi[2 * TCAP_KEYS][TCA_PITCH];
-    __shared__ __align__(16) unsigned short s_vlo[2 * TCAP_KEYS][TCA_PITCH];
+    // Dynamic shared memory: K hi, K lo, V hi, V lo stages of
+    // 2 * TCAP_KEYS rows of D + 8 halves each. Q is staged in the two K
+    // stages first (64 rows), then each key tile.
+    extern __shared__ __align__(16) unsigned short tcap_shared[];
+    constexpr int P = D + 8;
+    typedef unsigned short Row[P];
+    Row* s_khi = reinterpret_cast<Row*>(tcap_shared);
+    Row* s_klo = s_khi + 2 * TCAP_KEYS;
+    Row* s_vhi = s_klo + 2 * TCAP_KEYS;
+    Row* s_vlo = s_vhi + 2 * TCAP_KEYS;
     unsigned int tid = threadIdx.x;
     unsigned int warp = tid >> 5;
     unsigned int lane = tid & 31;
@@ -585,23 +590,24 @@ extern "C" __global__ void attention_tcp_kernel(
     unsigned long long head = blockIdx.y;
     unsigned long long tile_first = (unsigned long long)blockIdx.x * TCA_QUERIES;
     unsigned long long group_size = head_count / kv_head_count;
-    unsigned long long q_offset = head * TCA_D;
-    unsigned long long kv_offset = (head / group_size) * TCA_D;
-    const float scale = 0.125f;
+    unsigned long long q_offset = head * D;
+    unsigned long long kv_offset = (head / group_size) * D;
+    // 1/sqrt(D), folded into Q (exact for 64 dimensions).
+    const float scale = 1.0f / sqrtf((float)D);
 
-    for (unsigned int e = tid; e < TCA_QUERIES * TCA_D; e += 128) {
-        unsigned int r = e / TCA_D;
-        unsigned int c = e % TCA_D;
+    for (unsigned int e = tid; e < TCA_QUERIES * D; e += 128) {
+        unsigned int r = e / D;
+        unsigned int c = e % D;
         unsigned long long qi = tile_first + r;
         float value = qi < seq_len ? q[qi * q_model_dim + q_offset + c] * scale : 0.0f;
         tca_split(value, &s_khi[r][c], &s_klo[r][c]);
     }
     __syncthreads();
-    unsigned int qh[4][4];
-    unsigned int ql[4][4];
+    unsigned int qh[D / 16][4];
+    unsigned int ql[D / 16][4];
     unsigned int wr = warp * 16 + g;
 #pragma unroll
-    for (int ks = 0; ks < 4; ks++) {
+    for (int ks = 0; ks < D / 16; ks++) {
         unsigned int c0 = ks * 16 + 2 * t;
         qh[ks][0] = tca_u32(&s_khi[wr][c0]);
         qh[ks][1] = tca_u32(&s_khi[wr + 8][c0]);
@@ -636,18 +642,18 @@ extern "C" __global__ void attention_tcp_kernel(
 
     float max_value[2] = {neg_inf(), neg_inf()};
     float sum[2] = {0.0f, 0.0f};
-    float o[8][4];
+    float o[D / 8][4];
 #pragma unroll
-    for (int dt = 0; dt < 8; dt++)
+    for (int dt = 0; dt < D / 8; dt++)
 #pragma unroll
         for (int i = 0; i < 4; i++) o[dt][i] = 0.0f;
 
-    // One stage: TCAP_KEYS keys of 64 dimensions, 8 chunks of 16 bytes per
-    // row, for each of K hi, K lo, V hi and V lo.
+    // One stage: TCAP_KEYS keys of D dimensions, D / 8 chunks of 16 bytes
+    // per row, for each of K hi, K lo, V hi and V lo.
     auto load_stage = [&](unsigned long long tile, unsigned int stage) {
-        for (unsigned int c = tid; c < TCAP_KEYS * 8; c += 128) {
-            unsigned int r = c >> 3;
-            unsigned int col = (c & 7) * 8;
+        for (unsigned int c = tid; c < TCAP_KEYS * (D / 8); c += 128) {
+            unsigned int r = c / (D / 8);
+            unsigned int col = (c % (D / 8)) * 8;
             unsigned long long key = tile + r;
             bool valid = key < kv_seq_len;
             unsigned long long offset = valid ? key * kv_model_dim + kv_offset + col : 0;
@@ -681,7 +687,7 @@ extern "C" __global__ void attention_tcp_kernel(
 #pragma unroll
             for (int i = 0; i < 4; i++) s[nt][i] = 0.0f;
 #pragma unroll
-        for (int ks = 0; ks < 4; ks++) {
+        for (int ks = 0; ks < D / 16; ks++) {
 #pragma unroll
             for (int np = 0; np < 2; np++) {
                 // Keys np*16 .. np*16+15: b0/b1 of n-tile 2np, then 2np+1.
@@ -746,7 +752,7 @@ extern "C" __global__ void attention_tcp_kernel(
             max_value[h] = new_max[h];
         }
 #pragma unroll
-        for (int dt = 0; dt < 8; dt++)
+        for (int dt = 0; dt < D / 8; dt++)
 #pragma unroll
             for (int i = 0; i < 4; i++) o[dt][i] *= keep[i >> 1];
 
@@ -760,7 +766,7 @@ extern "C" __global__ void attention_tcp_kernel(
             tca_split_pair(s[2 * j + 1][2] * take[1], s[2 * j + 1][3] * take[1], &ph[3], &pl[3]);
             unsigned int vr = base + j * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
 #pragma unroll
-            for (int dp = 0; dp < 4; dp++) {
+            for (int dp = 0; dp < D / 16; dp++) {
                 unsigned int vc = dp * 16 + (lane >> 4) * 8;
                 unsigned int bh[4];
                 unsigned int bl[4];
@@ -780,7 +786,7 @@ extern "C" __global__ void attention_tcp_kernel(
     }
 
 #pragma unroll
-    for (int dt = 0; dt < 8; dt++)
+    for (int dt = 0; dt < D / 8; dt++)
 #pragma unroll
         for (int i = 0; i < 4; i++) {
             int h = i >> 1;
@@ -789,4 +795,27 @@ extern "C" __global__ void attention_tcp_kernel(
                     sum[h] > 0.0f ? o[dt][i] : 0.0f;
             }
         }
+}
+
+#define ATTENTION_TCP_ARGS                                                        \
+    const float* q, const unsigned short* k_hi, const unsigned short* k_lo,      \
+    const unsigned short* v_hi, const unsigned short* v_lo, float* out,          \
+    unsigned long long seq_len, unsigned long long kv_seq_len,                   \
+    unsigned long long head_count, unsigned long long kv_head_count,             \
+    unsigned long long q_model_dim, unsigned long long kv_model_dim, int causal, \
+    long long window_size, unsigned long long query_position_offset
+#define ATTENTION_TCP_PASS                                                        \
+    q, k_hi, k_lo, v_hi, v_lo, out, seq_len, kv_seq_len, head_count,             \
+    kv_head_count, q_model_dim, kv_model_dim, causal, window_size,               \
+    query_position_offset
+
+// 64-dimension heads: 36 KB of dynamic shared memory per block.
+extern "C" __global__ void attention_tcp_kernel(ATTENTION_TCP_ARGS) {
+    attention_tcp_body<64>(ATTENTION_TCP_PASS);
+}
+
+// 128-dimension heads: 68 KB of dynamic shared memory per block, past the
+// 48 KB default (the launcher raises the function's limit).
+extern "C" __global__ void attention_tcp128_kernel(ATTENTION_TCP_ARGS) {
+    attention_tcp_body<128>(ATTENTION_TCP_PASS);
 }

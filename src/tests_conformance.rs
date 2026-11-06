@@ -1141,7 +1141,15 @@ fn block_attention_matches_reference_cpu_on_decode_prefill_and_long_histories() 
         return;
     };
     // (seq_len, kv_seq_len, head_count, kv_head_count, head_dimension, window)
-    let cases: [(u64, u64, u64, u64, u64, Option<u64>); 15] = [
+    let cases: [(u64, u64, u64, u64, u64, Option<u64>); 20] = [
+        // 128-dimension heads (Qwen2.5-1.5B's 12 query / 2 KV heads): the
+        // grouped decode Kernel's 32-key chunks, with and without a
+        // window, and the Tensor Core prefill on its larger stages.
+        (1, 300, 12, 2, 128, None),
+        (1, 1000, 12, 2, 128, Some(300)),
+        (130, 130, 12, 2, 128, None),
+        (200, 1000, 12, 2, 128, Some(150)),
+        (37, 37, 12, 2, 128, None),
         (1, 300, 14, 2, 64, None),
         // The grouped decode Kernel: one exact 64-key chunk, a long history
         // ending in a partial chunk, and one query head per KV head.
