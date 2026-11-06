@@ -37,7 +37,9 @@ use magnetar_runtime::memory::{
     MemoryAllocationClass, MemoryAllocationId, MemoryAllocationOwner, MemoryAllocationRequest,
     MemoryError, MemoryManager, MemoryPlacement, TensorResidency,
 };
-use magnetar_runtime::operator::{OperatorAttributeValue, OperatorSpec, RopeLlama3Scaling};
+use magnetar_runtime::operator::{
+    OperatorAttributeValue, OperatorSpec, RopeBandedFrequencyScaling,
+};
 use magnetar_runtime::provider::{
     ProviderExecutionApi, StepCaptureId, StepCaptureRequest, StepReplayError, TensorValue,
     TensorValueAdmissionError,
@@ -1112,10 +1114,11 @@ impl CudaExecutor {
                             });
                         }
                     };
-                    let frequency_scaling = RopeLlama3Scaling::from_attributes(
-                        &invocation.attributes,
-                    )
-                    .map_err(|attribute| KernelError::KernelAttributeUnsupported { attribute })?;
+                    let frequency_scaling =
+                        RopeBandedFrequencyScaling::from_attributes(&invocation.attributes)
+                            .map_err(|attribute| KernelError::KernelAttributeUnsupported {
+                                attribute,
+                            })?;
                     self.kernels
                         .rope_with_frequency_scaling(
                             input,

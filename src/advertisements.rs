@@ -23,7 +23,7 @@ use magnetar_runtime::kernel::{
     KernelMemoryClass, KernelOperatorVersionRange,
 };
 use magnetar_runtime::operator::{
-    OperatorFamily, OperatorId, ROPE_LLAMA3_SCALING_FEATURE, TensorLayoutKind, TensorRole,
+    OperatorFamily, OperatorId, ROPE_BANDED_FREQUENCY_SCALING_FEATURE, TensorLayoutKind, TensorRole,
 };
 
 pub const CUDA_KERNEL_FAMILY: KernelImplementationFamily = KernelImplementationFamily::Cuda;
@@ -155,7 +155,7 @@ pub fn cuda_kernel_advertisements(
             provider_name,
         ),
         {
-            // Honours the Llama 3 frequency-scaling attributes.
+            // Honours the banded frequency-scaling attributes.
             let mut rope = baseline_advertisement(
                 "rope",
                 OperatorFamily::PositionEncoding,
@@ -164,7 +164,7 @@ pub fn cuda_kernel_advertisements(
             );
             rope.id
                 .features
-                .insert(ROPE_LLAMA3_SCALING_FEATURE.to_string());
+                .insert(ROPE_BANDED_FREQUENCY_SCALING_FEATURE.to_string());
             rope
         },
         {
