@@ -2115,7 +2115,7 @@ fn moe_experts_match_reference_cpu_for_f32_and_packed_experts() {
                     routing,
                 )
                 .unwrap();
-            assert_close_scaled(&download(&kernels, &actual), &expected, hidden as f32);
+            assert_close_relative(&download(&kernels, &actual), &expected);
             let packed_experts =
                 [&gate, &up, &down].map(|w| kernels.upload_packed_weight(w).unwrap());
             let actual = kernels
@@ -2126,7 +2126,7 @@ fn moe_experts_match_reference_cpu_for_f32_and_packed_experts() {
                     routing,
                 )
                 .unwrap();
-            assert_close_scaled(&download(&kernels, &actual), &expected, hidden as f32);
+            assert_close_relative(&download(&kernels, &actual), &expected);
         }
     }
 
@@ -2176,4 +2176,16 @@ fn row_scale_and_sigmoid_match_reference_cpu() {
     let expected = magnetar_runtime::reference_cpu::sigmoid(&x);
     let actual = kernels.sigmoid(&upload(&kernels, &x)).unwrap();
     assert_close_scaled(&download(&kernels, &actual), &expected, 1.0);
+}
+
+/// `actual` within f32 summation error of `expected`, relative to each
+/// value's magnitude (large accumulations differ in their last bits).
+fn assert_close_relative(actual: &HostTensor, expected: &HostTensor) {
+    assert_eq!(actual.shape, expected.shape);
+    for (index, (a, e)) in actual.data.iter().zip(&expected.data).enumerate() {
+        assert!(
+            (a - e).abs() <= 1e-4 * (1.0 + e.abs()),
+            "index {index}: {a} vs {e}"
+        );
+    }
 }
