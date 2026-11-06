@@ -253,9 +253,18 @@ impl CudaMultiExecutor {
         for (id, owner, version) in missing {
             let owner = *owner;
             let moving = |error: String| {
+                let streams: Vec<String> = self
+                    .members
+                    .iter()
+                    .enumerate()
+                    .map(|(index, member)| format!("GPU {index} {}", member.capture_status()))
+                    .collect();
                 self.error(
                     ProviderExecutionPhase::Submit,
-                    format!("moving '{id}' from GPU {owner} to GPU {member}: {error}"),
+                    format!(
+                        "moving '{id}' from GPU {owner} to GPU {member}: {error} (streams: {})",
+                        streams.join(", ")
+                    ),
                 )
             };
             self.members[owner]
@@ -658,8 +667,9 @@ impl ProviderExecutionApi for CudaMultiExecutor {
             .collect()
     }
 
+    /// Opt-in while it is qualified: `MAGNETAR_CUDA_MULTI_CAPTURE=1`.
     fn supports_step_capture(&self) -> bool {
-        true
+        std::env::var("MAGNETAR_CUDA_MULTI_CAPTURE").as_deref() == Ok("1")
     }
 
     /// Opens a multi-GPU capture: each member's own capture opens with the

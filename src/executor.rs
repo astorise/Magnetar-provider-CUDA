@@ -639,6 +639,14 @@ impl CudaExecutor {
         Ok(true)
     }
 
+    /// This executor's stream capture status, for diagnostics.
+    pub fn capture_status(&self) -> String {
+        match self.kernels.stream().capture_status() {
+            Ok(status) => format!("{status:?}"),
+            Err(error) => format!("unknown ({error:?})"),
+        }
+    }
+
     /// This executor's Device.
     pub fn device_id(&self) -> &DeviceId {
         &self.device_id
