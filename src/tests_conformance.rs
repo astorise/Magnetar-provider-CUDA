@@ -2178,14 +2178,20 @@ fn row_scale_and_sigmoid_match_reference_cpu() {
     assert_close_scaled(&download(&kernels, &actual), &expected, 1.0);
 }
 
-/// `actual` within f32 summation error of `expected`, relative to each
-/// value's magnitude (large accumulations differ in their last bits).
+/// `actual` within f32 summation error of `expected`, measured against the
+/// largest expected magnitude: an output is a difference of terms that
+/// large, so cancellation leaves an error of their size, not its own (a
+/// wrong expert or weight changes outputs by that whole magnitude).
 fn assert_close_relative(actual: &HostTensor, expected: &HostTensor) {
     assert_eq!(actual.shape, expected.shape);
+    let scale = expected
+        .data
+        .iter()
+        .fold(1.0_f32, |max, e| max.max(e.abs()));
     for (index, (a, e)) in actual.data.iter().zip(&expected.data).enumerate() {
         assert!(
-            (a - e).abs() <= 1e-4 * (1.0 + e.abs()),
-            "index {index}: {a} vs {e}"
+            (a - e).abs() <= 1e-5 * scale,
+            "index {index}: {a} vs {e} (scale {scale})"
         );
     }
 }
