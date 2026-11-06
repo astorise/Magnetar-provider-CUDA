@@ -906,6 +906,9 @@ impl CudaExecutor {
         let reads_compact = |index: usize| match invocation.kernel.name.as_str() {
             "matmul" | "matmul-bias" | "matmul-residual" => index == 1,
             "gated-matmul" => index == 1 || index == 2,
+            // The stacked expert weights: packed experts are read packed,
+            // other compact ones expanded per call.
+            "moe-experts" => index >= 2,
             "embedding" => index == 0,
             _ => false,
         };
@@ -1216,6 +1219,45 @@ impl CudaExecutor {
                         .map_err(KernelError::from)?
                 }
                 "silu" => self.kernels.silu(get(0)?).map_err(KernelError::from)?,
+                "activation" => match invocation.attributes.get("kind") {
+                    Some(OperatorAttributeValue::String(kind)) if kind == "sigmoid" => {
+                        self.kernels.sigmoid(get(0)?).map_err(KernelError::from)?
+                    }
+                    Some(OperatorAttributeValue::String(kind)) if kind == "silu" => {
+                        self.kernels.silu(get(0)?).map_err(KernelError::from)?
+                    }
+                    other => {
+                        return Err(KernelError::KernelAttributeUnsupported {
+                            attribute: format!("activation kind {other:?} is not implemented"),
+                        });
+                    }
+                },
+                "row-scale" => self
+                    .kernels
+                    .row_scale(get(0)?, get(1)?)
+                    .map_err(KernelError::from)?,
+                // `execute-and-cache-moe-experts` F02.
+                "moe-experts" => {
+                    let integer = |name: &str| {
+                        Self::attribute_integer(&invocation.attributes, name)
+                            .filter(|value| *value > 0)
+                            .ok_or_else(|| KernelError::KernelAttributeUnsupported {
+                                attribute: name.into(),
+                            })
+                    };
+                    let routing = magnetar_runtime::reference_cpu::MoeRouting {
+                        experts: integer("experts")?,
+                        top_k: integer("top_k")?,
+                        normalize: Self::attribute_bool(
+                            &invocation.attributes,
+                            "normalize_top_k",
+                            false,
+                        ),
+                    };
+                    self.kernels
+                        .moe_experts(get(0)?, get(1)?, [get(2)?, get(3)?, get(4)?], routing)
+                        .map_err(KernelError::from)?
+                }
                 "add" => {
                     let a = get(0)?;
                     let b = get(1)?;

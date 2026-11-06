@@ -2074,3 +2074,106 @@ fn q8_packed_decode_step_captures_and_a_failed_capture_leaves_the_stream_usable(
     let (_, again) = step(outputs()).unwrap();
     assert_eq!(download(&kernels, &again).data, expected.data);
 }
+
+/// `execute-and-cache-moe-experts` F02: the CUDA `moe-experts` against the
+/// Reference CPU for f32 and packed `Q8_0` experts, for a decode-sized
+/// step (persistent scratch) and a prefill-sized one (temporaries); a
+/// decode-sized step captures and replays exactly.
+#[test]
+fn moe_experts_match_reference_cpu_for_f32_and_packed_experts() {
+    use magnetar_runtime::reference_cpu::{MoeRouting, moe_experts};
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let (hidden, inter, experts, top_k) = (64_u64, 32_u64, 5_u64, 2_u64);
+    let routing = MoeRouting {
+        experts,
+        top_k,
+        normalize: false,
+    };
+    // Stored as each expert's rows: gate/up [E*I, H], down [E*H, I].
+    let gate = packed_q8(experts * inter, hidden, true, 31);
+    let up = packed_q8(experts * inter, hidden, true, 32);
+    let down = packed_q8(experts * hidden, inter, true, 33);
+    let (gate_f32, up_f32, down_f32) = (gate.dequantize(), up.dequantize(), down.dequantize());
+    for tokens in [1_u64, 70] {
+        let h = activations(tokens, hidden, 34);
+        let logits = activations(tokens, experts, 35);
+        for normalize in [false, true] {
+            let routing = MoeRouting {
+                normalize,
+                ..routing
+            };
+            let expected =
+                moe_experts(&h, &logits, [&gate_f32, &up_f32, &down_f32], routing).unwrap();
+            let f32_experts = [&gate_f32, &up_f32, &down_f32].map(|w| upload(&kernels, w));
+            let actual = kernels
+                .moe_experts(
+                    &upload(&kernels, &h),
+                    &upload(&kernels, &logits),
+                    [&f32_experts[0], &f32_experts[1], &f32_experts[2]],
+                    routing,
+                )
+                .unwrap();
+            assert_close_scaled(&download(&kernels, &actual), &expected, hidden as f32);
+            let packed_experts =
+                [&gate, &up, &down].map(|w| kernels.upload_packed_weight(w).unwrap());
+            let actual = kernels
+                .moe_experts(
+                    &upload(&kernels, &h),
+                    &upload(&kernels, &logits),
+                    [&packed_experts[0], &packed_experts[1], &packed_experts[2]],
+                    routing,
+                )
+                .unwrap();
+            assert_close_scaled(&download(&kernels, &actual), &expected, hidden as f32);
+        }
+    }
+
+    // A decode step captures (its output offered ahead) and replays.
+    let packed_experts = [&gate, &up, &down].map(|w| kernels.upload_packed_weight(w).unwrap());
+    let h = upload(&kernels, &activations(1, hidden, 36));
+    let logits = upload(&kernels, &activations(1, experts, 37));
+    let step = |out| {
+        let offered = kernels.offer_output(Some(out));
+        let result = kernels.moe_experts(
+            &h,
+            &logits,
+            [&packed_experts[0], &packed_experts[1], &packed_experts[2]],
+            routing,
+        );
+        drop(offered);
+        result
+    };
+    let alloc = || {
+        kernels
+            .stream()
+            .alloc_zeros::<f32>(hidden as usize)
+            .unwrap()
+    };
+    let eager = download(&kernels, &step(alloc()).unwrap());
+    let out = alloc();
+    kernels.begin_capture(Default::default()).unwrap();
+    let captured = step(out).unwrap();
+    let mut graph = kernels.end_capture().unwrap();
+    kernels.launch_captured(&mut graph, 0).unwrap();
+    assert_eq!(download(&kernels, &captured).data, eager.data);
+}
+
+/// `row-scale` and the `sigmoid` activation against the Reference CPU.
+#[test]
+fn row_scale_and_sigmoid_match_reference_cpu() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let x = activations(3, 40, 41);
+    let scale = activations(3, 1, 42);
+    let expected = magnetar_runtime::reference_cpu::row_scale(&x, &scale).unwrap();
+    let actual = kernels
+        .row_scale(&upload(&kernels, &x), &upload(&kernels, &scale))
+        .unwrap();
+    assert_close_scaled(&download(&kernels, &actual), &expected, 1.0);
+    let expected = magnetar_runtime::reference_cpu::sigmoid(&x);
+    let actual = kernels.sigmoid(&upload(&kernels, &x)).unwrap();
+    assert_close_scaled(&download(&kernels, &actual), &expected, 1.0);
+}

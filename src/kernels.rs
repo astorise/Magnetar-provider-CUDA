@@ -366,7 +366,24 @@ pub struct CudaKernels {
     /// `a`: the current buffer, then every buffer it outgrew (kept until
     /// this Provider drops, like the attention scratch).
     split_scratch: std::sync::Mutex<SplitScratch>,
+    /// `moe-experts`' routing and expert activations for a step of up to
+    /// [`MOE_PERSISTENT_TOKENS`] tokens: the current buffers, then every
+    /// set they outgrew (a captured step may still read one, so none is
+    /// freed before this Provider).
+    moe_scratch: std::sync::Mutex<(Option<MoeScratch>, Vec<MoeScratch>)>,
 }
+
+/// `moe-experts` scratch: the routed experts and weights of each
+/// `(token, k)` pair, and each pair's expert activation.
+struct MoeScratch {
+    indices: CudaSlice<i32>,
+    weights: CudaSlice<f32>,
+    act: CudaSlice<f32>,
+}
+
+/// Steps of at most this many tokens (decode) route through the persistent
+/// scratch, so they capture; longer ones (prefill) use temporaries.
+const MOE_PERSISTENT_TOKENS: u64 = 64;
 
 /// The current hi/lo split buffer and the ones it outgrew.
 type SplitScratch = (Option<CudaSlice<u16>>, Vec<CudaSlice<u16>>);
@@ -483,6 +500,7 @@ impl CudaKernels {
             embedding_flag: std::sync::Mutex::new(None),
             attention_scratch: std::sync::Mutex::new((None, Vec::new())),
             split_scratch: std::sync::Mutex::new((None, Vec::new())),
+            moe_scratch: std::sync::Mutex::new((None, Vec::new())),
         })
     }
 
@@ -1357,6 +1375,243 @@ impl CudaKernels {
             bf16: None,
             q8: None,
         })
+    }
+
+    /// `sigmoid(x)`, element-wise (`activation` with `kind = sigmoid`).
+    pub fn sigmoid(&self, input: &CudaDeviceBuffer) -> Result<CudaDeviceBuffer, CudaError> {
+        Self::require_f32(&[input], "sigmoid")?;
+        let n = input.slice.len() as u64;
+        let mut out_dev = self.alloc_output(input.slice.len())?;
+        let func = self.function("sigmoid_kernel")?;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(&input.slice).arg(&mut out_dev).arg(&n);
+        unsafe { args.launch(LaunchConfig::for_num_elems(n as u32)) }?;
+        Ok(CudaDeviceBuffer {
+            slice: out_dev,
+            shape: input.shape.clone(),
+            bf16: None,
+            q8: None,
+        })
+    }
+
+    /// `out[t, :] = x[t, :] * scale[t]`, `scale` of `[T, 1]` or `[T]`.
+    pub fn row_scale(
+        &self,
+        x: &CudaDeviceBuffer,
+        scale: &CudaDeviceBuffer,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        Self::require_f32(&[x, scale], "row-scale")?;
+        let (rows, cols) = rows_cols_buf(x)?;
+        if scale.slice.len() as u64 != rows {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!(
+                    "row-scale expects one scale per row of {:?}, got {:?}",
+                    x.shape, scale.shape
+                ),
+            ));
+        }
+        let n = x.slice.len() as u64;
+        let mut out_dev = self.alloc_output(x.slice.len())?;
+        let func = self.function("row_scale_kernel")?;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(&x.slice)
+            .arg(&scale.slice)
+            .arg(&mut out_dev)
+            .arg(&cols)
+            .arg(&n);
+        unsafe { args.launch(LaunchConfig::for_num_elems(n as u32)) }?;
+        Ok(CudaDeviceBuffer {
+            slice: out_dev,
+            shape: x.shape.clone(),
+            bf16: None,
+            q8: None,
+        })
+    }
+
+    /// The `moe-experts` Operator (`execute-and-cache-moe-experts` F02):
+    /// `magnetar_runtime::reference_cpu::moe_experts`' semantics. Routing
+    /// stays on the Device. Packed `Q8_0` experts (transposed storage,
+    /// each expert a run of stored rows) are read packed; f32 experts
+    /// directly; any other compact storage is expanded for this call.
+    pub fn moe_experts(
+        &self,
+        h: &CudaDeviceBuffer,
+        logits: &CudaDeviceBuffer,
+        [gate, up, down]: [&CudaDeviceBuffer; 3],
+        routing: magnetar_runtime::reference_cpu::MoeRouting,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        Self::require_f32(&[h, logits], "moe-experts' activations")?;
+        let shape_error = |reason: String| CudaError::new(CudaErrorCode::ShapeUnsupported, reason);
+        let (tokens, hidden) = rows_cols_buf(h)?;
+        let (logit_rows, experts) = rows_cols_buf(logits)?;
+        let top_k = routing.top_k;
+        if experts != routing.experts || logit_rows != tokens || top_k == 0 || top_k > experts {
+            return Err(shape_error(format!(
+                "moe-experts routes top {top_k} of {} experts over [{logit_rows}, {experts}] \
+                 logits for {tokens} tokens",
+                routing.experts
+            )));
+        }
+        let (gate_rows, gate_cols) = rows_cols_buf(gate)?;
+        let (down_rows, down_cols) = rows_cols_buf(down)?;
+        if gate_rows != hidden
+            || !gate_cols.is_multiple_of(experts)
+            || up.shape != gate.shape
+            || down_cols != experts * hidden
+            || down_rows != gate_cols / experts
+        {
+            return Err(shape_error(format!(
+                "moe-experts expects gate/up [{hidden}, {experts} * I] and down [I, {experts} * \
+                 {hidden}], got {:?}, {:?} and {:?}",
+                gate.shape, up.shape, down.shape
+            )));
+        }
+        let inter = gate_cols / experts;
+        let pairs = tokens * top_k;
+
+        let mut scratch_slot = self.moe_scratch.lock().unwrap();
+        let mut temporary = None;
+        let scratch: &mut MoeScratch = if tokens <= MOE_PERSISTENT_TOKENS {
+            let fits = scratch_slot.0.as_ref().is_some_and(|scratch| {
+                scratch.indices.len() as u64 >= pairs && scratch.act.len() as u64 >= pairs * inter
+            });
+            if !fits {
+                self.forbid_in_capture("growing the moe-experts scratch")?;
+                let capacity = MOE_PERSISTENT_TOKENS * top_k;
+                let grown = MoeScratch {
+                    indices: self.stream.alloc_zeros::<i32>(capacity as usize)?,
+                    weights: self.stream.alloc_zeros::<f32>(capacity as usize)?,
+                    act: self
+                        .stream
+                        .alloc_zeros::<f32>((capacity * inter) as usize)?,
+                };
+                if let Some(outgrown) = scratch_slot.0.replace(grown) {
+                    scratch_slot.1.push(outgrown);
+                }
+            }
+            scratch_slot.0.as_mut().expect("ensured above")
+        } else {
+            self.forbid_in_capture("a moe-experts prefill scratch")?;
+            temporary.insert(MoeScratch {
+                indices: self.stream.alloc_zeros::<i32>(pairs as usize)?,
+                weights: self.stream.alloc_zeros::<f32>(pairs as usize)?,
+                act: self.stream.alloc_zeros::<f32>((pairs * inter) as usize)?,
+            })
+        };
+
+        let normalize = i32::from(routing.normalize);
+        let func = self.function("moe_route_kernel")?;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(&logits.slice)
+            .arg(&mut scratch.indices)
+            .arg(&mut scratch.weights)
+            .arg(&tokens)
+            .arg(&experts)
+            .arg(&top_k)
+            .arg(&normalize);
+        unsafe { args.launch(LaunchConfig::for_num_elems(tokens as u32)) }?;
+
+        fn packed(buffer: &CudaDeviceBuffer, stored_cols: u64) -> Option<&CudaQ8Weight> {
+            buffer
+                .q8
+                .as_ref()
+                .filter(|q8| q8.transposed && q8.stored_cols == stored_cols)
+        }
+        let warps_grid = |cols: u64, rows: u64| LaunchConfig {
+            grid_dim: (
+                cols.div_ceil(u64::from(Q8_MATMUL_WARPS)) as u32,
+                rows as u32,
+                1,
+            ),
+            block_dim: (32, Q8_MATMUL_WARPS, 1),
+            shared_mem_bytes: 0,
+        };
+        if let (Some(gate_q8), Some(up_q8)) = (packed(gate, hidden), packed(up, hidden)) {
+            let func = self.function("moe_q8_gated_kernel")?;
+            let mut args = self.stream.launch_builder(&func);
+            args.arg(&h.slice)
+                .arg(&scratch.indices)
+                .arg(&gate_q8.quants)
+                .arg(&gate_q8.scales)
+                .arg(&up_q8.quants)
+                .arg(&up_q8.scales)
+                .arg(&mut scratch.act)
+                .arg(&top_k)
+                .arg(&hidden)
+                .arg(&inter);
+            unsafe { args.launch(warps_grid(inter, pairs)) }?;
+        } else {
+            let (mut gate_f32, mut up_f32) = (None, None);
+            let gate = self.as_f32(gate, &mut gate_f32)?;
+            let up = self.as_f32(up, &mut up_f32)?;
+            let func = self.function("moe_f32_gated_kernel")?;
+            let mut args = self.stream.launch_builder(&func);
+            args.arg(&h.slice)
+                .arg(&scratch.indices)
+                .arg(&gate.slice)
+                .arg(&up.slice)
+                .arg(&mut scratch.act)
+                .arg(&pairs)
+                .arg(&top_k)
+                .arg(&hidden)
+                .arg(&inter)
+                .arg(&experts);
+            unsafe { args.launch(LaunchConfig::for_num_elems((pairs * inter) as u32)) }?;
+        }
+
+        let mut out_dev = self.alloc_output((tokens * hidden) as usize)?;
+        if let Some(down_q8) = packed(down, inter) {
+            let func = self.function("moe_q8_down_kernel")?;
+            let mut args = self.stream.launch_builder(&func);
+            args.arg(&scratch.act)
+                .arg(&scratch.indices)
+                .arg(&scratch.weights)
+                .arg(&down_q8.quants)
+                .arg(&down_q8.scales)
+                .arg(&mut out_dev)
+                .arg(&top_k)
+                .arg(&hidden)
+                .arg(&inter);
+            unsafe { args.launch(warps_grid(hidden, tokens)) }?;
+        } else {
+            let mut down_f32 = None;
+            let down = self.as_f32(down, &mut down_f32)?;
+            let func = self.function("moe_f32_down_kernel")?;
+            let mut args = self.stream.launch_builder(&func);
+            args.arg(&scratch.act)
+                .arg(&scratch.indices)
+                .arg(&scratch.weights)
+                .arg(&down.slice)
+                .arg(&mut out_dev)
+                .arg(&tokens)
+                .arg(&top_k)
+                .arg(&hidden)
+                .arg(&inter)
+                .arg(&experts);
+            unsafe { args.launch(LaunchConfig::for_num_elems((tokens * hidden) as u32)) }?;
+        }
+        drop(temporary);
+        drop(scratch_slot);
+        Ok(CudaDeviceBuffer {
+            slice: out_dev,
+            shape: vec![tokens, hidden],
+            bf16: None,
+            q8: None,
+        })
+    }
+
+    /// `buffer` as plain f32: itself, or its expansion for this call,
+    /// kept in `expanded`.
+    fn as_f32<'b>(
+        &self,
+        buffer: &'b CudaDeviceBuffer,
+        expanded: &'b mut Option<CudaDeviceBuffer>,
+    ) -> Result<&'b CudaDeviceBuffer, CudaError> {
+        if !buffer.is_compact() {
+            return Ok(buffer);
+        }
+        Ok(expanded.insert(self.expand(buffer)?))
     }
 
     pub fn embedding_lookup(

@@ -282,6 +282,242 @@ extern "C" __global__ void q8_gated_matmul_rows_kernel(
     }
 }
 
+// `execute-and-cache-moe-experts` F02. One thread per token row: softmax
+// of its `experts` router logits in f32, the `top_k` largest probabilities
+// (ties to the lower expert), divided by their sum when `normalize` --
+// `magnetar_runtime::reference_cpu::moe_route`'s order of operations.
+// Writes `indices`/`weights[t * top_k + k]`; the routing never leaves the
+// Device, so a decode step that routes stays capturable.
+extern "C" __global__ void moe_route_kernel(
+    const float* logits,
+    int* indices,
+    float* weights,
+    unsigned long long tokens,
+    unsigned long long experts,
+    unsigned long long top_k,
+    int normalize
+) {
+    unsigned long long t = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= tokens) {
+        return;
+    }
+    const float* row = logits + t * experts;
+    float max_logit = row[0];
+    for (unsigned long long e = 1; e < experts; e++) {
+        max_logit = fmaxf(max_logit, row[e]);
+    }
+    float sum = 0.0f;
+    for (unsigned long long e = 0; e < experts; e++) {
+        sum += expf(row[e] - max_logit);
+    }
+    float chosen_total = 0.0f;
+    float previous = __int_as_float(0x7f800000);
+    long long previous_expert = -1;
+    for (unsigned long long k = 0; k < top_k; k++) {
+        // The next expert after (previous, previous_expert) in descending
+        // probability, ties by ascending index.
+        long long best = -1;
+        float best_p = -1.0f;
+        for (unsigned long long e = 0; e < experts; e++) {
+            float p = expf(row[e] - max_logit);
+            bool after_previous = p < previous || (p == previous && (long long)e > previous_expert);
+            if (after_previous && (best < 0 || p > best_p)) {
+                best = (long long)e;
+                best_p = p;
+            }
+        }
+        indices[t * top_k + k] = (int)best;
+        weights[t * top_k + k] = best_p / sum;
+        chosen_total += best_p / sum;
+        previous = best_p;
+        previous_expert = best;
+    }
+    if (normalize) {
+        for (unsigned long long k = 0; k < top_k; k++) {
+            weights[t * top_k + k] /= chosen_total;
+        }
+    }
+}
+
+// act[tk, j] = silu(h[t] . gate_e[:, j]) * (h[t] . up_e[:, j]) for the
+// routed pair tk = t * top_k + k and its expert e = indices[tk], with the
+// stacked experts packed `Q8_0` in transposed storage: expert e's column j
+// is stored row e * inter + j, `hidden` quants long. One warp per (tk, j),
+// `q8_matmul_rows_kernel`'s reading pattern.
+extern "C" __global__ void moe_q8_gated_kernel(
+    const float* h,
+    const int* indices,
+    const signed char* gate_quants,
+    const float* gate_scales,
+    const signed char* up_quants,
+    const float* up_scales,
+    float* act,
+    unsigned long long top_k,
+    unsigned long long hidden,
+    unsigned long long inter
+) {
+    unsigned long long j = (unsigned long long)blockIdx.x * Q8_MATMUL_WARPS + threadIdx.y;
+    unsigned long long tk = blockIdx.y;
+    if (j >= inter) {
+        return;
+    }
+    unsigned long long t = tk / top_k;
+    unsigned long long row = (unsigned long long)indices[tk] * inter + j;
+    const signed char* wg = gate_quants + row * hidden;
+    const signed char* wu = up_quants + row * hidden;
+    const float* sg = gate_scales + row * (hidden >> 5);
+    const float* su = up_scales + row * (hidden >> 5);
+    const float* x = h + t * hidden;
+    float g = 0.0f;
+    float u = 0.0f;
+    for (unsigned long long i = (unsigned long long)threadIdx.x * 4; i < hidden; i += 128) {
+        char4 qg = *reinterpret_cast<const char4*>(wg + i);
+        char4 qu = *reinterpret_cast<const char4*>(wu + i);
+        float4 v = *reinterpret_cast<const float4*>(x + i);
+        g += sg[i >> 5] * (v.x * (float)qg.x + v.y * (float)qg.y + v.z * (float)qg.z + v.w * (float)qg.w);
+        u += su[i >> 5] * (v.x * (float)qu.x + v.y * (float)qu.y + v.z * (float)qu.z + v.w * (float)qu.w);
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        g += __shfl_xor_sync(0xffffffffu, g, offset);
+        u += __shfl_xor_sync(0xffffffffu, u, offset);
+    }
+    if (threadIdx.x == 0) {
+        act[tk * inter + j] = g * (1.0f / (1.0f + expf(-g))) * u;
+    }
+}
+
+// out[t, c] = sum_k weights[tk] * (act[tk] . down_e[:, c]) with the stacked
+// down projections packed `Q8_0` in transposed storage: expert e's column c
+// is stored row e * hidden + c, `inter` quants long. One warp per (t, c);
+// the experts add in routing order.
+extern "C" __global__ void moe_q8_down_kernel(
+    const float* act,
+    const int* indices,
+    const float* weights,
+    const signed char* down_quants,
+    const float* down_scales,
+    float* out,
+    unsigned long long top_k,
+    unsigned long long hidden,
+    unsigned long long inter
+) {
+    unsigned long long c = (unsigned long long)blockIdx.x * Q8_MATMUL_WARPS + threadIdx.y;
+    unsigned long long t = blockIdx.y;
+    if (c >= hidden) {
+        return;
+    }
+    float total = 0.0f;
+    for (unsigned long long k = 0; k < top_k; k++) {
+        unsigned long long tk = t * top_k + k;
+        unsigned long long row = (unsigned long long)indices[tk] * hidden + c;
+        const signed char* w = down_quants + row * inter;
+        const float* scales = down_scales + row * (inter >> 5);
+        const float* a = act + tk * inter;
+        float sum = 0.0f;
+        for (unsigned long long i = (unsigned long long)threadIdx.x * 4; i < inter; i += 128) {
+            char4 q = *reinterpret_cast<const char4*>(w + i);
+            float4 v = *reinterpret_cast<const float4*>(a + i);
+            sum += scales[i >> 5] * (v.x * (float)q.x + v.y * (float)q.y + v.z * (float)q.z + v.w * (float)q.w);
+        }
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum += __shfl_xor_sync(0xffffffffu, sum, offset);
+        }
+        total += weights[tk] * sum;
+    }
+    if (threadIdx.x == 0) {
+        out[t * hidden + c] = total;
+    }
+}
+
+// The f32 forms of the two kernels above, for experts stored as plain f32
+// logical matrices: `gate`/`up` `[hidden, experts * inter]` and `down`
+// `[inter, experts * hidden]`, row-major. One thread per output element.
+extern "C" __global__ void moe_f32_gated_kernel(
+    const float* h,
+    const int* indices,
+    const float* gate,
+    const float* up,
+    float* act,
+    unsigned long long pairs,
+    unsigned long long top_k,
+    unsigned long long hidden,
+    unsigned long long inter,
+    unsigned long long experts
+) {
+    unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= pairs * inter) {
+        return;
+    }
+    unsigned long long tk = index / inter;
+    unsigned long long j = index % inter;
+    unsigned long long column = (unsigned long long)indices[tk] * inter + j;
+    unsigned long long stride = experts * inter;
+    const float* x = h + (tk / top_k) * hidden;
+    float g = 0.0f;
+    float u = 0.0f;
+    for (unsigned long long i = 0; i < hidden; i++) {
+        g += x[i] * gate[i * stride + column];
+        u += x[i] * up[i * stride + column];
+    }
+    act[index] = g * (1.0f / (1.0f + expf(-g))) * u;
+}
+
+extern "C" __global__ void moe_f32_down_kernel(
+    const float* act,
+    const int* indices,
+    const float* weights,
+    const float* down,
+    float* out,
+    unsigned long long tokens,
+    unsigned long long top_k,
+    unsigned long long hidden,
+    unsigned long long inter,
+    unsigned long long experts
+) {
+    unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= tokens * hidden) {
+        return;
+    }
+    unsigned long long t = index / hidden;
+    unsigned long long c = index % hidden;
+    unsigned long long stride = experts * hidden;
+    float total = 0.0f;
+    for (unsigned long long k = 0; k < top_k; k++) {
+        unsigned long long tk = t * top_k + k;
+        unsigned long long column = (unsigned long long)indices[tk] * hidden + c;
+        const float* a = act + tk * inter;
+        float sum = 0.0f;
+        for (unsigned long long j = 0; j < inter; j++) {
+            sum += a[j] * down[j * stride + column];
+        }
+        total += weights[tk] * sum;
+    }
+    out[index] = total;
+}
+
+// out[i] = x[i] * scale[i / cols]: each row scaled by its own scalar.
+extern "C" __global__ void row_scale_kernel(
+    const float* x,
+    const float* scale,
+    float* out,
+    unsigned long long cols,
+    unsigned long long n
+) {
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = x[i] * scale[i / cols];
+    }
+}
+
+extern "C" __global__ void sigmoid_kernel(const float* x, float* out, unsigned long long n) {
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = 1.0f / (1.0f + expf(-x[i]));
+    }
+}
+
 // One thread per output element. `bias` is a single row of `cols` values,
 // broadcast across every row of `a` (real Qwen2/2.5 QKV projection bias:
 // `[rows, cols] + [cols] -> [rows, cols]`) -- mirrors `rmsnorm_kernel`'s
