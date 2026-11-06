@@ -704,9 +704,10 @@ impl ProviderExecutionApi for CudaMultiExecutor {
             .collect()
     }
 
-    /// Opt-in while it is qualified: `MAGNETAR_CUDA_MULTI_CAPTURE=1`.
+    /// On by default; `MAGNETAR_CUDA_MULTI_CAPTURE=0` is the disable
+    /// control (every step spanning GPUs then runs uncaptured).
     fn supports_step_capture(&self) -> bool {
-        std::env::var("MAGNETAR_CUDA_MULTI_CAPTURE").as_deref() == Ok("1")
+        std::env::var("MAGNETAR_CUDA_MULTI_CAPTURE").as_deref() != Ok("0")
     }
 
     /// Opens a multi-GPU capture: each member's own capture opens with the
