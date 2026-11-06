@@ -1353,8 +1353,24 @@ impl CudaKernels {
         let (vocab, dim) = rows_cols_buf(table)?;
         Self::require_f32(&[ids], "the embedding lookup's ids")?;
         // A packed table read row by row must be stored untransposed.
+        let context = |step: &'static str| {
+            let packed = table.is_q8();
+            move |error: CudaError| {
+                CudaError::new(
+                    CudaErrorCode::ExecutionFailed,
+                    format!(
+                        "embedding lookup {step} ({} ids, table {vocab}x{dim}, packed {packed}): \
+                         {error}",
+                        ids.slice.len()
+                    ),
+                )
+            }
+        };
         if table.q8.as_ref().is_some_and(|q8| q8.transposed) {
-            return self.embedding_lookup(&self.dequantize_q8(table)?, ids);
+            let dense = self
+                .dequantize_q8(table)
+                .map_err(context("dequantizing a transposed table"))?;
+            return self.embedding_lookup(&dense, ids);
         }
         let table16 = self.bf16_address(table);
         let (table_q8, table_q8_scales) = match &table.q8 {
@@ -1366,20 +1382,30 @@ impl CudaKernels {
         };
         let num_ids = ids.slice.len() as u64;
         // Rows of invalid ids stay unwritten, but those fail the lookup.
-        let mut out_dev = self.alloc_output(ids.slice.len() * dim as usize)?;
+        let mut out_dev = self
+            .alloc_output(ids.slice.len() * dim as usize)
+            .map_err(context("output allocation"))?;
         let mut flag_slot = self.embedding_flag.lock().unwrap();
         let mut invalid_id_flag = match flag_slot.take() {
             Some(flag) => flag,
             None => {
                 self.forbid_in_capture("a device allocation")?;
-                self.stream.alloc_zeros::<i32>(1)?
+                self.stream
+                    .alloc_zeros::<i32>(1)
+                    .map_err(CudaError::from)
+                    .map_err(context("flag allocation"))?
             }
         };
         // A captured step resets the flag once, at its start.
         if !self.is_capturing() {
-            self.stream.memset_zeros(&mut invalid_id_flag)?;
+            self.stream
+                .memset_zeros(&mut invalid_id_flag)
+                .map_err(CudaError::from)
+                .map_err(context("flag reset"))?;
         }
-        let func = self.function("embedding_lookup_kernel")?;
+        let func = self
+            .function("embedding_lookup_kernel")
+            .map_err(context("function load"))?;
         let mut args = self.stream.launch_builder(&func);
         args.arg(&table.slice)
             .arg(&ids.slice)

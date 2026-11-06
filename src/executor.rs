@@ -915,10 +915,14 @@ impl CudaExecutor {
             if reads_compact(index) || !storage.get(id).is_some_and(CudaDeviceBuffer::is_compact) {
                 continue;
             }
-            let expanded = self
-                .kernels
-                .expand(&storage[id])
-                .map_err(KernelError::from)?;
+            let expanded = self.kernels.expand(&storage[id]).map_err(|error| {
+                KernelError::KernelExecutionFailed {
+                    reason: format!(
+                        "expanding compact input {index} of {}: {error}",
+                        invocation.kernel.name
+                    ),
+                }
+            })?;
             storage.insert(id.clone(), expanded);
         }
         Ok(())
