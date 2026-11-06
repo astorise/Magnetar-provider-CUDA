@@ -535,10 +535,15 @@ impl CudaKernels {
                 "no step capture is in progress",
             )
         })?;
+        let deferred = self.take_deferred_error();
         let graph = self.stream.end_capture(
             sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
         );
         if let Some(failure) = capture.failure {
+            return Err(CudaError::new(CudaErrorCode::CaptureUnsupported, failure));
+        }
+        if let Err(error) = deferred {
+            let failure = format!("the step capture met a driver error: {error:?}");
             return Err(CudaError::new(CudaErrorCode::CaptureUnsupported, failure));
         }
         let graph = graph?.ok_or_else(|| {
@@ -555,9 +560,18 @@ impl CudaKernels {
         })
     }
 
+    /// Takes the error cudarc recorded from work it could not report
+    /// (freeing a buffer dropped while capturing). Left in place, it would
+    /// fail the next driver call -- ending the capture included, leaving
+    /// the stream capturing.
+    fn take_deferred_error(&self) -> Result<(), cudarc::driver::DriverError> {
+        self.stream.context().check_err()
+    }
+
     /// Ends the capture in progress, if any, and discards it.
     pub fn abort_capture(&self) {
         if self.capture.lock().unwrap().take().is_some() {
+            let _ = self.take_deferred_error();
             let _ = self.stream.end_capture(
                 sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
             );
@@ -1901,7 +1915,21 @@ impl CudaKernels {
         } else {
             (a_rows, a_cols)
         };
-        // Packed weights: each projection through the packed matmul.
+        // Packed weights read packed against a few contiguous rows: both
+        // projections in one launch, with no intermediate to allocate (a
+        // captured decode step allocates nothing).
+        if let (Some(gate_q8), Some(up_q8)) = (&gate.q8, &up.q8)
+            && gate_q8.transposed
+            && up_q8.transposed
+            && !transpose_a
+            && !transpose_b
+            && m <= Q8_MATMUL_MAX_ROWS
+            && k == b_rows
+        {
+            Self::require_f32(&[a], "gated-matmul's input")?;
+            return self.q8_gated_matmul_rows(a, gate_q8, up_q8, m, k, b_cols);
+        }
+        // Other packed weights: each projection through the packed matmul.
         if transpose_b || m > MATMUL_SPLIT_K_MAX_ROWS || k != b_rows || gate.is_q8() || up.is_q8() {
             let gate_out = self.matmul(a, gate, transpose_a, transpose_b)?;
             let up_out = self.matmul(a, up, transpose_a, transpose_b)?;
@@ -2051,6 +2079,47 @@ impl CudaKernels {
             .arg(&n)
             .arg(&addend_buffer.slice)
             .arg(&addend_mode);
+        let config = LaunchConfig {
+            grid_dim: (
+                n.div_ceil(u64::from(Q8_MATMUL_WARPS)) as u32,
+                m.div_ceil(Q8_MATMUL_ROWS) as u32,
+                1,
+            ),
+            block_dim: (32, Q8_MATMUL_WARPS, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { args.launch(config) }?;
+        Ok(CudaDeviceBuffer {
+            slice: out_dev,
+            shape: vec![m, n],
+            bf16: None,
+            q8: None,
+        })
+    }
+
+    /// `silu(a x gate) * (a x up)` for two transposed-storage packed
+    /// weights; see `q8_gated_matmul_rows_kernel`.
+    fn q8_gated_matmul_rows(
+        &self,
+        a: &CudaDeviceBuffer,
+        gate: &CudaQ8Weight,
+        up: &CudaQ8Weight,
+        m: u64,
+        k: u64,
+        n: u64,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        let mut out_dev = self.alloc_output((m * n) as usize)?;
+        let func = self.function("q8_gated_matmul_rows_kernel")?;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(&a.slice)
+            .arg(&gate.quants)
+            .arg(&gate.scales)
+            .arg(&up.quants)
+            .arg(&up.scales)
+            .arg(&mut out_dev)
+            .arg(&m)
+            .arg(&k)
+            .arg(&n);
         let config = LaunchConfig {
             grid_dim: (
                 n.div_ceil(u64::from(Q8_MATMUL_WARPS)) as u32,

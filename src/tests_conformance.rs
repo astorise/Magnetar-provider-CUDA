@@ -2015,3 +2015,51 @@ fn q8_packed_weights_at_real_checkpoint_sizes() {
         }
     }
 }
+
+/// A decode step over packed weights (`execute-direct-quantized-weights`)
+/// captures into a CUDA graph -- the packed gated matmul allocates no
+/// intermediate -- and its replay matches the uncaptured step. A capture
+/// failed after a device buffer was dropped while capturing leaves the
+/// stream usable: the driver error that free recorded does not outlive the
+/// aborted capture.
+#[test]
+fn q8_packed_decode_step_captures_and_a_failed_capture_leaves_the_stream_usable() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let (k, n) = (128_u64, 64_u64);
+    let gate = kernels
+        .upload_packed_weight(&packed_q8(n, k, true, 21))
+        .unwrap();
+    let up = kernels
+        .upload_packed_weight(&packed_q8(n, k, true, 22))
+        .unwrap();
+    let table = kernels
+        .upload_packed_weight(&packed_q8(6, k, false, 23))
+        .unwrap();
+    let ids = upload(&kernels, &HostTensor::new([1], vec![4.0]).unwrap());
+    let step = || {
+        let hidden = kernels.embedding_lookup(&table, &ids)?;
+        let out = kernels.gated_matmul(&hidden, &gate, &up, false, false)?;
+        Ok::<_, crate::error::CudaError>((hidden, out))
+    };
+    let (_, eager) = step().unwrap();
+    let expected = download(&kernels, &eager);
+
+    kernels.begin_capture(Default::default()).unwrap();
+    let (_hidden, captured) = step().unwrap();
+    let mut graph = kernels.end_capture().unwrap();
+    kernels.launch_captured(&mut graph, 0).unwrap();
+    assert_eq!(download(&kernels, &captured).data, expected.data);
+
+    let dropped = upload(&kernels, &activations(1, k, 7));
+    kernels.begin_capture(Default::default()).unwrap();
+    drop(dropped);
+    assert!(
+        kernels.upload(&activations(1, k, 8)).is_err(),
+        "a host upload cannot be captured"
+    );
+    kernels.abort_capture();
+    let (_, again) = step().unwrap();
+    assert_eq!(download(&kernels, &again).data, expected.data);
+}

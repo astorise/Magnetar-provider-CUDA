@@ -216,6 +216,72 @@ extern "C" __global__ void q8_matmul_rows_kernel(
     }
 }
 
+// `silu(gate) * up` for a contiguous `a` and two packed weights stored
+// transposed, as `q8_matmul_rows_kernel` computes each projection: one warp
+// per output column reads both weights' rows, so the gated MLP's decode
+// step writes one output and allocates no intermediate. The arithmetic is
+// `q8_matmul_rows_kernel`'s per projection followed by `silu_mul_kernel`'s.
+extern "C" __global__ void q8_gated_matmul_rows_kernel(
+    const float* a,
+    const signed char* gate_quants,
+    const float* gate_scales,
+    const signed char* up_quants,
+    const float* up_scales,
+    float* out,
+    unsigned long long m,
+    unsigned long long k,
+    unsigned long long n
+) {
+    unsigned long long col = (unsigned long long)blockIdx.x * Q8_MATMUL_WARPS + threadIdx.y;
+    unsigned long long first_row = (unsigned long long)blockIdx.y * Q8_MATMUL_ROWS;
+    if (col >= n || first_row >= m) {
+        return;
+    }
+    unsigned int rows = (unsigned int)min((unsigned long long)Q8_MATMUL_ROWS, m - first_row);
+    unsigned int lane = threadIdx.x;
+    const signed char* wg = gate_quants + col * k;
+    const signed char* wu = up_quants + col * k;
+    const float* g_scales = gate_scales + col * (k >> 5);
+    const float* u_scales = up_scales + col * (k >> 5);
+    float gate_acc[Q8_MATMUL_ROWS];
+    float up_acc[Q8_MATMUL_ROWS];
+#pragma unroll
+    for (int r = 0; r < Q8_MATMUL_ROWS; r++) {
+        gate_acc[r] = 0.0f;
+        up_acc[r] = 0.0f;
+    }
+    for (unsigned long long i = (unsigned long long)lane * 4; i < k; i += 128) {
+        char4 qg = *reinterpret_cast<const char4*>(wg + i);
+        char4 qu = *reinterpret_cast<const char4*>(wu + i);
+        float dg = g_scales[i >> 5];
+        float du = u_scales[i >> 5];
+#pragma unroll
+        for (int r = 0; r < Q8_MATMUL_ROWS; r++) {
+            if (r < (int)rows) {
+                float4 x = *reinterpret_cast<const float4*>(a + (first_row + r) * k + i);
+                gate_acc[r] += dg * (x.x * (float)qg.x + x.y * (float)qg.y + x.z * (float)qg.z
+                    + x.w * (float)qg.w);
+                up_acc[r] += du * (x.x * (float)qu.x + x.y * (float)qu.y + x.z * (float)qu.z
+                    + x.w * (float)qu.w);
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < Q8_MATMUL_ROWS; r++) {
+        float g = gate_acc[r];
+        float u = up_acc[r];
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            g += __shfl_xor_sync(0xffffffffu, g, offset);
+            u += __shfl_xor_sync(0xffffffffu, u, offset);
+        }
+        if (lane == 0 && r < (int)rows) {
+            float activated = g * (1.0f / (1.0f + expf(-g)));
+            out[(first_row + r) * n + col] = activated * u;
+        }
+    }
+}
+
 // One thread per output element. `bias` is a single row of `cols` values,
 // broadcast across every row of `a` (real Qwen2/2.5 QKV projection bias:
 // `[rows, cols] + [cols] -> [rows, cols]`) -- mirrors `rmsnorm_kernel`'s
