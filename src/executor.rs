@@ -612,6 +612,33 @@ impl CudaExecutor {
         Ok(())
     }
 
+    /// Copies `peer`'s current `id` into this executor's existing `id`
+    /// buffer, in place (its device address unchanged, so a captured step
+    /// reading it stays valid). `false`, copying nothing, when either side
+    /// lacks a plain f32 buffer of the same length. The caller waits for
+    /// `peer`'s stream first.
+    pub fn copy_from_peer_in_place(
+        &self,
+        peer: &CudaExecutor,
+        id: &TensorResourceId,
+    ) -> Result<bool, CudaError> {
+        let peer_storage = peer.storage.lock().unwrap();
+        let Some(source) = peer_storage.get(id) else {
+            return Ok(false);
+        };
+        let mut storage = self.storage.lock().unwrap();
+        let Some(destination) = storage.get_mut(id) else {
+            return Ok(false);
+        };
+        if source.is_compact() || destination.is_compact() || source.len() != destination.len() {
+            return Ok(false);
+        }
+        self.kernels
+            .stream()
+            .memcpy_dtod(&source.slice, &mut destination.slice)?;
+        Ok(true)
+    }
+
     /// This executor's Device.
     pub fn device_id(&self) -> &DeviceId {
         &self.device_id

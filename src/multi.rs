@@ -19,8 +19,10 @@
 //!   produced anew.
 //!
 //! Each member is an ordinary [`CudaExecutor`] bound to its own GPU, so every
-//! Kernel, packed weight and admission rule is the single-GPU one. Step
-//! capture is not offered yet: a step spanning GPUs runs uncaptured.
+//! Kernel, packed weight and admission rule is the single-GPU one. A step
+//! is captured as one CUDA graph per contiguous run of a member's work,
+//! with the boundary crossings between them recorded and repeated in place
+//! at replay, so each graph's captured addresses stay valid.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -40,8 +42,8 @@ use magnetar_runtime::memory::{
 use magnetar_runtime::operator::OperatorSpec;
 use magnetar_runtime::packed_weight::{PackedWeight, PackedWeightWrite};
 use magnetar_runtime::provider::{
-    Provider, ProviderError, ProviderExecutionApi, ProviderMetadata, ProviderRegistry, TensorValue,
-    TensorValueAdmissionError,
+    Provider, ProviderError, ProviderExecutionApi, ProviderMetadata, ProviderRegistry,
+    StepCaptureId, StepCaptureRequest, StepReplayError, TensorValue, TensorValueAdmissionError,
 };
 use magnetar_runtime::scheduler::{
     ProviderCancellationOutcome, ProviderExecutionError, ProviderExecutionErrorCode,
@@ -123,6 +125,33 @@ impl Residency {
     }
 }
 
+/// One step of a multi-GPU capture, replayed in order.
+enum CapturedOp {
+    /// A member's own captured graph.
+    Graph { member: usize, id: StepCaptureId },
+    /// `id` copied in place from `from` to `to`, after `from`'s stream.
+    Copy {
+        id: TensorResourceId,
+        from: usize,
+        to: usize,
+    },
+}
+
+/// The step capture in progress: the operations so far and the member
+/// whose own capture is open.
+struct Recording {
+    request: StepCaptureRequest,
+    ops: Vec<CapturedOp>,
+    open: Option<usize>,
+}
+
+#[derive(Default)]
+struct CaptureState {
+    recording: Option<Recording>,
+    captures: BTreeMap<StepCaptureId, Vec<CapturedOp>>,
+    next: u64,
+}
+
 /// The execution side of [`CudaMultiProvider`].
 pub struct CudaMultiExecutor {
     provider_name: String,
@@ -131,6 +160,7 @@ pub struct CudaMultiExecutor {
     residency: Mutex<Residency>,
     completed: Mutex<BTreeMap<ProviderExecutionId, KernelResult>>,
     next_execution: std::sync::atomic::AtomicU64,
+    capture: Mutex<CaptureState>,
 }
 
 impl CudaMultiExecutor {
@@ -189,55 +219,113 @@ impl CudaMultiExecutor {
             .unwrap_or(residency.current)
     }
 
-    /// Copies every input of `invocation` that `member` lacks from its
-    /// owner, after the owner's stream has written it.
-    fn bring_inputs(
+    /// The inputs of `invocation` that `member` lacks, with their owner and
+    /// current version.
+    fn missing_inputs(
         &self,
         invocation: &KernelInvocation,
         member: usize,
+    ) -> Vec<(TensorResourceId, usize, u64)> {
+        let residency = self.residency.lock().unwrap();
+        invocation
+            .inputs
+            .iter()
+            .map(|input| &input.resource.id)
+            .filter(|id| !residency.current_on(id, member))
+            .filter_map(|id| {
+                residency
+                    .resources
+                    .get(id)
+                    .map(|copies| (id.clone(), copies.owner, copies.version))
+            })
+            .collect()
+    }
+
+    /// Copies `missing` into `member` from each owner, after the owner's
+    /// stream has written it: in place when `member` already has a buffer
+    /// of the same size, else into a new one.
+    fn bring_inputs(
+        &self,
+        missing: &[(TensorResourceId, usize, u64)],
+        member: usize,
         memory: &mut MemoryManager,
     ) -> Result<(), ProviderExecutionError> {
-        for input in &invocation.inputs {
-            let id = &input.resource.id;
-            let (owner, version) = {
-                let residency = self.residency.lock().unwrap();
-                if residency.current_on(id, member) {
-                    continue;
-                }
-                match residency.resources.get(id) {
-                    Some(copies) => (copies.owner, copies.version),
-                    // Unknown here: let the member report it.
-                    None => continue,
-                }
-            };
-            self.members[owner].synchronize().map_err(|error| {
+        for (id, owner, version) in missing {
+            let owner = *owner;
+            let moving = |error: String| {
                 self.error(
                     ProviderExecutionPhase::Submit,
-                    format!("waiting for GPU {owner} before moving '{id}': {error}"),
+                    format!("moving '{id}' from GPU {owner} to GPU {member}: {error}"),
                 )
-            })?;
-            self.members[member]
-                .copy_tensor_from_peer_admitted(
-                    memory,
-                    &self.members[owner],
-                    id,
-                    id.clone(),
-                    MemoryAllocationClass::Tensor,
-                    MemoryAllocationOwner::Provider(ProviderBinding::new(
-                        self.provider_name.clone(),
-                    )),
-                )
-                .map_err(|error| {
-                    self.error(
-                        ProviderExecutionPhase::Submit,
-                        format!("moving '{id}' from GPU {owner} to GPU {member}: {error:?}"),
+            };
+            self.members[owner]
+                .synchronize()
+                .map_err(|error| moving(error.to_string()))?;
+            let in_place = self.members[member]
+                .copy_from_peer_in_place(&self.members[owner], id)
+                .map_err(|error| moving(error.to_string()))?;
+            if !in_place {
+                self.members[member]
+                    .copy_tensor_from_peer_admitted(
+                        memory,
+                        &self.members[owner],
+                        id,
+                        id.clone(),
+                        MemoryAllocationClass::Tensor,
+                        MemoryAllocationOwner::Provider(ProviderBinding::new(
+                            self.provider_name.clone(),
+                        )),
                     )
-                })?;
+                    .map_err(|error| moving(format!("{error:?}")))?;
+            }
             if let Some(copies) = self.residency.lock().unwrap().resources.get_mut(id) {
-                copies.copies.insert(member, version);
+                copies.copies.insert(member, *version);
             }
         }
         Ok(())
+    }
+
+    /// While capturing, prepares `member` to run an invocation needing
+    /// `missing`: the open member capture is closed (its graph recorded)
+    /// whenever the member changes or an input must cross first, the
+    /// crossings are made and recorded, and `member`'s own capture opened.
+    /// `false` when no capture is in progress.
+    fn prepare_captured_invocation(
+        &self,
+        member: usize,
+        missing: &[(TensorResourceId, usize, u64)],
+        memory: &mut MemoryManager,
+    ) -> Result<bool, ProviderExecutionError> {
+        let mut capture = self.capture.lock().unwrap();
+        let Some(recording) = capture.recording.as_mut() else {
+            return Ok(false);
+        };
+        if recording.open != Some(member) || !missing.is_empty() {
+            if let Some(open) = recording.open.take() {
+                let id = self.members[open].end_step_capture()?;
+                recording.ops.push(CapturedOp::Graph { member: open, id });
+            }
+            self.bring_inputs(missing, member, memory)?;
+            for (id, from, _) in missing {
+                recording.ops.push(CapturedOp::Copy {
+                    id: id.clone(),
+                    from: *from,
+                    to: member,
+                });
+            }
+            self.members[member].begin_step_capture(&recording.request)?;
+            recording.open = Some(member);
+        }
+        Ok(true)
+    }
+
+    /// Releases every member capture `ops` holds.
+    fn release_ops(&self, ops: &[CapturedOp]) {
+        for op in ops {
+            if let CapturedOp::Graph { member, id } = op {
+                self.members[*member].release_step_capture(id);
+            }
+        }
     }
 
     /// Records `id` as produced by `member`, freeing the stale copies other
@@ -314,7 +402,10 @@ impl ProviderExecutionApi for CudaMultiExecutor {
         memory: &mut MemoryManager,
     ) -> Result<ProviderExecutionHandle, ProviderExecutionError> {
         let member = self.execution_member(invocation);
-        self.bring_inputs(invocation, member, memory)?;
+        let missing = self.missing_inputs(invocation, member);
+        if !self.prepare_captured_invocation(member, &missing, memory)? {
+            self.bring_inputs(&missing, member, memory)?;
+        }
         let member_handle =
             self.members[member].submit_kernel(advertisement, operator, invocation, memory)?;
         let result = self.members[member].complete_kernel(&member_handle)?;
@@ -567,6 +658,139 @@ impl ProviderExecutionApi for CudaMultiExecutor {
             .collect()
     }
 
+    fn supports_step_capture(&self) -> bool {
+        true
+    }
+
+    /// Opens a multi-GPU capture: each member's own capture opens with the
+    /// first invocation it runs, and closes when the step moves to another
+    /// member or an input must cross GPUs first (the crossing is recorded
+    /// between the two graphs).
+    fn begin_step_capture(
+        &self,
+        request: &StepCaptureRequest,
+    ) -> Result<(), ProviderExecutionError> {
+        let mut capture = self.capture.lock().unwrap();
+        if capture.recording.is_some() {
+            return Err(self.error(
+                ProviderExecutionPhase::Submit,
+                "a step capture is already in progress",
+            ));
+        }
+        capture.recording = Some(Recording {
+            request: request.clone(),
+            ops: Vec::new(),
+            open: None,
+        });
+        Ok(())
+    }
+
+    fn end_step_capture(&self) -> Result<StepCaptureId, ProviderExecutionError> {
+        let mut capture = self.capture.lock().unwrap();
+        let Some(mut recording) = capture.recording.take() else {
+            return Err(self.error(
+                ProviderExecutionPhase::Complete,
+                "no step capture is in progress",
+            ));
+        };
+        if let Some(open) = recording.open.take() {
+            match self.members[open].end_step_capture() {
+                Ok(id) => recording.ops.push(CapturedOp::Graph { member: open, id }),
+                Err(error) => {
+                    self.release_ops(&recording.ops);
+                    return Err(error);
+                }
+            }
+        }
+        let id = StepCaptureId::new(format!(
+            "{}:multi-capture:{}",
+            self.provider_name, capture.next
+        ));
+        capture.next += 1;
+        capture.captures.insert(id.clone(), recording.ops);
+        Ok(id)
+    }
+
+    fn abort_step_capture(&self) {
+        let mut capture = self.capture.lock().unwrap();
+        if let Some(recording) = capture.recording.take() {
+            if let Some(open) = recording.open {
+                self.members[open].abort_step_capture();
+            }
+            self.release_ops(&recording.ops);
+        }
+    }
+
+    /// Replays each member graph in order with the same `offset`, each
+    /// input going to the first graph of the member holding it, and
+    /// repeats each recorded crossing in place after its source's stream.
+    fn replay_step(
+        &self,
+        id: &StepCaptureId,
+        offset: u64,
+        inputs: Vec<(TensorResourceId, HostTensor)>,
+    ) -> Result<(), StepReplayError> {
+        let capture = self.capture.lock().unwrap();
+        let ops = capture
+            .captures
+            .get(id)
+            .ok_or_else(|| StepReplayError::Invalidated {
+                reason: format!("no step capture '{id}'"),
+            })?;
+        let mut pending: Vec<(Option<usize>, TensorResourceId, HostTensor)> = {
+            let residency = self.residency.lock().unwrap();
+            inputs
+                .into_iter()
+                .map(|(resource, tensor)| (residency.owner(&resource), resource, tensor))
+                .collect()
+        };
+        let failed = |detail: String| {
+            StepReplayError::Failed(self.error(ProviderExecutionPhase::Submit, detail))
+        };
+        for op in ops {
+            match op {
+                CapturedOp::Graph { member, id } => {
+                    let (mine, rest): (Vec<_>, Vec<_>) = pending
+                        .into_iter()
+                        .partition(|(owner, _, _)| owner.is_none_or(|owner| owner == *member));
+                    pending = rest;
+                    let mine = mine
+                        .into_iter()
+                        .map(|(_, resource, tensor)| (resource, tensor))
+                        .collect();
+                    self.members[*member].replay_step(id, offset, mine)?;
+                }
+                CapturedOp::Copy { id, from, to } => {
+                    self.members[*from]
+                        .synchronize()
+                        .map_err(|error| failed(error.to_string()))?;
+                    let copied = self.members[*to]
+                        .copy_from_peer_in_place(&self.members[*from], id)
+                        .map_err(|error| failed(error.to_string()))?;
+                    if !copied {
+                        return Err(StepReplayError::Invalidated {
+                            reason: format!(
+                                "'{id}' no longer has its captured storage on GPU {to}"
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        if let Some((_, resource, _)) = pending.first() {
+            return Err(StepReplayError::Invalidated {
+                reason: format!("input '{resource}' was not read by the captured step"),
+            });
+        }
+        Ok(())
+    }
+
+    fn release_step_capture(&self, id: &StepCaptureId) {
+        if let Some(ops) = self.capture.lock().unwrap().captures.remove(id) {
+            self.release_ops(&ops);
+        }
+    }
+
     fn select_greedy_column(
         &self,
         logits: &TensorResourceId,
@@ -631,6 +855,7 @@ impl CudaMultiProvider {
                     residency: Mutex::new(Residency::default()),
                     completed: Mutex::new(BTreeMap::new()),
                     next_execution: std::sync::atomic::AtomicU64::new(0),
+                    capture: Mutex::new(CaptureState::default()),
                 })
             }),
         }
