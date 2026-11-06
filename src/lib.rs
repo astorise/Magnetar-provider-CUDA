@@ -14,6 +14,7 @@ pub mod error;
 pub mod executor;
 mod half_precision;
 pub mod kernels;
+pub mod multi;
 pub mod peer;
 pub mod provider;
 

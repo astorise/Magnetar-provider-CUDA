@@ -62,7 +62,7 @@ pub fn cuda_provider_metadata() -> ProviderMetadata {
     cuda_provider_metadata_for(CUDA_PROVIDER_NAME)
 }
 
-fn cuda_provider_metadata_for(provider_name: &str) -> ProviderMetadata {
+pub(crate) fn cuda_provider_metadata_for(provider_name: &str) -> ProviderMetadata {
     ProviderMetadata::new(
         provider_name,
         CUDA_PROVIDER_VERSION,
@@ -216,6 +216,11 @@ impl CudaProvider {
     /// `providers/cpu`'s own `ReferenceCpuProvider::executor()`.
     pub fn executor(&self) -> Option<Arc<CudaExecutor>> {
         self.executor.clone()
+    }
+
+    /// This Provider's Device, when one was discovered.
+    pub fn device_descriptor(&self) -> Option<Arc<DeviceDescriptor>> {
+        self.device.clone()
     }
 
     /// Test-only: builds a `CudaProvider` with a real, discovered Device

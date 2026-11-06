@@ -605,6 +605,18 @@ impl CudaExecutor {
         Ok(allocation.id)
     }
 
+    /// Waits for every operation queued on this executor's stream: a peer
+    /// reading one of its buffers must not start before it is written.
+    pub fn synchronize(&self) -> Result<(), CudaError> {
+        self.kernels.stream().synchronize()?;
+        Ok(())
+    }
+
+    /// This executor's Device.
+    pub fn device_id(&self) -> &DeviceId {
+        &self.device_id
+    }
+
     /// Copies `peer_id`'s current device allocation from `peer`'s own
     /// storage directly into this executor's own storage under `id`, via
     /// a real cross-context CUDA device-to-device copy
