@@ -150,6 +150,11 @@ struct CaptureState {
     recording: Option<Recording>,
     captures: BTreeMap<StepCaptureId, Vec<CapturedOp>>,
     next: u64,
+    /// Stale copies left in place while a capture was open: freeing a
+    /// buffer while any stream on the thread captures fails (and cudarc
+    /// reports that failure at the member's next driver call), so they are
+    /// freed by the next uncaptured invocation.
+    deferred_releases: Vec<(TensorResourceId, usize)>,
 }
 
 /// The execution side of [`CudaMultiProvider`].
@@ -328,6 +333,28 @@ impl CudaMultiExecutor {
         Ok(true)
     }
 
+    /// Frees the stale copies a capture left in place, once none is open
+    /// (and only those still stale: a copy refreshed since stays).
+    fn release_deferred(&self, memory: &mut MemoryManager) {
+        let releases = {
+            let mut capture = self.capture.lock().unwrap();
+            if capture.recording.is_some() {
+                return;
+            }
+            std::mem::take(&mut capture.deferred_releases)
+        };
+        for (id, holder) in releases {
+            if self.residency.lock().unwrap().current_on(&id, holder) {
+                continue;
+            }
+            if let Some(copies) = self.residency.lock().unwrap().resources.get_mut(&id) {
+                copies.copies.remove(&holder);
+            }
+            let _ =
+                ProviderExecutionApi::release_admitted_tensor(&*self.members[holder], memory, &id);
+        }
+    }
+
     /// Releases every member capture `ops` holds.
     fn release_ops(&self, ops: &[CapturedOp]) {
         for op in ops {
@@ -346,6 +373,15 @@ impl CudaMultiExecutor {
         memory: Option<&mut MemoryManager>,
     ) {
         let stale = self.residency.lock().unwrap().produced(id, member);
+        {
+            let mut capture = self.capture.lock().unwrap();
+            if capture.recording.is_some() {
+                capture
+                    .deferred_releases
+                    .extend(stale.into_iter().map(|holder| (id.clone(), holder)));
+                return;
+            }
+        }
         match memory {
             Some(memory) => {
                 for holder in stale {
@@ -410,6 +446,7 @@ impl ProviderExecutionApi for CudaMultiExecutor {
         invocation: &KernelInvocation,
         memory: &mut MemoryManager,
     ) -> Result<ProviderExecutionHandle, ProviderExecutionError> {
+        self.release_deferred(memory);
         let member = self.execution_member(invocation);
         let missing = self.missing_inputs(invocation, member);
         if !self.prepare_captured_invocation(member, &missing, memory)? {
