@@ -22,7 +22,9 @@ use magnetar_runtime::kernel::{
     KernelAdvertisement, KernelCancellationSupport, KernelId, KernelImplementationFamily,
     KernelMemoryClass, KernelOperatorVersionRange,
 };
-use magnetar_runtime::operator::{OperatorFamily, OperatorId, TensorLayoutKind, TensorRole};
+use magnetar_runtime::operator::{
+    OperatorFamily, OperatorId, ROPE_LLAMA3_SCALING_FEATURE, TensorLayoutKind, TensorRole,
+};
 
 pub const CUDA_KERNEL_FAMILY: KernelImplementationFamily = KernelImplementationFamily::Cuda;
 pub const CUDA_CONFORMANCE_PROFILE: &str = "cuda-conformance-v1";
@@ -152,12 +154,19 @@ pub fn cuda_kernel_advertisements(
             device_id,
             provider_name,
         ),
-        baseline_advertisement(
-            "rope",
-            OperatorFamily::PositionEncoding,
-            device_id,
-            provider_name,
-        ),
+        {
+            // Honours the Llama 3 frequency-scaling attributes.
+            let mut rope = baseline_advertisement(
+                "rope",
+                OperatorFamily::PositionEncoding,
+                device_id,
+                provider_name,
+            );
+            rope.id
+                .features
+                .insert(ROPE_LLAMA3_SCALING_FEATURE.to_string());
+            rope
+        },
         {
             // Honours `key_count` (`append-kv-history-in-place`).
             let mut attention = baseline_advertisement(

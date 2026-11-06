@@ -1482,6 +1482,66 @@ fn rope_half_split_matches_reference_cpu() {
     }
 }
 
+/// Llama 3 per-frequency scaling matches the CPU Provider, across the
+/// kept, smoothed and divided frequency bands, interleaved and half-split.
+#[test]
+fn rope_llama3_frequency_scaling_matches_reference_cpu() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let scaling = magnetar_runtime::operator::RopeLlama3Scaling {
+        factor: 8.0,
+        low_freq_factor: 1.0,
+        high_freq_factor: 4.0,
+        original_context_length: 64,
+    };
+    // 2 rows, head_count = 2, head_width = 16: pairs span all three bands.
+    let data: Vec<f32> = (0..64).map(|i| i as f32 * 0.031 - 1.0).collect();
+    let input = HostTensor::new([2, 32], data).unwrap();
+    for (pairing, cuda_pairing) in [
+        (
+            magnetar_provider_cpu::RopePairing::HalfSplit,
+            crate::kernels::CudaRopePairing::HalfSplit,
+        ),
+        (
+            magnetar_provider_cpu::RopePairing::Interleaved,
+            crate::kernels::CudaRopePairing::Interleaved,
+        ),
+    ] {
+        let expected = magnetar_provider_cpu::rope_with_frequency_scaling(
+            &input,
+            500_000.0,
+            1.0,
+            16,
+            37,
+            2,
+            pairing,
+            Some(&scaling),
+        )
+        .unwrap();
+        let unscaled =
+            magnetar_provider_cpu::rope_with_pairing(&input, 500_000.0, 1.0, 16, 37, 2, pairing)
+                .unwrap();
+        assert_ne!(
+            expected.data, unscaled.data,
+            "the scaling changes the rotation"
+        );
+        let actual_dev = kernels
+            .rope_with_frequency_scaling(
+                &upload(&kernels, &input),
+                500_000.0,
+                1.0,
+                16,
+                37,
+                2,
+                cuda_pairing,
+                Some(&scaling),
+            )
+            .unwrap();
+        assert_close(&download(&kernels, &actual_dev), &expected);
+    }
+}
+
 /// Exactly bfloat16 values (`execute-native-half-precision`): f32 values
 /// whose low 16 bits are zero.
 fn bf16_exact_values(len: usize, seed: u32) -> Vec<f32> {

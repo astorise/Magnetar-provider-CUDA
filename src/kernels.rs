@@ -24,6 +24,7 @@ use cudarc::driver::{
 };
 use cudarc::nvrtc::compile_ptx;
 use magnetar_runtime::HostTensor;
+use magnetar_runtime::operator::RopeLlama3Scaling;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1406,7 +1407,48 @@ impl CudaKernels {
         head_count: u64,
         pairing: CudaRopePairing,
     ) -> Result<CudaDeviceBuffer, CudaError> {
+        self.rope_with_frequency_scaling(
+            input,
+            base,
+            scale,
+            dimension,
+            position_offset,
+            head_count,
+            pairing,
+            None,
+        )
+    }
+
+    /// [`Self::rope_with_pairing`] with optional Llama 3 per-frequency
+    /// scaling (`frequency_scaling = "llama3"`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_with_frequency_scaling(
+        &self,
+        input: &CudaDeviceBuffer,
+        base: f32,
+        scale: f32,
+        dimension: u64,
+        position_offset: u64,
+        head_count: u64,
+        pairing: CudaRopePairing,
+        frequency_scaling: Option<&RopeLlama3Scaling>,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
         Self::require_f32(&[input], "rope")?;
+        if let Some(scaling) = frequency_scaling {
+            scaling
+                .validate()
+                .map_err(|reason| CudaError::new(CudaErrorCode::ShapeUnsupported, reason))?;
+        }
+        // `0` disables the scaling in the Kernel.
+        let (llama3_factor, low_freq_factor, high_freq_factor, original_context_length) =
+            frequency_scaling.map_or((0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32), |scaling| {
+                (
+                    scaling.factor as f32,
+                    scaling.low_freq_factor as f32,
+                    scaling.high_freq_factor as f32,
+                    scaling.original_context_length as f32,
+                )
+            });
         let (rows, cols) = rows_cols_buf(input)?;
         if head_count == 0 || !cols.is_multiple_of(head_count) {
             return Err(CudaError::new(
@@ -1467,7 +1509,11 @@ impl CudaKernels {
             .arg(&position_offset)
             .arg(&head_count)
             .arg(&half_split)
-            .arg(&step_offset);
+            .arg(&step_offset)
+            .arg(&llama3_factor)
+            .arg(&low_freq_factor)
+            .arg(&high_freq_factor)
+            .arg(&original_context_length);
         unsafe { args.launch(LaunchConfig::for_num_elems(work_items)) }?;
         Ok(CudaDeviceBuffer {
             slice: out_dev,
