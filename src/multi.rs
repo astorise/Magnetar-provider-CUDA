@@ -138,8 +138,12 @@ enum CapturedOp {
         from: usize,
         to: usize,
     },
-    /// Tensor parallelism: every member's partial `id` summed, in place.
-    Reduce { id: TensorResourceId },
+    /// Tensor parallelism: `member`'s part of the next `Graph` op's graph,
+    /// which `member` joined while it was captured.
+    Joined {
+        member: usize,
+        step: crate::executor::JoinedStep,
+    },
 }
 
 /// The step capture in progress: the operations so far and the member
@@ -901,9 +905,10 @@ impl ProviderExecutionApi for CudaMultiExecutor {
                 self.members[open].abort_step_capture();
             }
             if recording.all_open {
-                for member in &self.members {
-                    member.abort_step_capture();
+                for member in &self.members[1..] {
+                    member.abandon_joined_capture(&self.members[0]);
                 }
+                self.members[0].abort_step_capture();
             }
             self.release_ops(&recording.ops);
         }
@@ -918,16 +923,22 @@ impl ProviderExecutionApi for CudaMultiExecutor {
         offset: u64,
         inputs: Vec<(TensorResourceId, HostTensor)>,
     ) -> Result<(), StepReplayError> {
-        let capture = self.capture.lock().unwrap();
+        let mut capture = self.capture.lock().unwrap();
+        if self.tensor_parallel_active() {
+            let ops = capture
+                .captures
+                .get_mut(id)
+                .ok_or_else(|| StepReplayError::Invalidated {
+                    reason: format!("no step capture '{id}'"),
+                })?;
+            return self.replay_tensor_parallel(ops, offset, inputs);
+        }
         let ops = capture
             .captures
             .get(id)
             .ok_or_else(|| StepReplayError::Invalidated {
                 reason: format!("no step capture '{id}'"),
             })?;
-        if self.tensor_parallel_active() {
-            return self.replay_tensor_parallel(ops, offset, inputs);
-        }
         let mut pending: Vec<(Option<usize>, TensorResourceId, HostTensor)> = {
             let residency = self.residency.lock().unwrap();
             inputs
@@ -966,7 +977,7 @@ impl ProviderExecutionApi for CudaMultiExecutor {
                         });
                     }
                 }
-                CapturedOp::Reduce { .. } => {
+                CapturedOp::Joined { .. } => {
                     return Err(StepReplayError::Invalidated {
                         reason: "a tensor-parallel capture outlived its plan".into(),
                     });

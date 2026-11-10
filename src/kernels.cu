@@ -34,6 +34,15 @@ extern "C" __global__ void add_kernel(const float* a, const float* b, float* out
     }
 }
 
+// a[i] += b[i]: a tensor-parallel reduction's in-place sum, which
+// allocates nothing and so can be captured.
+extern "C" __global__ void accumulate_kernel(float* a, const float* b, unsigned long long n) {
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        a[i] += b[i];
+    }
+}
+
 extern "C" __global__ void mul_kernel(const float* a, const float* b, float* out, unsigned long long n) {
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {

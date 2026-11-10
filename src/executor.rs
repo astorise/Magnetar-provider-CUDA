@@ -93,6 +93,9 @@ pub struct CudaExecutor {
     next_execution_ordinal: AtomicU64,
     /// Decode-step capture and replay (`capture-and-replay-cuda-graphs`).
     step_capture: Mutex<StepCaptureState>,
+    /// Each tensor-parallel reduction's copy of a peer's partial sum, kept
+    /// so that reducing allocates nothing after the first time.
+    reduce_scratch: Mutex<BTreeMap<TensorResourceId, CudaDeviceBuffer>>,
 }
 
 /// The device address and length (in floats) of a resource's buffer, as a
@@ -115,6 +118,13 @@ struct CaptureRecording {
     /// The token-id inputs of captured embedding lookups, with their table's
     /// vocabulary size: replayed ids are checked on the host.
     embedding_ids: BTreeMap<TensorResourceId, u64>,
+}
+
+/// A GPU's part of a step captured into another GPU's graph
+/// ([`CudaExecutor::join_step_capture`]).
+pub struct JoinedStep {
+    joined: crate::kernels::JoinedCapture,
+    recording: CaptureRecording,
 }
 
 /// One captured step: its graph, and the exact buffers it reads and writes.
@@ -140,6 +150,7 @@ impl CudaExecutor {
             resource_allocations: Mutex::new(BTreeMap::new()),
             next_execution_ordinal: AtomicU64::new(0),
             step_capture: Mutex::new(StepCaptureState::default()),
+            reduce_scratch: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -656,8 +667,10 @@ impl CudaExecutor {
 
     /// Adds `peer`'s `id` into this executor's `id`, in place (its device
     /// address unchanged): the reduction of a tensor-parallel partial sum.
-    /// Both must be plain f32 buffers of the same shape. The caller waits
-    /// for `peer`'s stream first; never called while capturing.
+    /// Both must be plain f32 buffers of the same shape. `peer`'s partial is
+    /// first copied into a scratch buffer kept per `id`, so after the first
+    /// time nothing allocates and the reduction can be captured. The copy
+    /// waits on `peer`'s stream.
     pub fn accumulate_from_peer(
         &self,
         peer: &CudaExecutor,
@@ -669,24 +682,164 @@ impl CudaExecutor {
                 format!("cannot reduce '{id}': the {side} GPU holds no plain f32 buffer for it"),
             )
         };
-        let partial = {
-            let peer_storage = peer.storage.lock().unwrap();
-            let source = peer_storage.get(id).ok_or_else(|| missing("peer"))?;
-            if source.is_compact() {
-                return Err(missing("peer"));
+        let peer_storage = peer.storage.lock().unwrap();
+        let source = peer_storage.get(id).ok_or_else(|| missing("peer"))?;
+        if source.is_compact() {
+            return Err(missing("peer"));
+        }
+        let mut scratch = self.reduce_scratch.lock().unwrap();
+        match scratch.get_mut(id) {
+            Some(partial) if partial.shape == source.shape => {
+                self.kernels
+                    .stream()
+                    .memcpy_dtod(&source.slice, &mut partial.slice)?;
             }
-            self.kernels.clone_buffer(source)?
-        };
+            _ => {
+                scratch.insert(id.clone(), self.kernels.clone_buffer(source)?);
+            }
+        }
+        drop(peer_storage);
+        let partial = &scratch[id];
         let mut storage = self.storage.lock().unwrap();
         let destination = storage.get_mut(id).ok_or_else(|| missing("reducing"))?;
-        if destination.is_compact() || destination.shape != partial.shape {
+        if destination.is_compact() {
             return Err(missing("reducing"));
         }
-        let sum = self.kernels.add(destination, &partial)?;
+        self.kernels.accumulate(destination, partial)
+    }
+
+    /// Joins `host`'s step capture, in progress, until
+    /// [`Self::leave_step_capture`]: this GPU's work then belongs to
+    /// `host`'s graph (a tensor-parallel step captured as one graph).
+    pub fn join_step_capture(
+        &self,
+        host: &CudaExecutor,
+        request: &StepCaptureRequest,
+    ) -> Result<(), ProviderExecutionError> {
+        let mut state = self.step_capture.lock().unwrap();
+        if state.recording.is_some() {
+            return Err(self.step_capture_error(
+                ProviderExecutionPhase::Submit,
+                "a step capture is already in progress".into(),
+            ));
+        }
         self.kernels
-            .stream()
-            .memcpy_dtod(&sum.slice, &mut destination.slice)?;
+            .join_capture(
+                &host.kernels,
+                request.advancing_attributes.iter().cloned().collect(),
+            )
+            .map_err(|error| {
+                self.step_capture_error(ProviderExecutionPhase::Submit, error.to_string())
+            })?;
+        state.recording = Some(CaptureRecording::default());
         Ok(())
+    }
+
+    /// Leaves `host`'s step capture; what replaying this GPU's part needs.
+    pub fn leave_step_capture(
+        &self,
+        host: &CudaExecutor,
+    ) -> Result<JoinedStep, ProviderExecutionError> {
+        let recording = self.step_capture.lock().unwrap().recording.take();
+        let left = self.kernels.leave_capture(&host.kernels);
+        let (Some(recording), Ok(joined)) = (recording, left) else {
+            return Err(self.step_capture_error(
+                ProviderExecutionPhase::Complete,
+                "this GPU's part of the step capture cannot be replayed".into(),
+            ));
+        };
+        Ok(JoinedStep { joined, recording })
+    }
+
+    /// Abandons a joined step capture, rejoining `host`'s stream so that
+    /// `host` can end its capture.
+    pub fn abandon_joined_capture(&self, host: &CudaExecutor) {
+        self.step_capture.lock().unwrap().recording = None;
+        let _ = self.kernels.leave_capture(&host.kernels);
+    }
+
+    /// Readies this GPU's part of a replay of `host`'s graph: checks the
+    /// captured buffers are still in place, writes `inputs` and the replay
+    /// `offset`, and makes `host`'s stream wait for those writes.
+    pub fn prepare_joined_replay(
+        &self,
+        step: &mut JoinedStep,
+        offset: u64,
+        inputs: Vec<(TensorResourceId, HostTensor)>,
+        host: &CudaExecutor,
+    ) -> Result<(), StepReplayError> {
+        let invalidated = |reason: String| StepReplayError::Invalidated { reason };
+        // The previous launch of `host`'s graph may still read this GPU's
+        // inputs and offset: overwrite them only after it.
+        self.kernels.follow(&host.kernels).map_err(|error| {
+            StepReplayError::Failed(
+                self.step_capture_error(ProviderExecutionPhase::Submit, error.to_string()),
+            )
+        })?;
+        if offset > step.joined.max_offset {
+            return Err(invalidated(format!(
+                "offset {offset} leaves the captured bounds (at most {})",
+                step.joined.max_offset
+            )));
+        }
+        let mut storage = self.storage.lock().unwrap();
+        for (resource, (address, len)) in &step.recording.resources {
+            let current = storage
+                .get(resource)
+                .map(|buffer| (self.kernels.address(buffer), buffer.len()));
+            if current != Some((*address, *len)) {
+                return Err(invalidated(format!(
+                    "resource '{resource}' no longer has its captured storage"
+                )));
+            }
+        }
+        let failed = |error: CudaError| {
+            StepReplayError::Failed(
+                self.step_capture_error(ProviderExecutionPhase::Submit, error.to_string()),
+            )
+        };
+        for (resource, tensor) in inputs {
+            if !step.recording.resources.contains_key(&resource) {
+                continue;
+            }
+            if let Some(&vocab) = step.recording.embedding_ids.get(&resource)
+                && tensor.data.iter().any(|&value| {
+                    !(value >= 0.0 && value == value.floor() && (value as u64) < vocab)
+                })
+            {
+                return Err(StepReplayError::Failed(self.step_capture_error(
+                    ProviderExecutionPhase::Submit,
+                    "embedding lookup id is not a valid in-range non-negative integer".into(),
+                )));
+            }
+            let buffer = storage
+                .get_mut(&resource)
+                .expect("every captured resource was checked above");
+            self.kernels
+                .write_into(buffer, &tensor.data)
+                .map_err(failed)?;
+        }
+        drop(storage);
+        self.kernels
+            .write_joined_offset(&mut step.joined, offset, &host.kernels)
+            .map_err(failed)
+    }
+
+    /// After `host` ran a graph this GPU joined for the first time, checks
+    /// its embedding lookups' invalid-id flag.
+    pub fn check_joined_embedding(
+        &self,
+        step: &JoinedStep,
+        host: &CudaExecutor,
+    ) -> Result<(), ProviderExecutionError> {
+        if !step.joined.has_embedding {
+            return Ok(());
+        }
+        let failed = |error: CudaError| {
+            self.step_capture_error(ProviderExecutionPhase::Complete, error.to_string())
+        };
+        self.kernels.follow(&host.kernels).map_err(failed)?;
+        self.kernels.check_embedding_flag().map_err(failed)
     }
 
     /// Makes this executor's stream wait, on the device, for everything

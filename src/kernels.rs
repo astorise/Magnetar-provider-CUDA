@@ -423,6 +423,18 @@ struct KernelCapture {
     has_embedding: bool,
 }
 
+/// What a GPU that joined another GPU's step capture
+/// ([`CudaKernels::join_capture`]) needs to replay its part: the captured
+/// launches live in the other GPU's graph, but read this GPU's own replay
+/// offset.
+pub struct JoinedCapture {
+    offset: CudaSlice<u64>,
+    /// See [`CapturedStep::max_offset`].
+    pub max_offset: u64,
+    /// See [`CapturedStep::has_embedding`].
+    pub has_embedding: bool,
+}
+
 /// A captured step's CUDA graph and what replaying it needs.
 pub struct CapturedStep {
     graph: CapturedGraph,
@@ -584,6 +596,108 @@ impl CudaKernels {
             failure: None,
             has_embedding: false,
         });
+        Ok(())
+    }
+
+    /// Joins `host`'s step capture, in progress: this stream waits on
+    /// `host`'s, which makes every later launch on it part of `host`'s
+    /// graph, until [`Self::leave_capture`]. One graph then holds every
+    /// GPU's work of a tensor-parallel step and the reductions between
+    /// them. Needs [`Self::prepare_capture`] first: nothing may allocate
+    /// while capturing.
+    pub fn join_capture(
+        &self,
+        host: &CudaKernels,
+        advancing: BTreeSet<String>,
+    ) -> Result<(), CudaError> {
+        let mut capture = self.capture.lock().unwrap();
+        let prepared = self.prepared_offset.lock().unwrap().take();
+        let (Some(offset), true) = (prepared, capture.is_none()) else {
+            return Err(CudaError::new(
+                CudaErrorCode::CaptureUnsupported,
+                "joining a step capture needs a prepared, idle stream",
+            ));
+        };
+        self.stream.wait(&host.stream.record_event(None)?)?;
+        let mut flag_slot = self.embedding_flag.lock().unwrap();
+        if let Some(flag) = flag_slot.as_mut() {
+            self.stream.memset_zeros(flag)?;
+        }
+        drop(flag_slot);
+        *capture = Some(KernelCapture {
+            advancing,
+            offset,
+            max_offset: u64::MAX,
+            failure: None,
+            has_embedding: false,
+        });
+        Ok(())
+    }
+
+    /// Leaves `host`'s step capture: `host`'s stream waits on this one, so
+    /// `host`'s graph ends after this GPU's captured work. Fails when
+    /// anything the capture cannot replay happened here.
+    pub fn leave_capture(&self, host: &CudaKernels) -> Result<JoinedCapture, CudaError> {
+        let capture = self.capture.lock().unwrap().take().ok_or_else(|| {
+            CudaError::new(
+                CudaErrorCode::CaptureUnsupported,
+                "no joined step capture is in progress",
+            )
+        })?;
+        let deferred = self.take_deferred_error();
+        host.stream.wait(&self.stream.record_event(None)?)?;
+        if let Some(failure) = capture.failure {
+            return Err(CudaError::new(CudaErrorCode::CaptureUnsupported, failure));
+        }
+        if let Err(error) = deferred {
+            let failure = format!("the step capture met a driver error: {error:?}");
+            return Err(CudaError::new(CudaErrorCode::CaptureUnsupported, failure));
+        }
+        Ok(JoinedCapture {
+            offset: capture.offset,
+            max_offset: capture.max_offset,
+            has_embedding: capture.has_embedding,
+        })
+    }
+
+    /// Writes a joined capture's replay offset, before `host` launches the
+    /// graph: `host`'s stream then waits on this one.
+    pub fn write_joined_offset(
+        &self,
+        joined: &mut JoinedCapture,
+        offset: u64,
+        host: &CudaKernels,
+    ) -> Result<(), CudaError> {
+        self.stream.memcpy_htod(&[offset], &mut joined.offset)?;
+        host.stream.join(&self.stream)?;
+        Ok(())
+    }
+
+    /// Makes this stream wait for everything queued on `host`'s so far.
+    pub fn follow(&self, host: &CudaKernels) -> Result<(), CudaError> {
+        self.stream.join(&host.stream)?;
+        Ok(())
+    }
+
+    /// `a += b`, element-wise, in place: plain f32 buffers of the same
+    /// shape. Allocates nothing, so it can be captured.
+    pub fn accumulate(
+        &self,
+        a: &mut CudaDeviceBuffer,
+        b: &CudaDeviceBuffer,
+    ) -> Result<(), CudaError> {
+        Self::require_f32(&[a, b], "accumulate")?;
+        if a.shape != b.shape {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!("accumulate: shape mismatch {:?} vs {:?}", a.shape, b.shape),
+            ));
+        }
+        let n = a.slice.len() as u64;
+        let func = self.function("accumulate_kernel")?;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(&mut a.slice).arg(&b.slice).arg(&n);
+        unsafe { args.launch(LaunchConfig::for_num_elems(n as u32)) }?;
         Ok(())
     }
 

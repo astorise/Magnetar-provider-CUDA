@@ -469,16 +469,10 @@ impl CudaMultiExecutor {
         }
         if result.status == KernelResultStatus::Succeeded {
             if role == OutputRole::Partial {
-                // A captured step ends each member's graph here and records
-                // the reduction between them.
-                self.close_open_member_captures()?;
+                // Captured too, while a step is: the reduction becomes part
+                // of the step's one graph.
                 for output in &invocation.outputs {
                     self.all_reduce(&output.resource.id)?;
-                    if let Some(recording) = self.capture.lock().unwrap().recording.as_mut() {
-                        recording.ops.push(CapturedOp::Reduce {
-                            id: output.resource.id.clone(),
-                        });
-                    }
                 }
             }
             let mut tp = self.tensor_parallel.lock().unwrap();
@@ -520,11 +514,19 @@ impl CudaMultiExecutor {
         for member in &self.members {
             member.prepare_step_capture()?;
         }
-        for (index, member) in self.members.iter().enumerate() {
-            if let Err(error) = member.begin_step_capture(&recording.request) {
-                for opened in &self.members[..index] {
-                    opened.abort_step_capture();
+        // The first member captures; the others join its capture, so the
+        // whole step, reductions included, becomes one graph.
+        let (host, others) = self
+            .members
+            .split_first()
+            .expect("a Provider has at least one member");
+        host.begin_step_capture(&recording.request)?;
+        for (index, member) in others.iter().enumerate() {
+            if let Err(error) = member.join_step_capture(host, &recording.request) {
+                for joined in &others[..index] {
+                    joined.abandon_joined_capture(host);
                 }
+                host.abort_step_capture();
                 return Err(error);
             }
         }
@@ -532,16 +534,8 @@ impl CudaMultiExecutor {
         Ok(())
     }
 
-    fn close_open_member_captures(&self) -> Result<(), ProviderExecutionError> {
-        let mut capture = self.capture.lock().unwrap();
-        match capture.recording.as_mut() {
-            Some(recording) => self.close_member_captures(recording),
-            None => Ok(()),
-        }
-    }
-
-    /// Ends every member's open capture, in member order, recording each
-    /// graph (each runs once as it ends).
+    /// Ends the step's one graph: every joined member leaves the first
+    /// member's capture, which then ends (its graph runs once as it ends).
     pub(super) fn close_member_captures(
         &self,
         recording: &mut Recording,
@@ -549,39 +543,64 @@ impl CudaMultiExecutor {
         if !std::mem::take(&mut recording.all_open) {
             return Ok(());
         }
+        let (host, others) = self
+            .members
+            .split_first()
+            .expect("a Provider has at least one member");
+        let mut joined = Vec::new();
         let mut first_error = None;
-        for (member, executor) in self.members.iter().enumerate() {
+        for (index, member) in others.iter().enumerate() {
             if first_error.is_some() {
-                executor.abort_step_capture();
+                member.abandon_joined_capture(host);
                 continue;
             }
-            match executor.end_step_capture() {
-                Ok(id) => recording.ops.push(CapturedOp::Graph { member, id }),
+            match member.leave_step_capture(host) {
+                Ok(step) => joined.push((index + 1, step)),
                 Err(error) => first_error = Some(error),
             }
         }
-        first_error.map_or(Ok(()), Err)
+        if let Some(error) = first_error {
+            host.abort_step_capture();
+            return Err(error);
+        }
+        let id = host.end_step_capture()?;
+        self.follow_host_graph()?;
+        for (member, step) in &joined {
+            self.members[*member].check_joined_embedding(step, host)?;
+        }
+        recording.ops.extend(
+            joined
+                .into_iter()
+                .map(|(member, step)| CapturedOp::Joined { member, step }),
+        );
+        recording.ops.push(CapturedOp::Graph { member: 0, id });
+        Ok(())
     }
 
-    /// Replays a tensor-parallel capture: each member's graphs and the
-    /// reductions between them, in order. Every input is replicated, so
-    /// each member's first graph receives all of them.
+    /// Replays a tensor-parallel capture: every joined member writes its
+    /// inputs and replay offset, then the first member launches the one
+    /// graph. Every input is replicated, so each member receives all of
+    /// them.
     pub(super) fn replay_tensor_parallel(
         &self,
-        ops: &[CapturedOp],
+        ops: &mut [CapturedOp],
         offset: u64,
         inputs: Vec<(TensorResourceId, HostTensor)>,
     ) -> Result<(), StepReplayError> {
-        let mut pending: Vec<Option<Vec<(TensorResourceId, HostTensor)>>> =
-            vec![Some(inputs); self.members.len()];
+        let host = &self.members[0];
         for op in ops {
             match op {
-                CapturedOp::Graph { member, id } => {
-                    let mine = pending[*member].take().unwrap_or_default();
-                    self.members[*member].replay_step(id, offset, mine)?;
+                CapturedOp::Joined { member, step } => {
+                    self.members[*member].prepare_joined_replay(
+                        step,
+                        offset,
+                        inputs.clone(),
+                        host,
+                    )?;
                 }
-                CapturedOp::Reduce { id } => {
-                    self.all_reduce(id).map_err(StepReplayError::Failed)?;
+                CapturedOp::Graph { member, id } => {
+                    self.members[*member].replay_step(id, offset, inputs.clone())?;
+                    self.follow_host_graph().map_err(StepReplayError::Failed)?;
                 }
                 CapturedOp::Copy { .. } => {
                     return Err(StepReplayError::Invalidated {
@@ -589,6 +608,24 @@ impl CudaMultiExecutor {
                     });
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Orders every other member's later work after the first member's
+    /// graph, which ran their captured work on their devices.
+    fn follow_host_graph(&self) -> Result<(), ProviderExecutionError> {
+        let (host, others) = self
+            .members
+            .split_first()
+            .expect("a Provider has at least one member");
+        for member in others {
+            member.wait_for_peer(host).map_err(|error| {
+                self.error(
+                    ProviderExecutionPhase::Submit,
+                    format!("ordering after the step graph: {error}"),
+                )
+            })?;
         }
         Ok(())
     }
