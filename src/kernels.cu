@@ -147,6 +147,28 @@ extern "C" __global__ void q8_dequantize_kernel(
     }
 }
 
+// The dot product of 16 consecutive quants (`q`, one 16-byte load: half a
+// `Q8_0` block, so one scale applies) with 16 consecutive floats of `x`
+// (16-byte aligned), summed in f32 in index order. Every decode-step
+// `Q8_0` Kernel reads its weights through it: 16 bytes per lane per step
+// keeps four times more weight bytes in flight than 4-byte loads, which
+// left the RTX 3060 at about half its bandwidth.
+__device__ __forceinline__ float q8_dot16(int4 q, const float* x) {
+    const signed char* b = reinterpret_cast<const signed char*>(&q);
+    float s = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 16; j += 4) {
+        float4 v = *reinterpret_cast<const float4*>(x + j);
+        s += v.x * (float)b[j] + v.y * (float)b[j + 1] + v.z * (float)b[j + 2]
+            + v.w * (float)b[j + 3];
+    }
+    return s;
+}
+
+// Quants per lane per step of the decode-step `Q8_0` Kernels, and per warp.
+#define Q8_LANE_QUANTS 16
+#define Q8_WARP_QUANTS 512
+
 // Rows of `a` one block of `q8_matmul_rows_kernel` serves.
 #define Q8_MATMUL_ROWS 8
 // Output columns (one warp each) per block of `q8_matmul_rows_kernel`.
@@ -155,7 +177,7 @@ extern "C" __global__ void q8_dequantize_kernel(
 // out[r, c] = sum_k a[r, k] * W[k, c] (+ addend) for a contiguous `a` of
 // `k` columns and a packed weight W stored transposed: stored row c holds
 // column c's `k` quants. One warp per output column reads that row once,
-// four consecutive quants per lane per step (contiguous across the warp),
+// sixteen consecutive quants per lane per step (contiguous across the warp),
 // for up to Q8_MATMUL_ROWS rows of `a`; each lane's four products are
 // summed in f32 and scaled by their block's scale. The decode-step matmul:
 // the weight is read packed, at about half the bytes of bfloat16.
@@ -184,16 +206,15 @@ extern "C" __global__ void q8_matmul_rows_kernel(
     for (int r = 0; r < Q8_MATMUL_ROWS; r++) {
         acc[r] = 0.0f;
     }
-    // Each step covers 128 quants: four blocks, eight lanes per block.
-    for (unsigned long long i = (unsigned long long)lane * 4; i < k; i += 128) {
-        char4 q = *reinterpret_cast<const char4*>(w + i);
+    // Each step covers 512 quants: sixteen blocks, two lanes per block.
+    for (unsigned long long i = (unsigned long long)lane * Q8_LANE_QUANTS; i < k;
+         i += Q8_WARP_QUANTS) {
+        int4 q = *reinterpret_cast<const int4*>(w + i);
         float d = w_scales[i >> 5];
 #pragma unroll
         for (int r = 0; r < Q8_MATMUL_ROWS; r++) {
             if (r < (int)rows) {
-                float4 x = *reinterpret_cast<const float4*>(a + (first_row + r) * k + i);
-                acc[r] += d * (x.x * (float)q.x + x.y * (float)q.y + x.z * (float)q.z
-                    + x.w * (float)q.w);
+                acc[r] += d * q8_dot16(q, a + (first_row + r) * k + i);
             }
         }
     }
@@ -250,19 +271,18 @@ extern "C" __global__ void q8_gated_matmul_rows_kernel(
         gate_acc[r] = 0.0f;
         up_acc[r] = 0.0f;
     }
-    for (unsigned long long i = (unsigned long long)lane * 4; i < k; i += 128) {
-        char4 qg = *reinterpret_cast<const char4*>(wg + i);
-        char4 qu = *reinterpret_cast<const char4*>(wu + i);
+    for (unsigned long long i = (unsigned long long)lane * Q8_LANE_QUANTS; i < k;
+         i += Q8_WARP_QUANTS) {
+        int4 qg = *reinterpret_cast<const int4*>(wg + i);
+        int4 qu = *reinterpret_cast<const int4*>(wu + i);
         float dg = g_scales[i >> 5];
         float du = u_scales[i >> 5];
 #pragma unroll
         for (int r = 0; r < Q8_MATMUL_ROWS; r++) {
             if (r < (int)rows) {
-                float4 x = *reinterpret_cast<const float4*>(a + (first_row + r) * k + i);
-                gate_acc[r] += dg * (x.x * (float)qg.x + x.y * (float)qg.y + x.z * (float)qg.z
-                    + x.w * (float)qg.w);
-                up_acc[r] += du * (x.x * (float)qu.x + x.y * (float)qu.y + x.z * (float)qu.z
-                    + x.w * (float)qu.w);
+                const float* x = a + (first_row + r) * k + i;
+                gate_acc[r] += dg * q8_dot16(qg, x);
+                up_acc[r] += du * q8_dot16(qu, x);
             }
         }
     }
@@ -382,12 +402,12 @@ extern "C" __global__ void moe_q8_gated_kernel(
     const float* x = h + t * hidden;
     float g = 0.0f;
     float u = 0.0f;
-    for (unsigned long long i = (unsigned long long)threadIdx.x * 4; i < hidden; i += 128) {
-        char4 qg = *reinterpret_cast<const char4*>(wg + i);
-        char4 qu = *reinterpret_cast<const char4*>(wu + i);
-        float4 v = *reinterpret_cast<const float4*>(x + i);
-        g += sg[i >> 5] * (v.x * (float)qg.x + v.y * (float)qg.y + v.z * (float)qg.z + v.w * (float)qg.w);
-        u += su[i >> 5] * (v.x * (float)qu.x + v.y * (float)qu.y + v.z * (float)qu.z + v.w * (float)qu.w);
+    for (unsigned long long i = (unsigned long long)threadIdx.x * Q8_LANE_QUANTS; i < hidden;
+         i += Q8_WARP_QUANTS) {
+        int4 qg = *reinterpret_cast<const int4*>(wg + i);
+        int4 qu = *reinterpret_cast<const int4*>(wu + i);
+        g += sg[i >> 5] * q8_dot16(qg, x + i);
+        u += su[i >> 5] * q8_dot16(qu, x + i);
     }
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -430,10 +450,10 @@ extern "C" __global__ void moe_q8_down_kernel(
         const float* scales = down_scales + row * (inter >> 5);
         const float* a = act + tk * inter;
         float sum = 0.0f;
-        for (unsigned long long i = (unsigned long long)threadIdx.x * 4; i < inter; i += 128) {
-            char4 q = *reinterpret_cast<const char4*>(w + i);
-            float4 v = *reinterpret_cast<const float4*>(a + i);
-            sum += scales[i >> 5] * (v.x * (float)q.x + v.y * (float)q.y + v.z * (float)q.z + v.w * (float)q.w);
+        for (unsigned long long i = (unsigned long long)threadIdx.x * Q8_LANE_QUANTS; i < inter;
+             i += Q8_WARP_QUANTS) {
+            int4 q = *reinterpret_cast<const int4*>(w + i);
+            sum += scales[i >> 5] * q8_dot16(q, a + i);
         }
 #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
