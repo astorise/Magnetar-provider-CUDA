@@ -52,7 +52,7 @@ use magnetar_runtime::scheduler::{
 };
 use magnetar_runtime::{ExecutionPlanId, HostTensor};
 
-use crate::error::CudaError;
+use crate::error::{CudaError, CudaErrorCode};
 use crate::kernels::{CapturedStep, CudaDeviceBuffer, CudaHalfDType, CudaKernels, CudaRopePairing};
 
 /// Reads which half-precision format an `add-half`/`mul-half` invocation
@@ -637,6 +637,41 @@ impl CudaExecutor {
             .stream()
             .memcpy_dtod(&source.slice, &mut destination.slice)?;
         Ok(true)
+    }
+
+    /// Adds `peer`'s `id` into this executor's `id`, in place (its device
+    /// address unchanged): the reduction of a tensor-parallel partial sum.
+    /// Both must be plain f32 buffers of the same shape. The caller waits
+    /// for `peer`'s stream first; never called while capturing.
+    pub fn accumulate_from_peer(
+        &self,
+        peer: &CudaExecutor,
+        id: &TensorResourceId,
+    ) -> Result<(), CudaError> {
+        let missing = |side: &str| {
+            CudaError::new(
+                CudaErrorCode::ExecutionFailed,
+                format!("cannot reduce '{id}': the {side} GPU holds no plain f32 buffer for it"),
+            )
+        };
+        let partial = {
+            let peer_storage = peer.storage.lock().unwrap();
+            let source = peer_storage.get(id).ok_or_else(|| missing("peer"))?;
+            if source.is_compact() {
+                return Err(missing("peer"));
+            }
+            self.kernels.clone_buffer(source)?
+        };
+        let mut storage = self.storage.lock().unwrap();
+        let destination = storage.get_mut(id).ok_or_else(|| missing("reducing"))?;
+        if destination.is_compact() || destination.shape != partial.shape {
+            return Err(missing("reducing"));
+        }
+        let sum = self.kernels.add(destination, &partial)?;
+        self.kernels
+            .stream()
+            .memcpy_dtod(&sum.slice, &mut destination.slice)?;
+        Ok(())
     }
 
     /// This executor's stream capture status, for diagnostics.

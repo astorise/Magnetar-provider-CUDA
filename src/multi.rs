@@ -50,10 +50,13 @@ use magnetar_runtime::scheduler::{
     ProviderExecutionHandle, ProviderExecutionId, ProviderExecutionPhase, ProviderExecutionRequest,
     ProviderExecutionResult, ProviderExecutionStatus,
 };
+use magnetar_runtime::tensor_parallel::TensorParallelPlan;
 
 use crate::advertisements::cuda_kernel_advertisements;
 use crate::executor::CudaExecutor;
 use crate::provider::CudaProvider;
+
+mod tensor_parallel;
 
 /// Where each resource lives across the members.
 #[derive(Default)]
@@ -166,6 +169,8 @@ pub struct CudaMultiExecutor {
     completed: Mutex<BTreeMap<ProviderExecutionId, KernelResult>>,
     next_execution: std::sync::atomic::AtomicU64,
     capture: Mutex<CaptureState>,
+    /// The tensor-parallel plan in force, if any (`tensor_parallel`).
+    tensor_parallel: Mutex<Option<tensor_parallel::TensorParallel>>,
 }
 
 impl CudaMultiExecutor {
@@ -401,6 +406,11 @@ impl CudaMultiExecutor {
     }
 
     fn owner_member(&self, id: &TensorResourceId) -> Option<&Arc<CudaExecutor>> {
+        // Under tensor parallelism every member holds every resource (or
+        // its share); the first one answers.
+        if self.tensor_parallel_active() {
+            return self.members.first();
+        }
         let owner = self.residency.lock().unwrap().owner(id)?;
         Some(&self.members[owner])
     }
@@ -446,6 +456,9 @@ impl ProviderExecutionApi for CudaMultiExecutor {
         invocation: &KernelInvocation,
         memory: &mut MemoryManager,
     ) -> Result<ProviderExecutionHandle, ProviderExecutionError> {
+        if self.tensor_parallel_active() {
+            return self.submit_kernel_tensor_parallel(advertisement, operator, invocation, memory);
+        }
         self.release_deferred(memory);
         let member = self.execution_member(invocation);
         let missing = self.missing_inputs(invocation, member);
@@ -514,11 +527,35 @@ impl ProviderExecutionApi for CudaMultiExecutor {
         Ok(())
     }
 
+    /// Takes the plan only before any weight is written, and never
+    /// alongside a layer placement.
+    fn apply_tensor_parallel(
+        &self,
+        plan: &TensorParallelPlan,
+    ) -> Result<(), ProviderExecutionError> {
+        if !plan.splits() {
+            return Ok(());
+        }
+        if self.placement.lock().unwrap().is_some() {
+            return Err(self.error(
+                ProviderExecutionPhase::Submit,
+                "a layer placement is already in force",
+            ));
+        }
+        self.take_tensor_parallel_plan(plan)
+    }
+
     fn write_tensor(
         &self,
         id: TensorResourceId,
         tensor: HostTensor,
     ) -> Result<(), ProviderExecutionError> {
+        if self.tensor_parallel_active() {
+            for member in &self.members {
+                ProviderExecutionApi::write_tensor(&**member, id.clone(), tensor.clone())?;
+            }
+            return Ok(());
+        }
         let member = self.write_member(&id);
         ProviderExecutionApi::write_tensor(&*self.members[member], id.clone(), tensor)?;
         self.record_produced(&id, member, None);
@@ -530,6 +567,9 @@ impl ProviderExecutionApi for CudaMultiExecutor {
         id: TensorResourceId,
         tensor: HostTensor,
     ) -> Result<(), ProviderExecutionError> {
+        if self.tensor_parallel_active() {
+            return self.write_weight_tensor_parallel(id, tensor);
+        }
         let member = self.weight_member(&id);
         ProviderExecutionApi::write_weight_tensor(&*self.members[member], id.clone(), tensor)?;
         self.residency.lock().unwrap().weights.insert(id, member);
@@ -541,6 +581,9 @@ impl ProviderExecutionApi for CudaMultiExecutor {
         id: TensorResourceId,
         weight: PackedWeight,
     ) -> Result<PackedWeightWrite, ProviderExecutionError> {
+        if self.tensor_parallel_active() {
+            return self.write_packed_weight_tensor_parallel(id, weight);
+        }
         let member = self.weight_member(&id);
         let written = ProviderExecutionApi::write_packed_weight_tensor(
             &*self.members[member],
@@ -567,6 +610,16 @@ impl ProviderExecutionApi for CudaMultiExecutor {
     }
 
     fn release_tensor(&self, id: &TensorResourceId) -> Result<bool, ProviderExecutionError> {
+        if let Some(tp) = self.tensor_parallel.lock().unwrap().as_mut() {
+            tp.forget(id);
+        }
+        if self.tensor_parallel_active() {
+            let mut released = false;
+            for member in &self.members {
+                released |= ProviderExecutionApi::release_tensor(&**member, id)?;
+            }
+            return Ok(released);
+        }
         let holders = {
             let mut residency = self.residency.lock().unwrap();
             let holders = residency.holders(id);
@@ -586,6 +639,16 @@ impl ProviderExecutionApi for CudaMultiExecutor {
         memory: &mut MemoryManager,
         id: &TensorResourceId,
     ) -> Result<bool, ProviderExecutionError> {
+        if let Some(tp) = self.tensor_parallel.lock().unwrap().as_mut() {
+            tp.forget(id);
+        }
+        if self.tensor_parallel_active() {
+            let mut released = false;
+            for member in &self.members {
+                released |= ProviderExecutionApi::release_admitted_tensor(&**member, memory, id)?;
+            }
+            return Ok(released);
+        }
         let holders = {
             let mut residency = self.residency.lock().unwrap();
             let holders = residency.holders(id);
@@ -609,6 +672,18 @@ impl ProviderExecutionApi for CudaMultiExecutor {
         class: MemoryAllocationClass,
         owner: MemoryAllocationOwner,
     ) -> Result<(), MemoryError> {
+        if self.tensor_parallel_active() {
+            for member in &self.members {
+                member.write_tensor_admitted(
+                    memory,
+                    resource_id.clone(),
+                    tensor.clone(),
+                    class,
+                    owner.clone(),
+                )?;
+            }
+            return Ok(());
+        }
         let member = self.write_member(&resource_id);
         self.members[member].write_tensor_admitted(
             memory,
@@ -626,6 +701,15 @@ impl ProviderExecutionApi for CudaMultiExecutor {
     }
 
     fn resident_shape(&self, id: &TensorResourceId) -> Option<Vec<u64>> {
+        if let Some(shape) = self
+            .tensor_parallel
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|tp| tp.logical_shape(id))
+        {
+            return Some(shape);
+        }
         self.owner_member(id)?.resident_shape(id)
     }
 
@@ -634,6 +718,12 @@ impl ProviderExecutionApi for CudaMultiExecutor {
         id: TensorResourceId,
         value: TensorValue,
     ) -> Result<(), ProviderExecutionError> {
+        if self.tensor_parallel_active() {
+            for member in &self.members {
+                ProviderExecutionApi::write_tensor_value(&**member, id.clone(), value.clone())?;
+            }
+            return Ok(());
+        }
         let member = self.write_member(&id);
         ProviderExecutionApi::write_tensor_value(&*self.members[member], id.clone(), value)?;
         self.record_produced(&id, member, None);
@@ -645,6 +735,13 @@ impl ProviderExecutionApi for CudaMultiExecutor {
         id: &TensorResourceId,
         shape: &[u64],
     ) -> Result<bool, ProviderExecutionError> {
+        if self.tensor_parallel_active() {
+            let mut written = true;
+            for member in &self.members {
+                written &= ProviderExecutionApi::write_zeroed_tensor(&**member, id, shape)?;
+            }
+            return Ok(written);
+        }
         let member = self.write_member(id);
         let written = ProviderExecutionApi::write_zeroed_tensor(&*self.members[member], id, shape)?;
         if written {
@@ -661,6 +758,18 @@ impl ProviderExecutionApi for CudaMultiExecutor {
         class: MemoryAllocationClass,
         owner: MemoryAllocationOwner,
     ) -> Result<(), TensorValueAdmissionError> {
+        if self.tensor_parallel_active() {
+            for member in &self.members {
+                member.write_tensor_value_admitted(
+                    memory,
+                    resource_id.clone(),
+                    value.clone(),
+                    class,
+                    owner.clone(),
+                )?;
+            }
+            return Ok(());
+        }
         let member = self.write_member(&resource_id);
         self.members[member].write_tensor_value_admitted(
             memory,
@@ -681,6 +790,18 @@ impl ProviderExecutionApi for CudaMultiExecutor {
         class: MemoryAllocationClass,
         owner: MemoryAllocationOwner,
     ) -> Result<MemoryAllocationId, TensorValueAdmissionError> {
+        if self.tensor_parallel_active() {
+            let mut first = None;
+            for member in &self.members {
+                let allocation =
+                    member.copy_tensor_admitted(memory, from, to.clone(), class, owner.clone())?;
+                first.get_or_insert(allocation);
+            }
+            if let Some(tp) = self.tensor_parallel.lock().unwrap().as_mut() {
+                tp.copied(from, &to);
+            }
+            return Ok(first.expect("a Provider has at least one member"));
+        }
         let member = self.residency.lock().unwrap().owner(from).unwrap_or(0);
         let allocation =
             self.members[member].copy_tensor_admitted(memory, from, to.clone(), class, owner)?;
@@ -707,6 +828,11 @@ impl ProviderExecutionApi for CudaMultiExecutor {
     /// On by default; `MAGNETAR_CUDA_MULTI_CAPTURE=0` is the disable
     /// control (every step spanning GPUs then runs uncaptured).
     fn supports_step_capture(&self) -> bool {
+        // Tensor-parallel steps reduce across GPUs with host-side waits,
+        // which a capture cannot hold yet.
+        if self.tensor_parallel_active() {
+            return false;
+        }
         std::env::var("MAGNETAR_CUDA_MULTI_CAPTURE").as_deref() != Ok("0")
     }
 
@@ -904,6 +1030,7 @@ impl CudaMultiProvider {
                     completed: Mutex::new(BTreeMap::new()),
                     next_execution: std::sync::atomic::AtomicU64::new(0),
                     capture: Mutex::new(CaptureState::default()),
+                    tensor_parallel: Mutex::new(None),
                 })
             }),
         }
