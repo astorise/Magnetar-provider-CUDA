@@ -43,6 +43,15 @@ extern "C" __global__ void accumulate_kernel(float* a, const float* b, unsigned 
     }
 }
 
+// dst[i] = src[i], `src` possibly another GPU's memory (peer access
+// enabled): a copy between GPUs that a step capture records as a Kernel.
+extern "C" __global__ void copy_kernel(float* dst, const float* src, unsigned long long n) {
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        dst[i] = src[i];
+    }
+}
+
 extern "C" __global__ void mul_kernel(const float* a, const float* b, float* out, unsigned long long n) {
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {

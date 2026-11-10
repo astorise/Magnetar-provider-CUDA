@@ -686,6 +686,16 @@ impl CudaExecutor {
         if source.is_compact() {
             return Err(missing("peer"));
         }
+        if self.kernels.has_peer_access() {
+            let mut storage = self.storage.lock().unwrap();
+            let destination = storage.get_mut(id).ok_or_else(|| missing("reducing"))?;
+            if destination.is_compact() {
+                return Err(missing("reducing"));
+            }
+            return self
+                .kernels
+                .accumulate_from_peer(destination, &peer.kernels, source);
+        }
         let mut scratch = self.reduce_scratch.lock().unwrap();
         match scratch.get_mut(id) {
             Some(partial) if partial.shape == source.shape && !partial.is_compact() => {
@@ -704,6 +714,12 @@ impl CudaExecutor {
             return Err(missing("reducing"));
         }
         self.kernels.accumulate(destination, partial)
+    }
+
+    /// Lets this GPU read other GPUs' memory directly in reductions and
+    /// copies (peer access enabled towards every other GPU).
+    pub fn set_peer_access(&self, enabled: bool) {
+        self.kernels.set_peer_access(enabled);
     }
 
     /// Joins `host`'s step capture, in progress, until

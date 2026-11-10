@@ -1043,15 +1043,19 @@ impl CudaMultiProvider {
             .collect::<Vec<Arc<CudaContext>>>();
         let available = !ordinals.is_empty() && executors.len() == ordinals.len();
         if available {
-            for from in &contexts {
+            for (from, executor) in contexts.iter().zip(&executors) {
+                let mut reaches_every_peer = true;
                 for to in &contexts {
                     if Arc::ptr_eq(from, to) {
                         continue;
                     }
-                    if crate::peer::device_can_access_peer(from, to).unwrap_or(false) {
-                        let _ = crate::peer::enable_peer_access(from, to);
-                    }
+                    let enabled = crate::peer::device_can_access_peer(from, to).unwrap_or(false)
+                        && crate::peer::enable_peer_access(from, to).is_ok();
+                    reaches_every_peer &= enabled;
                 }
+                // Reductions and copies then read peers' memory directly,
+                // in Kernels a step capture records.
+                executor.set_peer_access(reaches_every_peer);
             }
         }
         Self {

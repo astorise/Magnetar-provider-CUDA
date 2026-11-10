@@ -20,7 +20,7 @@
 
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaGraph, CudaModule, CudaSlice, CudaStream, DevicePtr,
-    DevicePtrMut, LaunchConfig, PushKernelArg, sys,
+    LaunchConfig, PushKernelArg, sys,
 };
 use cudarc::nvrtc::compile_ptx;
 use magnetar_runtime::HostTensor;
@@ -364,6 +364,8 @@ pub struct CudaKernels {
     /// are captured from one thread at once, where a thread-local capture
     /// on one would forbid the others' setup, instantiation and launch.
     relaxed_capture: std::sync::atomic::AtomicBool,
+    /// See [`CudaKernels::set_peer_access`].
+    peer_access: std::sync::atomic::AtomicBool,
     /// The embedding lookup's invalid-id flag, allocated once.
     embedding_flag: std::sync::Mutex<Option<CudaSlice<i32>>>,
     /// The split-key attention's per-chunk partials: the current buffer,
@@ -519,6 +521,7 @@ impl CudaKernels {
             capture: std::sync::Mutex::new(None),
             prepared_offset: std::sync::Mutex::new(None),
             relaxed_capture: std::sync::atomic::AtomicBool::new(false),
+            peer_access: std::sync::atomic::AtomicBool::new(false),
             embedding_flag: std::sync::Mutex::new(None),
             attention_scratch: std::sync::Mutex::new((None, Vec::new())),
             split_scratch: std::sync::Mutex::new((None, Vec::new())),
@@ -692,12 +695,21 @@ impl CudaKernels {
         Ok(())
     }
 
-    /// Copies `src`, held by `peer`'s GPU, into this GPU's `dst` on this
-    /// stream, after `peer`'s stream has written it: a plain device-to-
-    /// device copy through unified addressing (peer access enabled), which
-    /// a step capture records as a copy node -- unlike the peer copy
-    /// `CudaStream::memcpy_dtod` issues between contexts, which cannot be
-    /// captured.
+    /// Whether this GPU may read other GPUs' memory directly (peer access
+    /// enabled towards every other GPU of its Provider).
+    pub fn set_peer_access(&self, enabled: bool) {
+        self.peer_access
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn has_peer_access(&self) -> bool {
+        self.peer_access.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Copies `src`, held by `peer`'s GPU, into this GPU's `dst`, after
+    /// `peer`'s stream has written it. With peer access, a Kernel reading
+    /// `peer`'s memory directly, which a step capture records; else the
+    /// driver's peer copy, which cannot be captured.
     pub fn copy_from_peer(
         &self,
         peer: &CudaKernels,
@@ -710,20 +722,43 @@ impl CudaKernels {
                 format!("peer copy of {} floats into {}", src.len(), dst.len()),
             ));
         }
+        if !self.has_peer_access() {
+            self.stream.memcpy_dtod(src, dst)?;
+            return Ok(());
+        }
         self.stream.wait(&peer.stream.record_event(None)?)?;
-        self.stream.context().bind_to_thread()?;
-        let (source, _read) = src.device_ptr(&peer.stream);
-        let (destination, _write) = dst.device_ptr_mut(&self.stream);
-        // SAFETY: both allocations hold `len` floats, and this stream waits
-        // for the source's writer above.
-        unsafe {
-            cudarc::driver::result::memcpy_dtod_async(
-                destination,
-                source,
-                src.len() * std::mem::size_of::<f32>(),
-                self.stream.cu_stream(),
-            )
-        }?;
+        let source = src.device_ptr(&peer.stream).0;
+        let n = src.len() as u64;
+        let func = self.function("copy_kernel")?;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(dst).arg(&source).arg(&n);
+        unsafe { args.launch(LaunchConfig::for_num_elems(n as u32)) }?;
+        Ok(())
+    }
+
+    /// `a += b` with `b` held by `peer`'s GPU, read directly (peer access
+    /// enabled) after `peer`'s stream has written it: a tensor-parallel
+    /// reduction that allocates nothing and can be captured.
+    pub fn accumulate_from_peer(
+        &self,
+        a: &mut CudaDeviceBuffer,
+        peer: &CudaKernels,
+        b: &CudaDeviceBuffer,
+    ) -> Result<(), CudaError> {
+        Self::require_f32(&[a, b], "accumulate")?;
+        if a.shape != b.shape {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!("accumulate: shape mismatch {:?} vs {:?}", a.shape, b.shape),
+            ));
+        }
+        self.stream.wait(&peer.stream.record_event(None)?)?;
+        let addend = b.slice.device_ptr(&peer.stream).0;
+        let n = a.slice.len() as u64;
+        let func = self.function("accumulate_kernel")?;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(&mut a.slice).arg(&addend).arg(&n);
+        unsafe { args.launch(LaunchConfig::for_num_elems(n as u32)) }?;
         Ok(())
     }
 
