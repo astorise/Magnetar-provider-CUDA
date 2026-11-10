@@ -530,6 +530,25 @@ impl CudaMultiExecutor {
                 return Err(error);
             }
         }
+        // Every member's stream must now be part of the host's capture.
+        let statuses: Vec<String> = self
+            .members
+            .iter()
+            .map(|member| member.capture_status())
+            .collect();
+        if statuses.iter().any(|status| !status.contains("ACTIVE")) {
+            for joined in others {
+                joined.abandon_joined_capture(host);
+            }
+            host.abort_step_capture();
+            for member in &self.members {
+                member.clear_deferred_errors();
+            }
+            return Err(self.error(
+                ProviderExecutionPhase::Submit,
+                format!("joining the step capture left the streams {statuses:?}"),
+            ));
+        }
         recording.all_open = true;
         Ok(())
     }
@@ -640,9 +659,18 @@ impl CudaMultiExecutor {
     /// host never blocks.
     pub(super) fn all_reduce(&self, id: &TensorResourceId) -> Result<(), ProviderExecutionError> {
         let failed = |detail: String| {
+            let streams: Vec<String> = self
+                .members
+                .iter()
+                .enumerate()
+                .map(|(index, member)| format!("GPU {index} {}", member.capture_status()))
+                .collect();
             self.error(
                 ProviderExecutionPhase::Submit,
-                format!("reducing '{id}' across GPUs: {detail}"),
+                format!(
+                    "reducing '{id}' across GPUs: {detail} (streams: {})",
+                    streams.join(", ")
+                ),
             )
         };
         let (root, others) = self

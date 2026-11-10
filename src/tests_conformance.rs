@@ -2384,3 +2384,85 @@ fn assert_close_relative(actual: &HostTensor, expected: &HostTensor) {
         );
     }
 }
+
+/// A tensor-parallel step captured as one graph across two GPUs: the
+/// second GPU joins the first's capture, runs a Kernel, and the first sums
+/// the second's buffer into its own by reading it directly; the second
+/// then copies the sum back. The graph, launched twice, gives the same
+/// result as the same work run eagerly. Skipped without two GPUs with
+/// peer access.
+#[test]
+fn a_step_captured_across_two_gpus_replays_its_reduction() {
+    let first = CudaProvider::for_device(0, "first");
+    let second = CudaProvider::for_device(1, "second");
+    let (Some(context0), Some(context1)) = (first.context(), second.context()) else {
+        eprintln!("skipping: fewer than two CUDA devices");
+        return;
+    };
+    let reachable = crate::peer::device_can_access_peer(&context0, &context1).unwrap_or(false)
+        && crate::peer::device_can_access_peer(&context1, &context0).unwrap_or(false);
+    if !reachable {
+        eprintln!("skipping: the two GPUs have no peer access");
+        return;
+    }
+    crate::peer::enable_peer_access(&context0, &context1).unwrap();
+    crate::peer::enable_peer_access(&context1, &context0).unwrap();
+    let host = CudaKernels::compile_and_load(&context0).unwrap();
+    let joined = CudaKernels::compile_and_load(&context1).unwrap();
+    for kernels in [&host, &joined] {
+        kernels.set_peer_access(true);
+        kernels.set_relaxed_capture(true);
+    }
+    let values = HostTensor::new([1, 64], (0..64).map(|v| v as f32).collect::<Vec<_>>()).unwrap();
+    let mut a = upload(&host, &values);
+    let mut b = upload(&joined, &values);
+    let c = upload(&joined, &values);
+    // b += c on the second GPU, a += b read from it by the first, then b = a
+    // copied back. Eagerly once, which also loads every Kernel: b = 2v,
+    // a = 3v, b = 3v.
+    let step = |a: &mut CudaDeviceBuffer, b: &mut CudaDeviceBuffer| {
+        joined.accumulate(b, &c).unwrap();
+        host.accumulate_from_peer(a, &joined, b).unwrap();
+        joined
+            .copy_from_peer(&host, &a.slice, &mut b.slice)
+            .unwrap();
+        host.follow(&joined).unwrap();
+    };
+    step(&mut a, &mut b);
+    assert_eq!(
+        download(&host, &a).data,
+        (0..64).map(|v| 3.0 * v as f32).collect::<Vec<_>>()
+    );
+    for kernels in [&host, &joined] {
+        kernels.prepare_capture().unwrap();
+    }
+    host.begin_capture(Default::default()).unwrap();
+    joined.join_capture(&host, Default::default()).unwrap();
+    assert!(
+        format!("{:?}", joined.stream().capture_status().unwrap()).contains("ACTIVE"),
+        "the second GPU's stream joined the capture"
+    );
+    step(&mut a, &mut b);
+    let mut joined_part = joined.leave_capture(&host).unwrap();
+    let mut graph = host.end_capture().unwrap();
+    joined
+        .write_joined_offset(&mut joined_part, 0, &host)
+        .unwrap();
+    host.launch_captured(&mut graph, 0).unwrap();
+    joined.follow(&host).unwrap();
+    // end_capture only instantiates: two launches after the eager run take
+    // a from 3v to 7v, then 15v.
+    joined
+        .write_joined_offset(&mut joined_part, 0, &host)
+        .unwrap();
+    host.launch_captured(&mut graph, 0).unwrap();
+    joined.follow(&host).unwrap();
+    assert_eq!(
+        download(&host, &a).data,
+        (0..64).map(|v| 15.0 * v as f32).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        download(&joined, &b).data,
+        (0..64).map(|v| 15.0 * v as f32).collect::<Vec<_>>()
+    );
+}
