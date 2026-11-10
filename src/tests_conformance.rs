@@ -1782,6 +1782,95 @@ fn decode_matmul_bandwidth() {
     }
 }
 
+/// The Device time of a mixture-of-experts decode step's Kernels at
+/// Qwen1.5-MoE-A2.7B's shapes (hidden 2048, 60 experts of 1408, top 4, a
+/// 5632 shared expert, 2048-wide attention projections, a 151936-token
+/// output head), packed `Q8_0`, one token: each Kernel's time and the
+/// bandwidth of the weight bytes it must read. Also the routed experts
+/// split in two (30 held), as each GPU runs them under tensor parallelism.
+#[test]
+#[ignore = "GPU timing diagnostic"]
+fn moe_decode_kernel_times() {
+    use magnetar_runtime::reference_cpu::MoeRouting;
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let context = kernels.stream().context().clone();
+    let timing = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
+    let repeats = 100;
+    let time = |run: &dyn Fn()| -> f32 {
+        run();
+        let start = context.new_event(timing).unwrap();
+        let end = context.new_event(timing).unwrap();
+        start.record(kernels.stream()).unwrap();
+        for _ in 0..repeats {
+            run();
+        }
+        end.record(kernels.stream()).unwrap();
+        start.elapsed_ms(&end).unwrap() / repeats as f32
+    };
+    let q8_bytes = |elements: u64| elements / 32 * 34;
+    let report = |what: &str, ms: f32, bytes: u64| {
+        eprintln!(
+            "{what}: {:.1} us ({:.0} GB/s over {:.1} MB)",
+            ms * 1e3,
+            bytes as f32 / ms / 1e6,
+            bytes as f32 / 1e6
+        );
+    };
+    let (hidden, inter, experts, top_k) = (2048_u64, 1408_u64, 60_u64, 4_u64);
+    let h = upload(&kernels, &activations(1, hidden, 61));
+    let logits = upload(&kernels, &activations(1, experts, 62));
+    let routing = MoeRouting {
+        experts,
+        top_k,
+        normalize: false,
+    };
+    for held in [experts, experts / 2] {
+        let gate = kernels
+            .upload_packed_weight(&packed_q8(held * inter, hidden, true, 63))
+            .unwrap();
+        let up = kernels
+            .upload_packed_weight(&packed_q8(held * inter, hidden, true, 64))
+            .unwrap();
+        let down = kernels
+            .upload_packed_weight(&packed_q8(held * hidden, inter, true, 65))
+            .unwrap();
+        let ms = time(&|| {
+            kernels
+                .moe_experts(&h, &logits, [&gate, &up, &down], routing, (0, held))
+                .unwrap();
+        });
+        // At most top_k experts' three matrices are read.
+        let routed = top_k.min(held);
+        report(
+            &format!("moe-experts, {held} of {experts} experts held"),
+            ms,
+            routed * 3 * q8_bytes(hidden * inter),
+        );
+    }
+    for (what, k, n) in [
+        (
+            "attention projection [1, 2048] x [2048, 2048]",
+            hidden,
+            hidden,
+        ),
+        ("shared expert up [1, 2048] x [2048, 5632]", hidden, 5632),
+        ("shared expert down [1, 5632] x [5632, 2048]", 5632, hidden),
+        ("router [1, 2048] x [2048, 60]", hidden, experts),
+        ("output head [1, 2048] x [2048, 151936]", hidden, 151_936),
+    ] {
+        let a = upload(&kernels, &activations(1, k, 66));
+        let b = kernels
+            .upload_packed_weight(&packed_q8(n, k, true, 67))
+            .unwrap();
+        let ms = time(&|| {
+            kernels.matmul(&a, &b, false, false).unwrap();
+        });
+        report(what, ms, q8_bytes(k * n));
+    }
+}
+
 /// A deterministic packed `Q8_0` matrix of `stored_rows` x `stored_cols`
 /// (`execute-direct-quantized-weights`), with varied scales and quants
 /// covering the full signed 8-bit range.
