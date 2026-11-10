@@ -2113,6 +2113,7 @@ fn moe_experts_match_reference_cpu_for_f32_and_packed_experts() {
                     &upload(&kernels, &logits),
                     [&f32_experts[0], &f32_experts[1], &f32_experts[2]],
                     routing,
+                    (0, experts),
                 )
                 .unwrap();
             assert_close_relative(&download(&kernels, &actual), &expected);
@@ -2124,6 +2125,7 @@ fn moe_experts_match_reference_cpu_for_f32_and_packed_experts() {
                     &upload(&kernels, &logits),
                     [&packed_experts[0], &packed_experts[1], &packed_experts[2]],
                     routing,
+                    (0, experts),
                 )
                 .unwrap();
             assert_close_relative(&download(&kernels, &actual), &expected);
@@ -2141,6 +2143,7 @@ fn moe_experts_match_reference_cpu_for_f32_and_packed_experts() {
             &logits,
             [&packed_experts[0], &packed_experts[1], &packed_experts[2]],
             routing,
+            (0, experts),
         );
         drop(offered);
         result
@@ -2158,6 +2161,103 @@ fn moe_experts_match_reference_cpu_for_f32_and_packed_experts() {
     let mut graph = kernels.end_capture().unwrap();
     kernels.launch_captured(&mut graph, 0).unwrap();
     assert_eq!(download(&kernels, &captured).data, eager.data);
+}
+
+/// Tensor parallelism splits a `moe-experts` layer's experts whole across
+/// GPUs: each share, f32 or packed `Q8_0`, matches the Reference CPU's
+/// share (routing over every expert, summing only those held), and the
+/// shares add up to the whole layer.
+#[test]
+fn moe_expert_shares_match_reference_cpu_and_add_up() {
+    use magnetar_runtime::packed_weight::{PackedWeight, PackedWeightFormat};
+    use magnetar_runtime::reference_cpu::{MoeRouting, moe_experts, moe_experts_local};
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let (hidden, inter, experts, top_k, tokens) = (64_u64, 32_u64, 5_u64, 3_u64, 4_u64);
+    let routing = MoeRouting {
+        experts,
+        top_k,
+        normalize: true,
+    };
+    let gate = packed_q8(experts * inter, hidden, true, 51);
+    let up = packed_q8(experts * inter, hidden, true, 52);
+    let down = packed_q8(experts * hidden, inter, true, 53);
+    // Stored rows of experts [first, first + count).
+    let rows = |weight: &PackedWeight, per_expert: u64, first: u64, count: u64| {
+        let row_bytes = (weight.stored_cols() / 32 * 34) as usize;
+        let start = (first * per_expert) as usize * row_bytes;
+        let end = ((first + count) * per_expert) as usize * row_bytes;
+        PackedWeight::new(
+            PackedWeightFormat::Q8_0,
+            count * per_expert,
+            weight.stored_cols(),
+            true,
+            weight.bytes()[start..end].to_vec(),
+        )
+        .unwrap()
+    };
+    let h = activations(tokens, hidden, 54);
+    let logits = activations(tokens, experts, 55);
+    let whole = moe_experts(
+        &h,
+        &logits,
+        [&gate.dequantize(), &up.dequantize(), &down.dequantize()],
+        routing,
+    )
+    .unwrap();
+    let mut summed = vec![0.0_f32; whole.data.len()];
+    for (first, count) in [(0_u64, 2_u64), (2, 3)] {
+        let share = [
+            rows(&gate, inter, first, count),
+            rows(&up, inter, first, count),
+            rows(&down, hidden, first, count),
+        ];
+        let dense = share.each_ref().map(PackedWeight::dequantize);
+        let expected = moe_experts_local(
+            &h,
+            &logits,
+            [&dense[0], &dense[1], &dense[2]],
+            routing,
+            first,
+            count,
+        )
+        .unwrap();
+        let f32_share = dense.each_ref().map(|w| upload(&kernels, w));
+        let actual = kernels
+            .moe_experts(
+                &upload(&kernels, &h),
+                &upload(&kernels, &logits),
+                [&f32_share[0], &f32_share[1], &f32_share[2]],
+                routing,
+                (first, count),
+            )
+            .unwrap();
+        assert_close_relative(&download(&kernels, &actual), &expected);
+        let packed_share = share
+            .each_ref()
+            .map(|w| kernels.upload_packed_weight(w).unwrap());
+        let actual = download(
+            &kernels,
+            &kernels
+                .moe_experts(
+                    &upload(&kernels, &h),
+                    &upload(&kernels, &logits),
+                    [&packed_share[0], &packed_share[1], &packed_share[2]],
+                    routing,
+                    (first, count),
+                )
+                .unwrap(),
+        );
+        assert_close_relative(&actual, &expected);
+        for (slot, value) in summed.iter_mut().zip(&actual.data) {
+            *slot += value;
+        }
+    }
+    assert_close_relative(
+        &HostTensor::new(whole.shape.clone(), summed).unwrap(),
+        &whole,
+    );
 }
 
 /// `row-scale` and the `sigmoid` activation against the Reference CPU.

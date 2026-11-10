@@ -1358,8 +1358,18 @@ impl CudaExecutor {
                             false,
                         ),
                     };
+                    let local = magnetar_runtime::reference_cpu::moe_local_experts(
+                        &invocation.attributes,
+                        routing.experts,
+                    );
                     self.kernels
-                        .moe_experts(get(0)?, get(1)?, [get(2)?, get(3)?, get(4)?], routing)
+                        .moe_experts(
+                            get(0)?,
+                            get(1)?,
+                            [get(2)?, get(3)?, get(4)?],
+                            routing,
+                            local,
+                        )
                         .map_err(KernelError::from)?
                 }
                 "add" => {

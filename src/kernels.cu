@@ -287,7 +287,11 @@ extern "C" __global__ void q8_gated_matmul_rows_kernel(
 // (ties to the lower expert), divided by their sum when `normalize` --
 // `magnetar_runtime::reference_cpu::moe_route`'s order of operations.
 // Writes `indices`/`weights[t * top_k + k]`; the routing never leaves the
-// Device, so a decode step that routes stays capturable.
+// Device, so a decode step that routes stays capturable. Only experts
+// `[expert_first, expert_first + expert_count)` are held here (a Device's
+// share of an expert-split layer): `indices` holds each chosen expert's
+// index among those, or -1 for an expert held elsewhere, whose pair the
+// two kernels below skip.
 extern "C" __global__ void moe_route_kernel(
     const float* logits,
     int* indices,
@@ -295,7 +299,9 @@ extern "C" __global__ void moe_route_kernel(
     unsigned long long tokens,
     unsigned long long experts,
     unsigned long long top_k,
-    int normalize
+    int normalize,
+    unsigned long long expert_first,
+    unsigned long long expert_count
 ) {
     unsigned long long t = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= tokens) {
@@ -326,7 +332,10 @@ extern "C" __global__ void moe_route_kernel(
                 best_p = p;
             }
         }
-        indices[t * top_k + k] = (int)best;
+        unsigned long long chosen = (unsigned long long)best;
+        indices[t * top_k + k] = chosen >= expert_first && chosen - expert_first < expert_count
+            ? (int)(chosen - expert_first)
+            : -1;
         weights[t * top_k + k] = best_p / sum;
         chosen_total += best_p / sum;
         previous = best_p;
@@ -359,6 +368,9 @@ extern "C" __global__ void moe_q8_gated_kernel(
     unsigned long long j = (unsigned long long)blockIdx.x * Q8_MATMUL_WARPS + threadIdx.y;
     unsigned long long tk = blockIdx.y;
     if (j >= inter) {
+        return;
+    }
+    if (indices[tk] < 0) {
         return;
     }
     unsigned long long t = tk / top_k;
@@ -410,6 +422,9 @@ extern "C" __global__ void moe_q8_down_kernel(
     float total = 0.0f;
     for (unsigned long long k = 0; k < top_k; k++) {
         unsigned long long tk = t * top_k + k;
+        if (indices[tk] < 0) {
+            continue;
+        }
         unsigned long long row = (unsigned long long)indices[tk] * hidden + c;
         const signed char* w = down_quants + row * inter;
         const float* scales = down_scales + row * (inter >> 5);
@@ -452,6 +467,9 @@ extern "C" __global__ void moe_f32_gated_kernel(
     }
     unsigned long long tk = index / inter;
     unsigned long long j = index % inter;
+    if (indices[tk] < 0) {
+        return;
+    }
     unsigned long long column = (unsigned long long)indices[tk] * inter + j;
     unsigned long long stride = experts * inter;
     const float* x = h + (tk / top_k) * hidden;
@@ -486,6 +504,9 @@ extern "C" __global__ void moe_f32_down_kernel(
     float total = 0.0f;
     for (unsigned long long k = 0; k < top_k; k++) {
         unsigned long long tk = t * top_k + k;
+        if (indices[tk] < 0) {
+            continue;
+        }
         unsigned long long column = (unsigned long long)indices[tk] * hidden + c;
         const float* a = act + tk * inter;
         float sum = 0.0f;

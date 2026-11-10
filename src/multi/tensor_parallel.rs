@@ -27,9 +27,11 @@ use magnetar_runtime::kernel::{
     KernelAdvertisement, KernelInvocation, KernelResource, KernelResultStatus,
 };
 use magnetar_runtime::memory::MemoryManager;
+use magnetar_runtime::operator::OperatorAttributeValue;
 use magnetar_runtime::operator::OperatorSpec;
 use magnetar_runtime::packed_weight::{PackedWeight, PackedWeightFormat, PackedWeightWrite};
 use magnetar_runtime::provider::ProviderExecutionApi;
+use magnetar_runtime::reference_cpu::{MOE_EXPERT_COUNT_ATTRIBUTE, MOE_EXPERT_FIRST_ATTRIBUTE};
 use magnetar_runtime::scheduler::{
     ProviderExecutionError, ProviderExecutionHandle, ProviderExecutionId, ProviderExecutionPhase,
 };
@@ -84,6 +86,25 @@ impl TensorParallel {
         end - start
     }
 
+    /// The `[start, end)` range of the split dimension (`extent` long:
+    /// columns, or rows for [`WeightShard::Rows`]) member `member` holds of
+    /// a weight split as `shard`. Whole experts for an expert split.
+    fn weight_range(&self, shard: WeightShard, member: usize, extent: u64) -> (u64, u64) {
+        match shard {
+            WeightShard::Columns | WeightShard::Rows => self.share(member, extent),
+            WeightShard::Experts { experts } => {
+                let (first, end) = self.expert_range(member, experts);
+                let per_expert = extent / experts.max(1);
+                (first * per_expert, end * per_expert)
+            }
+        }
+    }
+
+    /// The `[first, end)` experts member `member` holds of `experts`.
+    fn expert_range(&self, member: usize, experts: u64) -> (u64, u64) {
+        self.plan.share(member, experts, 1)
+    }
+
     /// The logical shape of a split weight or sharded activation.
     pub(super) fn logical_shape(&self, id: &TensorResourceId) -> Option<Vec<u64>> {
         self.weights
@@ -114,7 +135,9 @@ impl TensorParallel {
         for input in &invocation.inputs {
             let id = &input.resource.id;
             match self.weights.get(id) {
-                Some((WeightShard::Rows, _)) => return OutputRole::Partial,
+                Some((WeightShard::Rows | WeightShard::Experts { .. }, _)) => {
+                    return OutputRole::Partial;
+                }
                 Some((WeightShard::Columns, _)) => role = OutputRole::Sharded,
                 None if self.sharded.contains_key(id) => role = OutputRole::Sharded,
                 None => {}
@@ -132,6 +155,7 @@ impl TensorParallel {
         role: OutputRole,
     ) -> KernelInvocation {
         let mut local = invocation.clone();
+        let mut held_experts = None;
         for input in &mut local.inputs {
             let id = input.resource.id.clone();
             let dimensions = &mut input.resource.descriptor.shape.dimensions;
@@ -141,10 +165,27 @@ impl TensorParallel {
                         *first = self.local_extent(member, *first);
                     }
                 }
+                Some((shard @ WeightShard::Experts { experts }, _)) => {
+                    if let Some(last) = dimensions.last_mut() {
+                        let (start, end) = self.weight_range(*shard, member, *last);
+                        *last = end - start;
+                    }
+                    held_experts = Some(self.expert_range(member, *experts));
+                }
                 Some((WeightShard::Columns, _)) => shrink_last(self, dimensions, member),
                 None if self.sharded.contains_key(&id) => shrink_last(self, dimensions, member),
                 None => {}
             }
+        }
+        if let Some((first, end)) = held_experts {
+            local.attributes.insert(
+                MOE_EXPERT_FIRST_ATTRIBUTE.to_string(),
+                OperatorAttributeValue::Integer(first as i64),
+            );
+            local.attributes.insert(
+                MOE_EXPERT_COUNT_ATTRIBUTE.to_string(),
+                OperatorAttributeValue::Integer((end - first) as i64),
+            );
         }
         if role == OutputRole::Sharded {
             for output in &mut local.outputs {
@@ -162,9 +203,9 @@ impl TensorParallel {
     fn split_host(&self, tensor: &HostTensor, shard: WeightShard, member: usize) -> HostTensor {
         let shape = &tensor.shape;
         match shard {
-            WeightShard::Columns => {
+            WeightShard::Columns | WeightShard::Experts { .. } => {
                 let columns = *shape.last().unwrap_or(&1);
-                let (start, end) = self.share(member, columns);
+                let (start, end) = self.weight_range(shard, member, columns);
                 let rows = (tensor.data.len() as u64 / columns.max(1)) as usize;
                 let (columns, start, end) = (columns as usize, start as usize, end as usize);
                 let data = (0..rows)
@@ -203,12 +244,12 @@ impl TensorParallel {
         let [logical_rows, logical_columns] = weight.logical_shape();
         let (extent, along_stored_rows) = match (shard, weight.transposed()) {
             // Logical `[in, out]` stored as `[out, in]`.
-            (WeightShard::Columns, true) => (logical_columns, true),
+            (WeightShard::Columns | WeightShard::Experts { .. }, true) => (logical_columns, true),
             (WeightShard::Rows, true) => (logical_rows, false),
-            (WeightShard::Columns, false) => (logical_columns, false),
+            (WeightShard::Columns | WeightShard::Experts { .. }, false) => (logical_columns, false),
             (WeightShard::Rows, false) => (logical_rows, true),
         };
-        let (start, end) = self.share(member, extent);
+        let (start, end) = self.weight_range(shard, member, extent);
         let block = format.block_elements();
         let row_bytes = (weight.stored_cols() / block * format.block_bytes()) as usize;
         let bytes = weight.bytes();
@@ -663,6 +704,33 @@ mod tests {
 
     fn tp_three_parts_decline(weight: &PackedWeight) -> bool {
         tp(3).split_packed(weight, WeightShard::Rows, 0).is_none()
+    }
+
+    #[test]
+    fn expert_shares_hold_whole_experts() {
+        let tp = tp(2);
+        let shard = WeightShard::Experts { experts: 5 };
+        // [2, 5 experts * 2 columns].
+        let tensor = HostTensor {
+            shape: vec![2, 10],
+            data: (0..20).map(|value| value as f32).collect(),
+        };
+        let first = tp.split_host(&tensor, shard, 0);
+        assert_eq!(first.shape, vec![2, 4]);
+        assert_eq!(first.data, vec![0.0, 1.0, 2.0, 3.0, 10.0, 11.0, 12.0, 13.0]);
+        let second = tp.split_host(&tensor, shard, 1);
+        assert_eq!(second.shape, vec![2, 6]);
+        assert_eq!(tp.expert_range(1, 5), (2, 5));
+        // Packed, transposed: expert e owns stored rows [e * 2, e * 2 + 2).
+        let block = PackedWeightFormat::Q8_0.block_bytes() as usize;
+        let bytes: Vec<u8> = (0..10 * block).map(|byte| byte as u8).collect();
+        let weight = PackedWeight::new(PackedWeightFormat::Q8_0, 10, 32, true, bytes.clone())
+            .expect("valid weight");
+        let share = tp
+            .split_packed(&weight, shard, 1)
+            .expect("whole stored rows");
+        assert_eq!(share.logical_shape(), [32, 6]);
+        assert_eq!(share.bytes(), &bytes[4 * block..]);
     }
 
     #[test]

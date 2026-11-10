@@ -1483,13 +1483,22 @@ impl CudaKernels {
         logits: &CudaDeviceBuffer,
         [gate, up, down]: [&CudaDeviceBuffer; 3],
         routing: magnetar_runtime::reference_cpu::MoeRouting,
+        (expert_first, local_experts): (u64, u64),
     ) -> Result<CudaDeviceBuffer, CudaError> {
         Self::require_f32(&[h, logits], "moe-experts' activations")?;
         let shape_error = |reason: String| CudaError::new(CudaErrorCode::ShapeUnsupported, reason);
         let (tokens, hidden) = rows_cols_buf(h)?;
         let (logit_rows, experts) = rows_cols_buf(logits)?;
         let top_k = routing.top_k;
-        if experts != routing.experts || logit_rows != tokens || top_k == 0 || top_k > experts {
+        if experts != routing.experts
+            || logit_rows != tokens
+            || top_k == 0
+            || top_k > experts
+            || local_experts == 0
+            || expert_first
+                .checked_add(local_experts)
+                .is_none_or(|end| end > experts)
+        {
             return Err(shape_error(format!(
                 "moe-experts routes top {top_k} of {} experts over [{logit_rows}, {experts}] \
                  logits for {tokens} tokens",
@@ -1499,18 +1508,18 @@ impl CudaKernels {
         let (gate_rows, gate_cols) = rows_cols_buf(gate)?;
         let (down_rows, down_cols) = rows_cols_buf(down)?;
         if gate_rows != hidden
-            || !gate_cols.is_multiple_of(experts)
+            || !gate_cols.is_multiple_of(local_experts)
             || up.shape != gate.shape
-            || down_cols != experts * hidden
-            || down_rows != gate_cols / experts
+            || down_cols != local_experts * hidden
+            || down_rows != gate_cols / local_experts
         {
             return Err(shape_error(format!(
-                "moe-experts expects gate/up [{hidden}, {experts} * I] and down [I, {experts} * \
-                 {hidden}], got {:?}, {:?} and {:?}",
+                "moe-experts expects gate/up [{hidden}, {local_experts} * I] and down [I, \
+                 {local_experts} * {hidden}], got {:?}, {:?} and {:?}",
                 gate.shape, up.shape, down.shape
             )));
         }
-        let inter = gate_cols / experts;
+        let inter = gate_cols / local_experts;
         let pairs = tokens * top_k;
 
         let mut scratch_slot = self.moe_scratch.lock().unwrap();
@@ -1552,7 +1561,9 @@ impl CudaKernels {
             .arg(&tokens)
             .arg(&experts)
             .arg(&top_k)
-            .arg(&normalize);
+            .arg(&normalize)
+            .arg(&expert_first)
+            .arg(&local_experts);
         unsafe { args.launch(LaunchConfig::for_num_elems(tokens as u32)) }?;
 
         fn packed(buffer: &CudaDeviceBuffer, stored_cols: u64) -> Option<&CudaQ8Weight> {
@@ -1599,7 +1610,7 @@ impl CudaKernels {
                 .arg(&top_k)
                 .arg(&hidden)
                 .arg(&inter)
-                .arg(&experts);
+                .arg(&local_experts);
             unsafe { args.launch(LaunchConfig::for_num_elems((pairs * inter) as u32)) }?;
         }
 
@@ -1631,7 +1642,7 @@ impl CudaKernels {
                 .arg(&top_k)
                 .arg(&hidden)
                 .arg(&inter)
-                .arg(&experts);
+                .arg(&local_experts);
             unsafe { args.launch(LaunchConfig::for_num_elems((tokens * hidden) as u32)) }?;
         }
         drop(temporary);
