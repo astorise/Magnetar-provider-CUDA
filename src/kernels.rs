@@ -20,7 +20,7 @@
 
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaGraph, CudaModule, CudaSlice, CudaStream, DevicePtr,
-    LaunchConfig, PushKernelArg, sys,
+    DevicePtrMut, LaunchConfig, PushKernelArg, sys,
 };
 use cudarc::nvrtc::compile_ptx;
 use magnetar_runtime::HostTensor;
@@ -637,6 +637,19 @@ impl CudaKernels {
     /// Leaves `host`'s step capture: `host`'s stream waits on this one, so
     /// `host`'s graph ends after this GPU's captured work. Fails when
     /// anything the capture cannot replay happened here.
+    /// Leaves `host`'s capture whatever its state, discarding this GPU's
+    /// part and any error recorded meanwhile, so `host` can end or abort
+    /// its capture and this stream works again afterwards.
+    pub fn abandon_join(&self, host: &CudaKernels) {
+        if self.capture.lock().unwrap().take().is_some() {
+            let _ = self.take_deferred_error();
+            if let Ok(event) = self.stream.record_event(None) {
+                let _ = host.stream.wait(&event);
+            }
+            let _ = self.take_deferred_error();
+        }
+    }
+
     pub fn leave_capture(&self, host: &CudaKernels) -> Result<JoinedCapture, CudaError> {
         let capture = self.capture.lock().unwrap().take().ok_or_else(|| {
             CudaError::new(
@@ -676,6 +689,41 @@ impl CudaKernels {
     /// Makes this stream wait for everything queued on `host`'s so far.
     pub fn follow(&self, host: &CudaKernels) -> Result<(), CudaError> {
         self.stream.join(&host.stream)?;
+        Ok(())
+    }
+
+    /// Copies `src`, held by `peer`'s GPU, into this GPU's `dst` on this
+    /// stream, after `peer`'s stream has written it: a plain device-to-
+    /// device copy through unified addressing (peer access enabled), which
+    /// a step capture records as a copy node -- unlike the peer copy
+    /// `CudaStream::memcpy_dtod` issues between contexts, which cannot be
+    /// captured.
+    pub fn copy_from_peer(
+        &self,
+        peer: &CudaKernels,
+        src: &CudaSlice<f32>,
+        dst: &mut CudaSlice<f32>,
+    ) -> Result<(), CudaError> {
+        if src.len() != dst.len() {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!("peer copy of {} floats into {}", src.len(), dst.len()),
+            ));
+        }
+        self.stream.wait(&peer.stream.record_event(None)?)?;
+        self.stream.context().bind_to_thread()?;
+        let (source, _read) = src.device_ptr(&peer.stream);
+        let (destination, _write) = dst.device_ptr_mut(&self.stream);
+        // SAFETY: both allocations hold `len` floats, and this stream waits
+        // for the source's writer above.
+        unsafe {
+            cudarc::driver::result::memcpy_dtod_async(
+                destination,
+                source,
+                src.len() * std::mem::size_of::<f32>(),
+                self.stream.cu_stream(),
+            )
+        }?;
         Ok(())
     }
 
@@ -739,7 +787,7 @@ impl CudaKernels {
     /// (freeing a buffer dropped while capturing). Left in place, it would
     /// fail the next driver call -- ending the capture included, leaving
     /// the stream capturing.
-    fn take_deferred_error(&self) -> Result<(), cudarc::driver::DriverError> {
+    pub(crate) fn take_deferred_error(&self) -> Result<(), cudarc::driver::DriverError> {
         self.stream.context().check_err()
     }
 

@@ -641,8 +641,8 @@ impl CudaExecutor {
     /// Copies `peer`'s current `id` into this executor's existing `id`
     /// buffer, in place (its device address unchanged, so a captured step
     /// reading it stays valid). `false`, copying nothing, when either side
-    /// lacks a plain f32 buffer of the same length. The caller waits for
-    /// `peer`'s stream first.
+    /// lacks a plain f32 buffer of the same length. The copy waits on
+    /// `peer`'s stream, and can be captured.
     pub fn copy_from_peer_in_place(
         &self,
         peer: &CudaExecutor,
@@ -660,8 +660,7 @@ impl CudaExecutor {
             return Ok(false);
         }
         self.kernels
-            .stream()
-            .memcpy_dtod(&source.slice, &mut destination.slice)?;
+            .copy_from_peer(&peer.kernels, &source.slice, &mut destination.slice)?;
         Ok(true)
     }
 
@@ -689,10 +688,9 @@ impl CudaExecutor {
         }
         let mut scratch = self.reduce_scratch.lock().unwrap();
         match scratch.get_mut(id) {
-            Some(partial) if partial.shape == source.shape => {
+            Some(partial) if partial.shape == source.shape && !partial.is_compact() => {
                 self.kernels
-                    .stream()
-                    .memcpy_dtod(&source.slice, &mut partial.slice)?;
+                    .copy_from_peer(&peer.kernels, &source.slice, &mut partial.slice)?;
             }
             _ => {
                 scratch.insert(id.clone(), self.kernels.clone_buffer(source)?);
@@ -755,7 +753,13 @@ impl CudaExecutor {
     /// `host` can end its capture.
     pub fn abandon_joined_capture(&self, host: &CudaExecutor) {
         self.step_capture.lock().unwrap().recording = None;
-        let _ = self.kernels.leave_capture(&host.kernels);
+        self.kernels.abandon_join(&host.kernels);
+    }
+
+    /// Discards any driver error recorded but not yet reported (after an
+    /// abandoned capture), so the next call starts clean.
+    pub fn clear_deferred_errors(&self) {
+        let _ = self.kernels.take_deferred_error();
     }
 
     /// Readies this GPU's part of a replay of `host`'s graph: checks the

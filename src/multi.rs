@@ -909,6 +909,9 @@ impl ProviderExecutionApi for CudaMultiExecutor {
                     member.abandon_joined_capture(&self.members[0]);
                 }
                 self.members[0].abort_step_capture();
+                for member in &self.members {
+                    member.clear_deferred_errors();
+                }
             }
             self.release_ops(&recording.ops);
         }

@@ -561,6 +561,9 @@ impl CudaMultiExecutor {
         }
         if let Some(error) = first_error {
             host.abort_step_capture();
+            for member in &self.members {
+                member.clear_deferred_errors();
+            }
             return Err(error);
         }
         let id = host.end_step_capture()?;
