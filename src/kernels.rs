@@ -437,6 +437,55 @@ pub struct JoinedCapture {
     pub has_embedding: bool,
 }
 
+/// A page-locked host buffer every GPU context can copy to and from
+/// (`CU_MEMHOSTALLOC_PORTABLE`): the stage a tensor-parallel reduction
+/// crosses between GPUs without peer access. Copies through it are
+/// ordinary asynchronous copies, which a step capture records.
+pub struct PinnedStage {
+    ptr: *mut f32,
+    len: usize,
+}
+
+// SAFETY: the buffer is only ever read and written by copies queued on
+// GPU streams, ordered by events.
+unsafe impl Send for PinnedStage {}
+unsafe impl Sync for PinnedStage {}
+
+impl PinnedStage {
+    pub fn new(kernels: &CudaKernels, len: usize) -> Result<Self, CudaError> {
+        kernels.stream.context().bind_to_thread()?;
+        // SAFETY: a fresh allocation of `len` floats, freed in `drop`.
+        let ptr = unsafe {
+            cudarc::driver::result::malloc_host(
+                len * std::mem::size_of::<f32>(),
+                sys::CU_MEMHOSTALLOC_PORTABLE,
+            )
+        }? as *mut f32;
+        Ok(Self { ptr, len })
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[allow(clippy::mut_from_ref)]
+    fn host(&self) -> &mut [f32] {
+        // SAFETY: see the `Send`/`Sync` impls: only queued copies touch it.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+impl Drop for PinnedStage {
+    fn drop(&mut self) {
+        // SAFETY: allocated by `malloc_host` in `new`.
+        let _ = unsafe { cudarc::driver::result::free_host(self.ptr.cast()) };
+    }
+}
+
 /// A captured step's CUDA graph and what replaying it needs.
 pub struct CapturedStep {
     graph: CapturedGraph,
@@ -733,6 +782,44 @@ impl CudaKernels {
         let mut args = self.stream.launch_builder(&func);
         args.arg(dst).arg(&source).arg(&n);
         unsafe { args.launch(LaunchConfig::for_num_elems(n as u32)) }?;
+        Ok(())
+    }
+
+    /// Copies `src` into `stage` on this stream.
+    pub fn stage_out(&self, src: &CudaSlice<f32>, stage: &PinnedStage) -> Result<(), CudaError> {
+        if src.len() != stage.len() {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!("staging {} floats through {}", src.len(), stage.len()),
+            ));
+        }
+        self.stream.context().bind_to_thread()?;
+        let source = src.device_ptr(&self.stream).0;
+        // SAFETY: `stage` holds `len` floats and outlives the copy.
+        unsafe {
+            cudarc::driver::result::memcpy_dtoh_async(stage.host(), source, self.stream.cu_stream())
+        }?;
+        Ok(())
+    }
+
+    /// Copies `stage` into `dst` on this stream.
+    pub fn stage_in(&self, stage: &PinnedStage, dst: &mut CudaSlice<f32>) -> Result<(), CudaError> {
+        if dst.len() != stage.len() {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!("staging {} floats into {}", stage.len(), dst.len()),
+            ));
+        }
+        self.stream.context().bind_to_thread()?;
+        let destination = dst.device_ptr(&self.stream).0;
+        // SAFETY: `stage` holds `len` floats and outlives the copy.
+        unsafe {
+            cudarc::driver::result::memcpy_htod_async(
+                destination,
+                stage.host(),
+                self.stream.cu_stream(),
+            )
+        }?;
         Ok(())
     }
 

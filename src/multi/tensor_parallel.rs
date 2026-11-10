@@ -701,7 +701,7 @@ impl CudaMultiExecutor {
         }
         for member in others {
             if !member
-                .copy_from_peer_in_place(root, id)
+                .copy_reduced_from_peer(root, id)
                 .map_err(|error| failed(error.to_string()))?
             {
                 return Err(failed("a member lost its buffer for it".into()));

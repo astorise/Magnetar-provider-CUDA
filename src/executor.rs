@@ -96,6 +96,9 @@ pub struct CudaExecutor {
     /// Each tensor-parallel reduction's copy of a peer's partial sum, kept
     /// so that reducing allocates nothing after the first time.
     reduce_scratch: Mutex<BTreeMap<TensorResourceId, CudaDeviceBuffer>>,
+    /// Each tensor-parallel reduction's page-locked stage, for GPUs without
+    /// peer access.
+    reduce_stages: Mutex<BTreeMap<TensorResourceId, crate::kernels::PinnedStage>>,
 }
 
 /// The device address and length (in floats) of a resource's buffer, as a
@@ -151,6 +154,7 @@ impl CudaExecutor {
             next_execution_ordinal: AtomicU64::new(0),
             step_capture: Mutex::new(StepCaptureState::default()),
             reduce_scratch: Mutex::new(BTreeMap::new()),
+            reduce_stages: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -696,24 +700,71 @@ impl CudaExecutor {
                 .kernels
                 .accumulate_from_peer(destination, &peer.kernels, source);
         }
-        let mut scratch = self.reduce_scratch.lock().unwrap();
-        match scratch.get_mut(id) {
-            Some(partial) if partial.shape == source.shape && !partial.is_compact() => {
-                self.kernels
-                    .copy_from_peer(&peer.kernels, &source.slice, &mut partial.slice)?;
-            }
-            _ => {
-                scratch.insert(id.clone(), self.kernels.clone_buffer(source)?);
-            }
+        // Without peer access: `peer` stages its partial in page-locked
+        // host memory, this GPU copies it into a scratch buffer and adds it,
+        // all queued copies a capture records.
+        let mut stages = self.reduce_stages.lock().unwrap();
+        if !stages
+            .get(id)
+            .is_some_and(|stage| stage.len() == source.len())
+        {
+            stages.insert(
+                id.clone(),
+                crate::kernels::PinnedStage::new(&self.kernels, source.len())?,
+            );
         }
+        let stage = &stages[id];
+        peer.kernels.stage_out(&source.slice, stage)?;
         drop(peer_storage);
-        let partial = &scratch[id];
+        self.kernels.follow(&peer.kernels)?;
         let mut storage = self.storage.lock().unwrap();
         let destination = storage.get_mut(id).ok_or_else(|| missing("reducing"))?;
         if destination.is_compact() {
             return Err(missing("reducing"));
         }
+        let mut scratch = self.reduce_scratch.lock().unwrap();
+        if !scratch
+            .get(id)
+            .is_some_and(|partial| partial.shape == destination.shape && !partial.is_compact())
+        {
+            scratch.insert(id.clone(), self.kernels.clone_buffer(destination)?);
+        }
+        let partial = scratch.get_mut(id).expect("inserted above");
+        self.kernels.stage_in(stage, &mut partial.slice)?;
         self.kernels.accumulate(destination, partial)
+    }
+
+    /// Copies `root`'s reduced `id` into this GPU's `id`, in place: the
+    /// second half of a tensor-parallel reduction. With peer access, read
+    /// directly; without, staged through `root`'s page-locked stage for
+    /// `id`. Either way after `root`'s stream, and capturable.
+    pub fn copy_reduced_from_peer(
+        &self,
+        root: &CudaExecutor,
+        id: &TensorResourceId,
+    ) -> Result<bool, CudaError> {
+        if self.kernels.has_peer_access() {
+            return self.copy_from_peer_in_place(root, id);
+        }
+        let root_storage = root.storage.lock().unwrap();
+        let Some(source) = root_storage.get(id) else {
+            return Ok(false);
+        };
+        let stages = root.reduce_stages.lock().unwrap();
+        let Some(stage) = stages.get(id) else {
+            return Ok(false);
+        };
+        let mut storage = self.storage.lock().unwrap();
+        let Some(destination) = storage.get_mut(id) else {
+            return Ok(false);
+        };
+        if source.is_compact() || destination.is_compact() || source.len() != destination.len() {
+            return Ok(false);
+        }
+        root.kernels.stage_out(&source.slice, stage)?;
+        self.kernels.follow(&root.kernels)?;
+        self.kernels.stage_in(stage, &mut destination.slice)?;
+        Ok(true)
     }
 
     /// Lets this GPU read other GPUs' memory directly in reductions and
