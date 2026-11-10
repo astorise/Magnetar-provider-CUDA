@@ -1859,6 +1859,10 @@ fn moe_decode_kernel_times() {
         ("shared expert down [1, 5632] x [5632, 2048]", 5632, hidden),
         ("router [1, 2048] x [2048, 60]", hidden, experts),
         ("output head [1, 2048] x [2048, 151936]", hidden, 151_936),
+        ("Mistral 7B q/o [1, 4096] x [4096, 4096]", 4096, 4096),
+        ("Mistral 7B k/v [1, 4096] x [4096, 1024]", 4096, 1024),
+        ("Mistral 7B gate/up [1, 4096] x [4096, 14336]", 4096, 14_336),
+        ("Mistral 7B down [1, 14336] x [14336, 4096]", 14_336, 4096),
     ] {
         let a = upload(&kernels, &activations(1, k, 66));
         let b = kernels

@@ -224,15 +224,25 @@ extern "C" __global__ void q8_matmul_rows_kernel(
     for (int r = 0; r < Q8_MATMUL_ROWS; r++) {
         acc[r] = 0.0f;
     }
-    // Each step covers 512 quants: sixteen blocks, two lanes per block.
+    // Each step covers 1024 quants in two halves of 512 (sixteen blocks,
+    // two lanes per block), both halves' loads issued before either is
+    // used: twice the weight bytes in flight per warp.
     for (unsigned long long i = (unsigned long long)lane * Q8_LANE_QUANTS; i < k;
-         i += Q8_WARP_QUANTS) {
+         i += 2 * Q8_WARP_QUANTS) {
+        unsigned long long j = i + Q8_WARP_QUANTS;
+        bool second = j < k;
         int4 q = *reinterpret_cast<const int4*>(w + i);
+        int4 q2 = second ? *reinterpret_cast<const int4*>(w + j) : make_int4(0, 0, 0, 0);
         float d = w_scales[i >> 5];
+        float d2 = second ? w_scales[j >> 5] : 0.0f;
 #pragma unroll
         for (int r = 0; r < Q8_MATMUL_ROWS; r++) {
             if (r < (int)rows) {
-                acc[r] += d * q8_dot16(q, a + (first_row + r) * k + i);
+                const float* x = a + (first_row + r) * k;
+                acc[r] += d * q8_dot16(q, x + i);
+                if (second) {
+                    acc[r] += d2 * q8_dot16(q2, x + j);
+                }
             }
         }
     }
@@ -290,17 +300,27 @@ extern "C" __global__ void q8_gated_matmul_rows_kernel(
         up_acc[r] = 0.0f;
     }
     for (unsigned long long i = (unsigned long long)lane * Q8_LANE_QUANTS; i < k;
-         i += Q8_WARP_QUANTS) {
+         i += 2 * Q8_WARP_QUANTS) {
+        unsigned long long j = i + Q8_WARP_QUANTS;
+        bool second = j < k;
         int4 qg = *reinterpret_cast<const int4*>(wg + i);
         int4 qu = *reinterpret_cast<const int4*>(wu + i);
+        int4 qg2 = second ? *reinterpret_cast<const int4*>(wg + j) : make_int4(0, 0, 0, 0);
+        int4 qu2 = second ? *reinterpret_cast<const int4*>(wu + j) : make_int4(0, 0, 0, 0);
         float dg = g_scales[i >> 5];
         float du = u_scales[i >> 5];
+        float dg2 = second ? g_scales[j >> 5] : 0.0f;
+        float du2 = second ? u_scales[j >> 5] : 0.0f;
 #pragma unroll
         for (int r = 0; r < Q8_MATMUL_ROWS; r++) {
             if (r < (int)rows) {
-                const float* x = a + (first_row + r) * k + i;
-                gate_acc[r] += dg * q8_dot16(qg, x);
-                up_acc[r] += du * q8_dot16(qu, x);
+                const float* x = a + (first_row + r) * k;
+                gate_acc[r] += dg * q8_dot16(qg, x + i);
+                up_acc[r] += du * q8_dot16(qu, x + i);
+                if (second) {
+                    gate_acc[r] += dg2 * q8_dot16(qg2, x + j);
+                    up_acc[r] += du2 * q8_dot16(qu2, x + j);
+                }
             }
         }
     }
