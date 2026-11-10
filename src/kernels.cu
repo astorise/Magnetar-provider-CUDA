@@ -302,7 +302,10 @@ extern "C" __global__ void q8_gated_matmul_rows_kernel(
     }
 }
 
-// `execute-and-cache-moe-experts` F02. One thread per token row: softmax
+// The most routed experts `moe_route_kernel` handles: 32 lanes of 8.
+#define MOE_ROUTE_EXPERTS_PER_LANE 8
+
+// `execute-and-cache-moe-experts` F02. One warp per token row: softmax
 // of its `experts` router logits in f32, the `top_k` largest probabilities
 // (ties to the lower expert), divided by their sum when `normalize` --
 // `magnetar_runtime::reference_cpu::moe_route`'s order of operations.
@@ -323,45 +326,72 @@ extern "C" __global__ void moe_route_kernel(
     unsigned long long expert_first,
     unsigned long long expert_count
 ) {
-    unsigned long long t = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    // One warp per token row: lane l owns experts l, l + 32, ... (at most
+    // MOE_ROUTE_EXPERTS_PER_LANE of them).
+    unsigned long long t = (unsigned long long)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    unsigned int lane = threadIdx.x % 32;
     if (t >= tokens) {
         return;
     }
     const float* row = logits + t * experts;
-    float max_logit = row[0];
-    for (unsigned long long e = 1; e < experts; e++) {
+    float max_logit = -__int_as_float(0x7f800000);
+    for (unsigned long long e = lane; e < experts; e += 32) {
         max_logit = fmaxf(max_logit, row[e]);
     }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        max_logit = fmaxf(max_logit, __shfl_xor_sync(0xffffffffu, max_logit, offset));
+    }
+    float p[MOE_ROUTE_EXPERTS_PER_LANE];
     float sum = 0.0f;
-    for (unsigned long long e = 0; e < experts; e++) {
-        sum += expf(row[e] - max_logit);
+#pragma unroll
+    for (int j = 0; j < MOE_ROUTE_EXPERTS_PER_LANE; j++) {
+        unsigned long long e = lane + 32ull * j;
+        p[j] = e < experts ? expf(row[e] - max_logit) : -1.0f;
+        if (e < experts) {
+            sum += p[j];
+        }
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_xor_sync(0xffffffffu, sum, offset);
     }
     float chosen_total = 0.0f;
-    float previous = __int_as_float(0x7f800000);
-    long long previous_expert = -1;
     for (unsigned long long k = 0; k < top_k; k++) {
-        // The next expert after (previous, previous_expert) in descending
-        // probability, ties by ascending index.
-        long long best = -1;
+        // This lane's best remaining expert (ties to the lower index), then
+        // the warp's.
         float best_p = -1.0f;
-        for (unsigned long long e = 0; e < experts; e++) {
-            float p = expf(row[e] - max_logit);
-            bool after_previous = p < previous || (p == previous && (long long)e > previous_expert);
-            if (after_previous && (best < 0 || p > best_p)) {
-                best = (long long)e;
-                best_p = p;
+        long long best = -1;
+#pragma unroll
+        for (int j = 0; j < MOE_ROUTE_EXPERTS_PER_LANE; j++) {
+            if (p[j] > best_p) {
+                best_p = p[j];
+                best = (long long)(lane + 32ull * j);
             }
         }
-        unsigned long long chosen = (unsigned long long)best;
-        indices[t * top_k + k] = chosen >= expert_first && chosen - expert_first < expert_count
-            ? (int)(chosen - expert_first)
-            : -1;
-        weights[t * top_k + k] = best_p / sum;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            float other_p = __shfl_xor_sync(0xffffffffu, best_p, offset);
+            long long other = __shfl_xor_sync(0xffffffffu, best, offset);
+            if (other_p > best_p || (other_p == best_p && other >= 0 && (best < 0 || other < best))) {
+                best_p = other_p;
+                best = other;
+            }
+        }
+        // The owning lane retires the chosen expert.
+        if (best >= 0 && (unsigned long long)best % 32 == lane) {
+            p[(unsigned long long)best / 32] = -1.0f;
+        }
+        if (lane == 0) {
+            unsigned long long chosen = (unsigned long long)best;
+            indices[t * top_k + k] = chosen >= expert_first && chosen - expert_first < expert_count
+                ? (int)(chosen - expert_first)
+                : -1;
+            weights[t * top_k + k] = best_p / sum;
+        }
         chosen_total += best_p / sum;
-        previous = best_p;
-        previous_expert = best;
     }
-    if (normalize) {
+    if (normalize && lane == 0) {
         for (unsigned long long k = 0; k < top_k; k++) {
             weights[t * top_k + k] /= chosen_total;
         }
@@ -419,6 +449,9 @@ extern "C" __global__ void moe_q8_gated_kernel(
     }
 }
 
+// Chosen experts `moe_q8_down_kernel` reads at once.
+#define MOE_DOWN_EXPERTS 4
+
 // out[t, c] = sum_k weights[tk] * (act[tk] . down_e[:, c]) with the stacked
 // down projections packed `Q8_0` in transposed storage: expert e's column c
 // is stored row e * hidden + c, `inter` quants long. One warp per (t, c);
@@ -439,27 +472,47 @@ extern "C" __global__ void moe_q8_down_kernel(
     if (c >= hidden) {
         return;
     }
+    // Up to MOE_DOWN_EXPERTS chosen experts read at once (their loads in
+    // flight together); each expert's sum, and the experts' total, in the
+    // same order as one at a time.
     float total = 0.0f;
-    for (unsigned long long k = 0; k < top_k; k++) {
-        unsigned long long tk = t * top_k + k;
-        if (indices[tk] < 0) {
-            continue;
+    for (unsigned long long k0 = 0; k0 < top_k; k0 += MOE_DOWN_EXPERTS) {
+        const signed char* w[MOE_DOWN_EXPERTS];
+        const float* scales[MOE_DOWN_EXPERTS];
+        const float* a[MOE_DOWN_EXPERTS];
+        float sum[MOE_DOWN_EXPERTS];
+        bool held[MOE_DOWN_EXPERTS];
+#pragma unroll
+        for (int k = 0; k < MOE_DOWN_EXPERTS; k++) {
+            unsigned long long tk = t * top_k + k0 + k;
+            held[k] = k0 + k < top_k && indices[tk] >= 0;
+            unsigned long long row = held[k] ? (unsigned long long)indices[tk] * hidden + c : 0;
+            w[k] = down_quants + row * inter;
+            scales[k] = down_scales + row * (inter >> 5);
+            a[k] = act + (held[k] ? tk : 0) * inter;
+            sum[k] = 0.0f;
         }
-        unsigned long long row = (unsigned long long)indices[tk] * hidden + c;
-        const signed char* w = down_quants + row * inter;
-        const float* scales = down_scales + row * (inter >> 5);
-        const float* a = act + tk * inter;
-        float sum = 0.0f;
         for (unsigned long long i = (unsigned long long)threadIdx.x * Q8_LANE_QUANTS; i < inter;
              i += Q8_WARP_QUANTS) {
-            int4 q = *reinterpret_cast<const int4*>(w + i);
-            sum += scales[i >> 5] * q8_dot16(q, a + i);
+#pragma unroll
+            for (int k = 0; k < MOE_DOWN_EXPERTS; k++) {
+                if (held[k]) {
+                    int4 q = *reinterpret_cast<const int4*>(w[k] + i);
+                    sum[k] += scales[k][i >> 5] * q8_dot16(q, a[k] + i);
+                }
+            }
         }
 #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            sum += __shfl_xor_sync(0xffffffffu, sum, offset);
+        for (int k = 0; k < MOE_DOWN_EXPERTS; k++) {
+            float value = sum[k];
+#pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                value += __shfl_xor_sync(0xffffffffu, value, offset);
+            }
+            if (held[k]) {
+                total += weights[t * top_k + k0 + k] * value;
+            }
         }
-        total += weights[tk] * sum;
     }
     if (threadIdx.x == 0) {
         out[t * hidden + c] = total;

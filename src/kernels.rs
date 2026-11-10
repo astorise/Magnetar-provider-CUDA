@@ -1472,6 +1472,10 @@ impl CudaKernels {
         })
     }
 
+    /// The most routed experts `moe_route_kernel` handles (`kernels.cu`'s
+    /// `MOE_ROUTE_EXPERTS_PER_LANE` lanes of 32).
+    const MOE_ROUTE_MAX_EXPERTS: u64 = 8 * 32;
+
     /// The `moe-experts` Operator (`execute-and-cache-moe-experts` F02):
     /// `magnetar_runtime::reference_cpu::moe_experts`' semantics. Routing
     /// stays on the Device. Packed `Q8_0` experts (transposed storage,
@@ -1498,6 +1502,7 @@ impl CudaKernels {
             || expert_first
                 .checked_add(local_experts)
                 .is_none_or(|end| end > experts)
+            || experts > Self::MOE_ROUTE_MAX_EXPERTS
         {
             return Err(shape_error(format!(
                 "moe-experts routes top {top_k} of {} experts over [{logit_rows}, {experts}] \
@@ -1564,7 +1569,13 @@ impl CudaKernels {
             .arg(&normalize)
             .arg(&expert_first)
             .arg(&local_experts);
-        unsafe { args.launch(LaunchConfig::for_num_elems(tokens as u32)) }?;
+        // One warp per token, four tokens per block.
+        let route_config = LaunchConfig {
+            grid_dim: (tokens.div_ceil(4) as u32, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { args.launch(route_config) }?;
 
         fn packed(buffer: &CudaDeviceBuffer, stored_cols: u64) -> Option<&CudaQ8Weight> {
             buffer
