@@ -138,6 +138,8 @@ enum CapturedOp {
         from: usize,
         to: usize,
     },
+    /// Tensor parallelism: every member's partial `id` summed, in place.
+    Reduce { id: TensorResourceId },
 }
 
 /// The step capture in progress: the operations so far and the member
@@ -146,6 +148,8 @@ struct Recording {
     request: StepCaptureRequest,
     ops: Vec<CapturedOp>,
     open: Option<usize>,
+    /// Tensor parallelism: every member's own capture is open.
+    all_open: bool,
 }
 
 #[derive(Default)]
@@ -828,11 +832,6 @@ impl ProviderExecutionApi for CudaMultiExecutor {
     /// On by default; `MAGNETAR_CUDA_MULTI_CAPTURE=0` is the disable
     /// control (every step spanning GPUs then runs uncaptured).
     fn supports_step_capture(&self) -> bool {
-        // Tensor-parallel steps reduce across GPUs with host-side waits,
-        // which a capture cannot hold yet.
-        if self.tensor_parallel_active() {
-            return false;
-        }
         std::env::var("MAGNETAR_CUDA_MULTI_CAPTURE").as_deref() != Ok("0")
     }
 
@@ -855,6 +854,7 @@ impl ProviderExecutionApi for CudaMultiExecutor {
             request: request.clone(),
             ops: Vec::new(),
             open: None,
+            all_open: false,
         });
         Ok(())
     }
@@ -876,6 +876,10 @@ impl ProviderExecutionApi for CudaMultiExecutor {
                 }
             }
         }
+        if let Err(error) = self.close_member_captures(&mut recording) {
+            self.release_ops(&recording.ops);
+            return Err(error);
+        }
         let id = StepCaptureId::new(format!(
             "{}:multi-capture:{}",
             self.provider_name, capture.next
@@ -890,6 +894,11 @@ impl ProviderExecutionApi for CudaMultiExecutor {
         if let Some(recording) = capture.recording.take() {
             if let Some(open) = recording.open {
                 self.members[open].abort_step_capture();
+            }
+            if recording.all_open {
+                for member in &self.members {
+                    member.abort_step_capture();
+                }
             }
             self.release_ops(&recording.ops);
         }
@@ -911,6 +920,9 @@ impl ProviderExecutionApi for CudaMultiExecutor {
             .ok_or_else(|| StepReplayError::Invalidated {
                 reason: format!("no step capture '{id}'"),
             })?;
+        if self.tensor_parallel_active() {
+            return self.replay_tensor_parallel(ops, offset, inputs);
+        }
         let mut pending: Vec<(Option<usize>, TensorResourceId, HostTensor)> = {
             let residency = self.residency.lock().unwrap();
             inputs
@@ -948,6 +960,11 @@ impl ProviderExecutionApi for CudaMultiExecutor {
                             ),
                         });
                     }
+                }
+                CapturedOp::Reduce { .. } => {
+                    return Err(StepReplayError::Invalidated {
+                        reason: "a tensor-parallel capture outlived its plan".into(),
+                    });
                 }
             }
         }

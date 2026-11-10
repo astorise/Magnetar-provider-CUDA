@@ -35,7 +35,9 @@ use magnetar_runtime::scheduler::{
 };
 use magnetar_runtime::tensor_parallel::{TensorParallelPlan, WeightShard};
 
-use super::CudaMultiExecutor;
+use magnetar_runtime::provider::StepReplayError;
+
+use super::{CapturedOp, CudaMultiExecutor, Recording};
 
 /// The plan in force, and what it split so far.
 pub(super) struct TensorParallel {
@@ -403,6 +405,7 @@ impl CudaMultiExecutor {
                 .collect();
             (role, locals)
         };
+        self.open_member_captures()?;
         let mut first = None;
         let mut failed = None;
         for (member, local) in locals.iter().enumerate() {
@@ -425,8 +428,16 @@ impl CudaMultiExecutor {
         }
         if result.status == KernelResultStatus::Succeeded {
             if role == OutputRole::Partial {
+                // A captured step ends each member's graph here and records
+                // the reduction between them.
+                self.close_open_member_captures()?;
                 for output in &invocation.outputs {
                     self.all_reduce(&output.resource.id)?;
+                    if let Some(recording) = self.capture.lock().unwrap().recording.as_mut() {
+                        recording.ops.push(CapturedOp::Reduce {
+                            id: output.resource.id.clone(),
+                        });
+                    }
                 }
             }
             let mut tp = self.tensor_parallel.lock().unwrap();
@@ -455,9 +466,94 @@ impl CudaMultiExecutor {
         Ok(ProviderExecutionHandle { id, ..handle })
     }
 
+    /// While capturing, opens every member's own capture if they are closed.
+    fn open_member_captures(&self) -> Result<(), ProviderExecutionError> {
+        let mut capture = self.capture.lock().unwrap();
+        let Some(recording) = capture.recording.as_mut() else {
+            return Ok(());
+        };
+        if recording.all_open {
+            return Ok(());
+        }
+        for (index, member) in self.members.iter().enumerate() {
+            if let Err(error) = member.begin_step_capture(&recording.request) {
+                for opened in &self.members[..index] {
+                    opened.abort_step_capture();
+                }
+                return Err(error);
+            }
+        }
+        recording.all_open = true;
+        Ok(())
+    }
+
+    fn close_open_member_captures(&self) -> Result<(), ProviderExecutionError> {
+        let mut capture = self.capture.lock().unwrap();
+        match capture.recording.as_mut() {
+            Some(recording) => self.close_member_captures(recording),
+            None => Ok(()),
+        }
+    }
+
+    /// Ends every member's open capture, in member order, recording each
+    /// graph (each runs once as it ends).
+    pub(super) fn close_member_captures(
+        &self,
+        recording: &mut Recording,
+    ) -> Result<(), ProviderExecutionError> {
+        if !std::mem::take(&mut recording.all_open) {
+            return Ok(());
+        }
+        let mut first_error = None;
+        for (member, executor) in self.members.iter().enumerate() {
+            if first_error.is_some() {
+                executor.abort_step_capture();
+                continue;
+            }
+            match executor.end_step_capture() {
+                Ok(id) => recording.ops.push(CapturedOp::Graph { member, id }),
+                Err(error) => first_error = Some(error),
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Replays a tensor-parallel capture: each member's graphs and the
+    /// reductions between them, in order. Every input is replicated, so
+    /// each member's first graph receives all of them.
+    pub(super) fn replay_tensor_parallel(
+        &self,
+        ops: &[CapturedOp],
+        offset: u64,
+        inputs: Vec<(TensorResourceId, HostTensor)>,
+    ) -> Result<(), StepReplayError> {
+        let mut pending: Vec<Option<Vec<(TensorResourceId, HostTensor)>>> =
+            vec![Some(inputs); self.members.len()];
+        for op in ops {
+            match op {
+                CapturedOp::Graph { member, id } => {
+                    let mine = pending[*member].take().unwrap_or_default();
+                    self.members[*member].replay_step(id, offset, mine)?;
+                }
+                CapturedOp::Reduce { id } => {
+                    self.all_reduce(id).map_err(StepReplayError::Failed)?;
+                }
+                CapturedOp::Copy { .. } => {
+                    return Err(StepReplayError::Invalidated {
+                        reason: "a layer-segment capture outlived its placement".into(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Sums every member's `id` into the first member's, then copies the
-    /// sum back to the others, in place.
-    fn all_reduce(&self, id: &TensorResourceId) -> Result<(), ProviderExecutionError> {
+    /// sum back to the others, in place. Ordered on the devices only: a
+    /// copy between GPUs waits on its source's stream, and the first
+    /// member waits for the copies back before it may overwrite `id`; the
+    /// host never blocks.
+    pub(super) fn all_reduce(&self, id: &TensorResourceId) -> Result<(), ProviderExecutionError> {
         let failed = |detail: String| {
             self.error(
                 ProviderExecutionPhase::Submit,
@@ -469,14 +565,9 @@ impl CudaMultiExecutor {
             .split_first()
             .expect("a Provider has at least one member");
         for member in others {
-            member
-                .synchronize()
-                .map_err(|error| failed(error.to_string()))?;
             root.accumulate_from_peer(member, id)
                 .map_err(|error| failed(error.to_string()))?;
         }
-        root.synchronize()
-            .map_err(|error| failed(error.to_string()))?;
         for member in others {
             if !member
                 .copy_from_peer_in_place(root, id)
@@ -484,6 +575,10 @@ impl CudaMultiExecutor {
             {
                 return Err(failed("a member lost its buffer for it".into()));
             }
+        }
+        for member in others {
+            root.wait_for_peer(member)
+                .map_err(|error| failed(error.to_string()))?;
         }
         Ok(())
     }

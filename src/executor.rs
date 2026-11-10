@@ -674,6 +674,13 @@ impl CudaExecutor {
         Ok(())
     }
 
+    /// Makes this executor's stream wait, on the device, for everything
+    /// queued on `peer`'s stream so far, without blocking the host.
+    pub fn wait_for_peer(&self, peer: &CudaExecutor) -> Result<(), CudaError> {
+        self.kernels.stream().join(peer.kernels.stream())?;
+        Ok(())
+    }
+
     /// This executor's stream capture status, for diagnostics.
     pub fn capture_status(&self) -> String {
         match self.kernels.stream().capture_status() {
