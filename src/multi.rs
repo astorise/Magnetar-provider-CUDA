@@ -546,7 +546,12 @@ impl ProviderExecutionApi for CudaMultiExecutor {
                 "a layer placement is already in force",
             ));
         }
-        self.take_tensor_parallel_plan(plan)
+        self.take_tensor_parallel_plan(plan)?;
+        // Every member's capture is open at once, from this one thread.
+        for member in &self.members {
+            member.set_concurrent_capture(true);
+        }
+        Ok(())
     }
 
     fn write_tensor(

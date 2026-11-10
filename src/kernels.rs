@@ -356,6 +356,14 @@ pub struct CudaKernels {
     /// The step capture in progress on this stream, if any
     /// (`capture-and-replay-cuda-graphs`).
     capture: std::sync::Mutex<Option<KernelCapture>>,
+    /// The replay offset of the next capture, allocated ahead by
+    /// [`Self::prepare_capture`].
+    prepared_offset: std::sync::Mutex<Option<CudaSlice<u64>>>,
+    /// Whether captures leave the thread unrestricted
+    /// (`CU_STREAM_CAPTURE_MODE_RELAXED`): set when several GPUs' streams
+    /// are captured from one thread at once, where a thread-local capture
+    /// on one would forbid the others' setup, instantiation and launch.
+    relaxed_capture: std::sync::atomic::AtomicBool,
     /// The embedding lookup's invalid-id flag, allocated once.
     embedding_flag: std::sync::Mutex<Option<CudaSlice<i32>>>,
     /// The split-key attention's per-chunk partials: the current buffer,
@@ -497,11 +505,34 @@ impl CudaKernels {
             functions: std::sync::Mutex::new(std::collections::HashMap::new()),
             offered_output: std::sync::Mutex::new(None),
             capture: std::sync::Mutex::new(None),
+            prepared_offset: std::sync::Mutex::new(None),
+            relaxed_capture: std::sync::atomic::AtomicBool::new(false),
             embedding_flag: std::sync::Mutex::new(None),
             attention_scratch: std::sync::Mutex::new((None, Vec::new())),
             split_scratch: std::sync::Mutex::new((None, Vec::new())),
             moe_scratch: std::sync::Mutex::new((None, Vec::new())),
         })
+    }
+
+    /// See `relaxed_capture`.
+    pub fn set_relaxed_capture(&self, relaxed: bool) {
+        self.relaxed_capture
+            .store(relaxed, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Allocates what the next [`Self::begin_capture`] needs, so that it
+    /// allocates nothing: with several GPUs' streams captured from one
+    /// thread, nothing may allocate once the first capture has begun.
+    pub fn prepare_capture(&self) -> Result<(), CudaError> {
+        let mut prepared = self.prepared_offset.lock().unwrap();
+        if prepared.is_none() {
+            *prepared = Some(self.stream.alloc_zeros::<u64>(1)?);
+        }
+        let mut flag_slot = self.embedding_flag.lock().unwrap();
+        if flag_slot.is_none() {
+            *flag_slot = Some(self.stream.alloc_zeros::<i32>(1)?);
+        }
+        Ok(())
     }
 
     /// Starts capturing this stream's work into a CUDA graph. Every later
@@ -517,14 +548,26 @@ impl CudaKernels {
         }
         // Allocated before the capture starts: nothing allocates while
         // capturing.
-        let offset = self.stream.alloc_zeros::<u64>(1)?;
+        let prepared = self.prepared_offset.lock().unwrap().take();
+        // Zeroed when allocated; each launch writes it anyway.
+        let offset = match prepared {
+            Some(offset) => offset,
+            None => self.stream.alloc_zeros::<u64>(1)?,
+        };
         let mut flag_slot = self.embedding_flag.lock().unwrap();
         let flag = match flag_slot.as_mut() {
             Some(flag) => flag,
             None => flag_slot.insert(self.stream.alloc_zeros::<i32>(1)?),
         };
-        self.stream
-            .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+        let mode = if self
+            .relaxed_capture
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED
+        } else {
+            sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL
+        };
+        self.stream.begin_capture(mode)?;
         // The captured step's first work: one reset of the invalid-id flag,
         // which its embedding lookups then only ever set.
         if let Err(error) = self.stream.memset_zeros(flag) {

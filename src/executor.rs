@@ -157,6 +157,21 @@ impl CudaExecutor {
         )
     }
 
+    /// Captures this executor's steps without restricting the rest of the
+    /// thread, for a caller capturing several GPUs from one thread.
+    pub fn set_concurrent_capture(&self, concurrent: bool) {
+        self.kernels.set_relaxed_capture(concurrent);
+    }
+
+    /// Allocates ahead what [`Self::begin_step_capture`] needs: a caller
+    /// opening several GPUs' captures from one thread prepares every one of
+    /// them before beginning any.
+    pub fn prepare_step_capture(&self) -> Result<(), ProviderExecutionError> {
+        self.kernels.prepare_capture().map_err(|error| {
+            self.step_capture_error(ProviderExecutionPhase::Submit, error.to_string())
+        })
+    }
+
     /// See [`ProviderExecutionApi::begin_step_capture`]: the invocations up
     /// to [`Self::end_step_capture`] are captured into a CUDA graph instead
     /// of running.

@@ -475,6 +475,10 @@ impl CudaMultiExecutor {
         if recording.all_open {
             return Ok(());
         }
+        // Nothing may allocate once the first member's capture has begun.
+        for member in &self.members {
+            member.prepare_step_capture()?;
+        }
         for (index, member) in self.members.iter().enumerate() {
             if let Err(error) = member.begin_step_capture(&recording.request) {
                 for opened in &self.members[..index] {
