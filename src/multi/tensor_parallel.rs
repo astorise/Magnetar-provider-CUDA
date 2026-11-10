@@ -286,6 +286,10 @@ impl TensorParallel {
     }
 }
 
+fn capture_trace() -> bool {
+    std::env::var("MAGNETAR_STEP_CAPTURE_TRACE").as_deref() == Ok("1")
+}
+
 /// The alignment of shares along a dimension of `extent`: a `Q8_0` block
 /// when every part can hold at least one, else single elements. A function
 /// of the extent alone, so the same dimension splits the same way in every
@@ -453,6 +457,20 @@ impl CudaMultiExecutor {
             let handle =
                 self.members[member].submit_kernel(advertisement, operator, local, memory)?;
             let result = self.members[member].complete_kernel(&handle)?;
+            // `MAGNETAR_STEP_CAPTURE_TRACE=1`: name the first invocation
+            // after which a member's capture is no longer active.
+            if capture_trace() && self.capture.lock().unwrap().recording.is_some() {
+                let status = self.members[member].capture_status();
+                if !status.contains("ACTIVE") {
+                    return Err(self.error(
+                        ProviderExecutionPhase::Submit,
+                        format!(
+                            "GPU {member}'s capture is {status} after '{}' ({}, {:?})",
+                            invocation.id, invocation.kernel.name, result.status
+                        ),
+                    ));
+                }
+            }
             let succeeded = result.status == KernelResultStatus::Succeeded;
             if member == 0 {
                 first = Some((handle, result));
