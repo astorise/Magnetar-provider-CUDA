@@ -315,6 +315,16 @@ const Q8_MATMUL_MAX_ROWS: u64 = 64;
 /// `q6k_matmul_rows_kernel` (`Q6K_COLS`).
 const Q4K_MATMUL_COLS: u64 = 2;
 const Q6K_MATMUL_COLS: u64 = 2;
+/// `LOWK_COLS` in `kernels.cu`.
+const LOW_BIT_MATMUL_COLS: u64 = 2;
+
+/// `LOWK_Q2K` / `LOWK_Q3K` in `kernels.cu`.
+fn low_bit_format(format: PackedWeightFormat) -> i32 {
+    match format {
+        PackedWeightFormat::Q2K => 0,
+        _ => 1,
+    }
+}
 /// `Q8_MATMUL_ROWS` / `Q8_MATMUL_WARPS` in `kernels.cu`.
 const Q8_MATMUL_ROWS: u64 = 8;
 const Q8_MATMUL_WARPS: u32 = 4;
@@ -1334,6 +1344,12 @@ impl CudaKernels {
         weight: &PackedWeight,
     ) -> Result<CudaDeviceBuffer, CudaError> {
         self.forbid_in_capture("a host-to-device upload")?;
+        if matches!(
+            weight.format(),
+            PackedWeightFormat::Q2K | PackedWeightFormat::Q3K
+        ) {
+            return self.upload_low_bit_weight(weight);
+        }
         if weight.format() == PackedWeightFormat::Q6K {
             // Each super-block without its trailing f16 `d` (208 bytes,
             // so every one stays 16-byte aligned), `d` as an f32 apart.
@@ -1414,6 +1430,53 @@ impl CudaKernels {
         })
     }
 
+    /// Stores a `Q2_K` or `Q3_K` weight in the layout
+    /// `lowk_matmul_rows_int8_kernel` reads: `Q2_K` super-blocks without
+    /// their `d` and `dmin` (80 bytes), those two as f32 apart; `Q3_K`
+    /// super-blocks as their mask and quants with the sixteen scales
+    /// unpacked to signed bytes (112 bytes), `d` as an f32 apart. Every
+    /// super-block stays 16-byte aligned.
+    fn upload_low_bit_weight(&self, weight: &PackedWeight) -> Result<CudaDeviceBuffer, CudaError> {
+        let format = weight.format();
+        let block_bytes = format.block_bytes() as usize;
+        let blocks = weight.bytes().chunks_exact(block_bytes);
+        let mut quants = Vec::with_capacity(blocks.len() * 112);
+        let mut scales = Vec::with_capacity(blocks.len() * 2);
+        let half = |lo: u8, hi: u8| half_precision::f16_to_f32(u16::from_le_bytes([lo, hi]));
+        for block in blocks {
+            if format == PackedWeightFormat::Q2K {
+                quants.extend(block[..80].iter().map(|&byte| byte as i8));
+                scales.push(half(block[80], block[81]));
+                scales.push(half(block[82], block[83]));
+            } else {
+                quants.extend(block[..96].iter().map(|&byte| byte as i8));
+                quants.extend(
+                    magnetar_runtime::model_loading::q3_k_scales(&block[96..108])
+                        .iter()
+                        .map(|&scale| scale - 32),
+                );
+                scales.push(half(block[108], block[109]));
+            }
+        }
+        let quants = self.stream.clone_htod(&quants)?;
+        let scales = self.stream.clone_htod(&scales)?;
+        let slice = self.stream.alloc_zeros::<f32>(1)?;
+        self.upload_count.fetch_add(1, Ordering::Relaxed);
+        Ok(CudaDeviceBuffer {
+            slice,
+            shape: weight.logical_shape().to_vec(),
+            bf16: None,
+            q8: Some(CudaQ8Weight {
+                quants,
+                scales,
+                format,
+                stored_rows: weight.stored_rows(),
+                stored_cols: weight.stored_cols(),
+                transposed: weight.transposed(),
+            }),
+        })
+    }
+
     /// A packed `Q8_0` buffer's logical matrix as f32, dequantized on the
     /// Device.
     pub fn dequantize_q8(&self, buffer: &CudaDeviceBuffer) -> Result<CudaDeviceBuffer, CudaError> {
@@ -1428,6 +1491,19 @@ impl CudaKernels {
                 let func = self.function("q8_dequantize_kernel")?;
                 let mut args = self.stream.launch_builder(&func);
                 args.arg(&q8.quants)
+                    .arg(&q8.scales)
+                    .arg(&mut out)
+                    .arg(&q8.stored_rows)
+                    .arg(&q8.stored_cols)
+                    .arg(&transposed);
+                unsafe { args.launch(LaunchConfig::for_num_elems(elements as u32)) }?;
+            }
+            PackedWeightFormat::Q2K | PackedWeightFormat::Q3K => {
+                let func = self.function("lowk_dequantize_kernel")?;
+                let format = low_bit_format(q8.format);
+                let mut args = self.stream.launch_builder(&func);
+                args.arg(&format)
+                    .arg(&q8.quants)
                     .arg(&q8.scales)
                     .arg(&mut out)
                     .arg(&q8.stored_rows)
@@ -2725,6 +2801,55 @@ impl CudaKernels {
             Self::require_f32(&[a], "gated-matmul's input")?;
             return self.q8_gated_matmul_rows(a, gate_q8, up_q8, m, k, b_cols);
         }
+        if let (Some(gate_low), Some(up_low)) = (&gate.q8, &up.q8)
+            && matches!(
+                gate_low.format,
+                PackedWeightFormat::Q2K | PackedWeightFormat::Q3K
+            )
+            && up_low.format == gate_low.format
+            && gate_low.transposed
+            && up_low.transposed
+            && !transpose_a
+            && !transpose_b
+            && m <= Q8_MATMUL_MAX_ROWS
+            && k == b_rows
+        {
+            Self::require_f32(&[a], "gated-matmul's input")?;
+            let int8 = self.quantize_activations(a, m, k)?;
+            if let Some(scratch) = int8.as_ref().and_then(|guard| guard.as_ref()) {
+                let mut out_dev = self.alloc_output((m * b_cols) as usize)?;
+                let format = low_bit_format(gate_low.format);
+                let func = self.function("lowk_gated_matmul_rows_int8_kernel")?;
+                let mut args = self.stream.launch_builder(&func);
+                args.arg(&format)
+                    .arg(&scratch.values)
+                    .arg(&scratch.scales)
+                    .arg(&gate_low.quants)
+                    .arg(&gate_low.scales)
+                    .arg(&up_low.quants)
+                    .arg(&up_low.scales)
+                    .arg(&mut out_dev)
+                    .arg(&m)
+                    .arg(&k)
+                    .arg(&b_cols);
+                let config = LaunchConfig {
+                    grid_dim: (
+                        b_cols.div_ceil(u64::from(Q8_MATMUL_WARPS)) as u32,
+                        m.div_ceil(Q8_MATMUL_ROWS) as u32,
+                        1,
+                    ),
+                    block_dim: (32, Q8_MATMUL_WARPS, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe { args.launch(config) }?;
+                return Ok(CudaDeviceBuffer {
+                    slice: out_dev,
+                    shape: vec![m, b_cols],
+                    bf16: None,
+                    q8: None,
+                });
+            }
+        }
         if let (Some(gate_q4k), Some(up_q4k)) = (&gate.q8, &up.q8)
             && gate_q4k.format == PackedWeightFormat::Q4K
             && up_q4k.format == PackedWeightFormat::Q4K
@@ -3003,6 +3128,59 @@ impl CudaKernels {
         })
     }
 
+    /// `lowk_matmul_rows_int8_kernel` for a `Q2_K`/`Q3_K` weight, when the
+    /// activations can be quantized to int8; `None` otherwise.
+    fn low_bit_matmul_rows(
+        &self,
+        a: &CudaDeviceBuffer,
+        weight: &CudaQ8Weight,
+        m: u64,
+        k: u64,
+        n: u64,
+        addend: Option<MatmulAddend<'_>>,
+    ) -> Result<Option<CudaDeviceBuffer>, CudaError> {
+        let int8 = self.quantize_activations(a, m, k)?;
+        let Some(scratch) = int8.as_ref().and_then(|guard| guard.as_ref()) else {
+            return Ok(None);
+        };
+        let mut out_dev = self.alloc_output((m * n) as usize)?;
+        let (addend_buffer, addend_mode) = match addend {
+            None => (a, 0i32),
+            Some(MatmulAddend::Row(bias)) => (bias, 1),
+            Some(MatmulAddend::Full(residual)) => (residual, 2),
+        };
+        let format = low_bit_format(weight.format);
+        let func = self.function("lowk_matmul_rows_int8_kernel")?;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(&format)
+            .arg(&scratch.values)
+            .arg(&scratch.scales)
+            .arg(&weight.quants)
+            .arg(&weight.scales)
+            .arg(&mut out_dev)
+            .arg(&m)
+            .arg(&k)
+            .arg(&n)
+            .arg(&addend_buffer.slice)
+            .arg(&addend_mode);
+        let config = LaunchConfig {
+            grid_dim: (
+                n.div_ceil(u64::from(Q8_MATMUL_WARPS) * LOW_BIT_MATMUL_COLS) as u32,
+                m.div_ceil(Q8_MATMUL_ROWS) as u32,
+                1,
+            ),
+            block_dim: (32, Q8_MATMUL_WARPS, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { args.launch(config) }?;
+        Ok(Some(CudaDeviceBuffer {
+            slice: out_dev,
+            shape: vec![m, n],
+            bf16: None,
+            q8: None,
+        }))
+    }
+
     /// `q6k_matmul_rows_kernel`: `a` (`m` contiguous rows of `k`) times the
     /// packed `Q6_K`, transposed-storage weight `q6k` (`[k, n]` logically).
     fn q6k_matmul_rows(
@@ -3177,6 +3355,16 @@ impl CudaKernels {
                     PackedWeightFormat::Q8_0 => self.q8_matmul_rows(a, q8, m, k, n, addend),
                     PackedWeightFormat::Q4K => self.q4k_matmul_rows(a, q8, m, k, n, addend),
                     PackedWeightFormat::Q6K => self.q6k_matmul_rows(a, q8, m, k, n, addend),
+                    PackedWeightFormat::Q2K | PackedWeightFormat::Q3K => {
+                        match self.low_bit_matmul_rows(a, q8, m, k, n, addend)? {
+                            Some(out) => Ok(out),
+                            // No int8 activations: against the f32 weight.
+                            None => {
+                                let dense = self.dequantize_q8(b)?;
+                                self.matmul_with_addend(a, &dense, addend, transpose_a, transpose_b)
+                            }
+                        }
+                    }
                 };
             }
             // Otherwise against the f32 weight, for this call only.

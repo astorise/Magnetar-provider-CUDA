@@ -3334,3 +3334,280 @@ extern "C" __global__ void q6k_matmul_rows_int8_kernel(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Packed `Q2_K` and `Q3_K` weights (`execute-direct-quantized-weights`),
+// read with int8 activations only (a matmul that cannot quantize its
+// activations dequantizes the weight for the call). Within a super-block,
+// value `128 h + 32 j + 16 p + l` (h = 0..1, j = 0..3, p = 0..1,
+// l = 0..15) is bits `2 j` of quant byte `32 h + 16 p + l`, under
+// sub-block `8 h + 2 j + p`.
+//
+// `Q2_K` (format 0) on the Device: 80 bytes per super-block -- sixteen
+// scale bytes (4-bit scale low, 4-bit min high) then 64 quant bytes -- and
+// its `d` and `dmin` as two f32 apart; `value = d * scale * q - dmin * min`.
+// `Q3_K` (format 1): 112 bytes -- 32 high-bit mask bytes, 64 quant bytes,
+// then the sixteen 6-bit scales unpacked to signed bytes with their -32
+// applied -- and `d` as an f32 apart; `value = d * scale * (q - 4)` with
+// `q` taking bit `4 h + j` of mask byte `16 p + l` as its third bit.
+
+#define LOWK_Q2K 0
+#define LOWK_Q3K 1
+
+__device__ __forceinline__ unsigned int lowk_block_bytes(int format) {
+    return format == LOWK_Q2K ? 80u : 112u;
+}
+
+__device__ __forceinline__ unsigned int lowk_scale_floats(int format) {
+    return format == LOWK_Q2K ? 2u : 1u;
+}
+
+// The logical matrix as f32, one thread per stored element.
+extern "C" __global__ void lowk_dequantize_kernel(
+    int format,
+    const unsigned char* blocks,
+    const float* dscales,
+    float* out,
+    unsigned long long stored_rows,
+    unsigned long long stored_cols,
+    unsigned int transposed
+) {
+    unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= stored_rows * stored_cols) {
+        return;
+    }
+    unsigned long long r = idx / stored_cols;
+    unsigned long long c = idx % stored_cols;
+    unsigned long long super_block = r * (stored_cols / 256) + c / 256;
+    const unsigned char* block = blocks + super_block * lowk_block_bytes(format);
+    const float* ds = dscales + super_block * lowk_scale_floats(format);
+    unsigned int w = (unsigned int)(c % 256);
+    unsigned int h = w / 128, j = (w % 128) / 32, p = (w % 32) / 16, l = w % 16;
+    float value;
+    if (format == LOWK_Q2K) {
+        unsigned int q = (block[16 + 32 * h + 16 * p + l] >> (2 * j)) & 3;
+        unsigned char sc = block[8 * h + 2 * j + p];
+        value = ds[0] * (float)(sc & 0xF) * (float)q - ds[1] * (float)(sc >> 4);
+    } else {
+        unsigned int q = (block[32 + 32 * h + 16 * p + l] >> (2 * j)) & 3;
+        unsigned int high = (block[16 * p + l] >> (4 * h + j)) & 1;
+        int scale = (int)(signed char)block[96 + 8 * h + 2 * j + p];
+        value = ds[0] * (float)scale * (float)((int)(q | (high << 2)) - 4);
+    }
+    if (transposed) {
+        out[c * stored_rows + r] = value;
+    } else {
+        out[idx] = value;
+    }
+}
+
+// One packed column's contribution for this lane's 32 values (`h`, `j`:
+// values `128 h + 32 j ..`, one activation block) against their int8
+// activations `x0` (first 16) and `x1`, scale `da`.
+__device__ __forceinline__ float lowk_lane_dot_int8(
+    int format,
+    const unsigned char* block,
+    const float* ds,
+    unsigned int h,
+    unsigned int j,
+    int4 x0,
+    int4 x1,
+    float da
+) {
+    const int* xa = reinterpret_cast<const int*>(&x0);
+    const int* xb = reinterpret_cast<const int*>(&x1);
+    int sum0 = 0, sum1 = 0;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        sum0 += i8_sum4(xa[i]);
+        sum1 += i8_sum4(xb[i]);
+    }
+    if (format == LOWK_Q2K) {
+        int4 qa = *reinterpret_cast<const int4*>(block + 16 + 32 * h);
+        int4 qb = *reinterpret_cast<const int4*>(block + 16 + 32 * h + 16);
+        const int* wa = reinterpret_cast<const int*>(&qa);
+        const int* wb = reinterpret_cast<const int*>(&qb);
+        int dot0 = 0, dot1 = 0;
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            dot0 = i8_dot4((wa[i] >> (2 * j)) & 0x03030303, xa[i], dot0);
+            dot1 = i8_dot4((wb[i] >> (2 * j)) & 0x03030303, xb[i], dot1);
+        }
+        unsigned char sc0 = block[8 * h + 2 * j];
+        unsigned char sc1 = block[8 * h + 2 * j + 1];
+        return da * (ds[0] * ((float)(sc0 & 0xF) * (float)dot0 + (float)(sc1 & 0xF) * (float)dot1)
+            - ds[1] * ((float)(sc0 >> 4) * (float)sum0 + (float)(sc1 >> 4) * (float)sum1));
+    }
+    int4 qa = *reinterpret_cast<const int4*>(block + 32 + 32 * h);
+    int4 qb = *reinterpret_cast<const int4*>(block + 32 + 32 * h + 16);
+    int4 ma = *reinterpret_cast<const int4*>(block);
+    int4 mb = *reinterpret_cast<const int4*>(block + 16);
+    const int* wa = reinterpret_cast<const int*>(&qa);
+    const int* wb = reinterpret_cast<const int*>(&qb);
+    const int* ha = reinterpret_cast<const int*>(&ma);
+    const int* hb = reinterpret_cast<const int*>(&mb);
+    unsigned int bit = 4 * h + j;
+    int dot0 = 0, dot1 = 0;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        int va = ((wa[i] >> (2 * j)) & 0x03030303) | ((((unsigned int)ha[i] >> bit) & 0x01010101) << 2);
+        int vb = ((wb[i] >> (2 * j)) & 0x03030303) | ((((unsigned int)hb[i] >> bit) & 0x01010101) << 2);
+        dot0 = i8_dot4(va, xa[i], dot0);
+        dot1 = i8_dot4(vb, xb[i], dot1);
+    }
+    float sc0 = (float)(signed char)block[96 + 8 * h + 2 * j];
+    float sc1 = (float)(signed char)block[96 + 8 * h + 2 * j + 1];
+    return da * ds[0] * (sc0 * (float)(dot0 - 4 * sum0) + sc1 * (float)(dot1 - 4 * sum1));
+}
+
+// Output columns one warp of `lowk_matmul_rows_int8_kernel` computes.
+#define LOWK_COLS 2
+
+// out[r, c] = sum_k a[r, k] * W[k, c] (+ addend) for a packed `Q2_K` or
+// `Q3_K` weight stored transposed, over int8 activations: one warp per
+// LOWK_COLS columns, eight lanes per super-block, a lane's 32 values one
+// activation block.
+extern "C" __global__ void lowk_matmul_rows_int8_kernel(
+    int format,
+    const signed char* aq,
+    const float* ad,
+    const unsigned char* blocks,
+    const float* dscales,
+    float* out,
+    unsigned long long m,
+    unsigned long long k,
+    unsigned long long n,
+    const float* addend,
+    int addend_mode
+) {
+    unsigned long long col0 =
+        ((unsigned long long)blockIdx.x * Q8_MATMUL_WARPS + threadIdx.y) * LOWK_COLS;
+    unsigned long long first_row = (unsigned long long)blockIdx.y * Q8_MATMUL_ROWS;
+    if (col0 >= n || first_row >= m) {
+        return;
+    }
+    unsigned int rows = (unsigned int)min((unsigned long long)Q8_MATMUL_ROWS, m - first_row);
+    unsigned int cols = (unsigned int)min((unsigned long long)LOWK_COLS, n - col0);
+    unsigned int lane = threadIdx.x;
+    unsigned long long super_blocks = k / 256;
+    unsigned int part = lane % 8;
+    unsigned int h = part / 4;
+    unsigned int j = part % 4;
+    unsigned int bytes = lowk_block_bytes(format);
+    unsigned int floats = lowk_scale_floats(format);
+    float acc[Q8_MATMUL_ROWS][LOWK_COLS];
+#pragma unroll
+    for (int r = 0; r < Q8_MATMUL_ROWS; r++) {
+#pragma unroll
+        for (int c = 0; c < LOWK_COLS; c++) {
+            acc[r][c] = 0.0f;
+        }
+    }
+    for (unsigned long long sb = lane / 8; sb < super_blocks; sb += 4) {
+        unsigned long long base = sb * 256 + 128 * h + 32 * j;
+#pragma unroll
+        for (int r = 0; r < Q8_MATMUL_ROWS; r++) {
+            if (r < (int)rows) {
+                unsigned long long at = (first_row + r) * k + base;
+                int4 x0 = *reinterpret_cast<const int4*>(aq + at);
+                int4 x1 = *reinterpret_cast<const int4*>(aq + at + 16);
+                float da = ad[at >> 5];
+#pragma unroll
+                for (int c = 0; c < LOWK_COLS; c++) {
+                    unsigned int column = (unsigned int)c < cols ? c : 0;
+                    unsigned long long index = (col0 + column) * super_blocks + sb;
+                    acc[r][c] += lowk_lane_dot_int8(
+                        format, blocks + index * bytes, dscales + index * floats, h, j, x0, x1, da);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < Q8_MATMUL_ROWS; r++) {
+#pragma unroll
+        for (int c = 0; c < LOWK_COLS; c++) {
+            float sum = acc[r][c];
+#pragma unroll
+            for (int offset_ = 16; offset_ > 0; offset_ >>= 1) {
+                sum += __shfl_xor_sync(0xffffffffu, sum, offset_);
+            }
+            if (lane == 0 && r < (int)rows && (unsigned int)c < cols) {
+                unsigned long long row = first_row + r;
+                unsigned long long col = col0 + c;
+                if (addend_mode == 1) {
+                    sum += addend[col];
+                } else if (addend_mode == 2) {
+                    sum += addend[row * n + col];
+                }
+                out[row * n + col] = sum;
+            }
+        }
+    }
+}
+
+// `silu(a x gate) * (a x up)` for two packed `Q2_K`/`Q3_K` weights of one
+// format, stored transposed, over int8 activations.
+extern "C" __global__ void lowk_gated_matmul_rows_int8_kernel(
+    int format,
+    const signed char* aq,
+    const float* ad,
+    const unsigned char* gate_blocks,
+    const float* gate_dscales,
+    const unsigned char* up_blocks,
+    const float* up_dscales,
+    float* out,
+    unsigned long long m,
+    unsigned long long k,
+    unsigned long long n
+) {
+    unsigned long long col = (unsigned long long)blockIdx.x * Q8_MATMUL_WARPS + threadIdx.y;
+    unsigned long long first_row = (unsigned long long)blockIdx.y * Q8_MATMUL_ROWS;
+    if (col >= n || first_row >= m) {
+        return;
+    }
+    unsigned int rows = (unsigned int)min((unsigned long long)Q8_MATMUL_ROWS, m - first_row);
+    unsigned int lane = threadIdx.x;
+    unsigned long long super_blocks = k / 256;
+    unsigned int part = lane % 8;
+    unsigned int h = part / 4;
+    unsigned int j = part % 4;
+    unsigned int bytes = lowk_block_bytes(format);
+    unsigned int floats = lowk_scale_floats(format);
+    float gate_acc[Q8_MATMUL_ROWS];
+    float up_acc[Q8_MATMUL_ROWS];
+#pragma unroll
+    for (int r = 0; r < Q8_MATMUL_ROWS; r++) {
+        gate_acc[r] = 0.0f;
+        up_acc[r] = 0.0f;
+    }
+    for (unsigned long long sb = lane / 8; sb < super_blocks; sb += 4) {
+        unsigned long long index = col * super_blocks + sb;
+        unsigned long long base = sb * 256 + 128 * h + 32 * j;
+#pragma unroll
+        for (int r = 0; r < Q8_MATMUL_ROWS; r++) {
+            if (r < (int)rows) {
+                unsigned long long at = (first_row + r) * k + base;
+                int4 x0 = *reinterpret_cast<const int4*>(aq + at);
+                int4 x1 = *reinterpret_cast<const int4*>(aq + at + 16);
+                float da = ad[at >> 5];
+                gate_acc[r] += lowk_lane_dot_int8(format, gate_blocks + index * bytes,
+                    gate_dscales + index * floats, h, j, x0, x1, da);
+                up_acc[r] += lowk_lane_dot_int8(format, up_blocks + index * bytes,
+                    up_dscales + index * floats, h, j, x0, x1, da);
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < Q8_MATMUL_ROWS; r++) {
+        float g = gate_acc[r];
+        float u = up_acc[r];
+#pragma unroll
+        for (int offset_ = 16; offset_ > 0; offset_ >>= 1) {
+            g += __shfl_xor_sync(0xffffffffu, g, offset_);
+            u += __shfl_xor_sync(0xffffffffu, u, offset_);
+        }
+        if (lane == 0 && r < (int)rows) {
+            out[(first_row + r) * n + col] = g * (1.0f / (1.0f + expf(-g))) * u;
+        }
+    }
+}
