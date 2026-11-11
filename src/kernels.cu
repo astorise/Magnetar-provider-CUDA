@@ -2381,3 +2381,154 @@ extern "C" __global__ void kv_write_kernel(
     unsigned long long offset = row_offset + (step_offset ? *step_offset : 0);
     store[offset * width + i] = rows[i];
 }
+
+// ---------------------------------------------------------------------------
+// Packed `Q4_K` weights (`execute-direct-quantized-weights`): GGUF
+// `block_q4_K` super-blocks kept as stored, 144 bytes for 256 values --
+// `f16` `d` and `dmin`, twelve bytes packing eight 6-bit sub-block scales
+// and mins, then 128 bytes of 4-bit quants. Within a super-block, quant
+// byte `32 * c + i` (c = 0..3, i = 0..31) holds value `64 * c + i` in its
+// low nibble (sub-block `2c`) and value `64 * c + 32 + i` in its high
+// nibble (sub-block `2c + 1`); `value = d * scale * q - dmin * min`
+// (`ggml-quants.c`'s `dequantize_row_q4_K`).
+
+#define Q4K_BLOCK_VALUES 256
+#define Q4K_BLOCK_BYTES 144
+
+// Sub-block `j`'s 6-bit scale and min (`ggml-quants.c`'s
+// `get_scale_min_k4`).
+__device__ __forceinline__ void q4k_scale_min(
+    int j,
+    const unsigned char* q,
+    float* scale,
+    float* min
+) {
+    if (j < 4) {
+        *scale = (float)(q[j] & 63);
+        *min = (float)(q[j + 4] & 63);
+    } else {
+        *scale = (float)((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4));
+        *min = (float)((q[j + 4] >> 4) | ((q[j] >> 6) << 4));
+    }
+}
+
+// The logical matrix as f32, one thread per stored element: stored row r,
+// stored column c, written to `out[c * stored_rows + r]` when transposed.
+extern "C" __global__ void q4k_dequantize_kernel(
+    const unsigned char* blocks,
+    float* out,
+    unsigned long long stored_rows,
+    unsigned long long stored_cols,
+    unsigned int transposed
+) {
+    unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= stored_rows * stored_cols) {
+        return;
+    }
+    unsigned long long r = idx / stored_cols;
+    unsigned long long c = idx % stored_cols;
+    const unsigned char* block = blocks
+        + (r * (stored_cols / Q4K_BLOCK_VALUES) + c / Q4K_BLOCK_VALUES) * Q4K_BLOCK_BYTES;
+    unsigned int w = (unsigned int)(c % Q4K_BLOCK_VALUES);
+    unsigned int chunk = w / 64;
+    unsigned int within = w % 64;
+    unsigned char byte = block[16 + 32 * chunk + (within % 32)];
+    int sub = 2 * chunk + (within >= 32 ? 1 : 0);
+    unsigned int q = within >= 32 ? (byte >> 4) : (byte & 0xF);
+    float d = half_bits_to_float((unsigned short)(block[0] | (block[1] << 8)));
+    float dmin = half_bits_to_float((unsigned short)(block[2] | (block[3] << 8)));
+    float scale, min;
+    q4k_scale_min(sub, block + 4, &scale, &min);
+    float value = (d * scale) * (float)q - dmin * min;
+    if (transposed) {
+        out[c * stored_rows + r] = value;
+    } else {
+        out[idx] = value;
+    }
+}
+
+// out[r, c] = sum_k a[r, k] * W[k, c] (+ addend) for a packed `Q4_K` weight
+// stored transposed (stored row c holds column c's `k` values, `k / 256`
+// super-blocks). One warp per output column, up to Q8_MATMUL_ROWS rows of
+// `a`: each step covers four super-blocks, eight lanes each; a lane loads
+// 16 quant bytes (32 values: 16 of sub-block 2c in the low nibbles, 16 of
+// sub-block 2c + 1 in the high ones) and applies the two sub-blocks'
+// scales and mins to its partial sums.
+extern "C" __global__ void q4k_matmul_rows_kernel(
+    const float* a,
+    const unsigned char* blocks,
+    float* out,
+    unsigned long long m,
+    unsigned long long k,
+    unsigned long long n,
+    const float* addend,
+    int addend_mode
+) {
+    unsigned long long col = (unsigned long long)blockIdx.x * Q8_MATMUL_WARPS + threadIdx.y;
+    unsigned long long first_row = (unsigned long long)blockIdx.y * Q8_MATMUL_ROWS;
+    if (col >= n || first_row >= m) {
+        return;
+    }
+    unsigned int rows = (unsigned int)min((unsigned long long)Q8_MATMUL_ROWS, m - first_row);
+    unsigned int lane = threadIdx.x;
+    unsigned long long super_blocks = k / Q4K_BLOCK_VALUES;
+    const unsigned char* w = blocks + col * super_blocks * Q4K_BLOCK_BYTES;
+    // This lane's part of a super-block: 16 bytes of chunk `chunk`.
+    unsigned int part = lane % 8;
+    unsigned int chunk = part / 2;
+    unsigned int offset = 16 * (part % 2);
+    float acc[Q8_MATMUL_ROWS];
+#pragma unroll
+    for (int r = 0; r < Q8_MATMUL_ROWS; r++) {
+        acc[r] = 0.0f;
+    }
+    for (unsigned long long sb = lane / 8; sb < super_blocks; sb += 4) {
+        const unsigned char* block = w + sb * Q4K_BLOCK_BYTES;
+        int4 packed = *reinterpret_cast<const int4*>(block + 16 + 32 * chunk + offset);
+        const unsigned char* q = reinterpret_cast<const unsigned char*>(&packed);
+        float d = half_bits_to_float((unsigned short)(block[0] | (block[1] << 8)));
+        float dmin = half_bits_to_float((unsigned short)(block[2] | (block[3] << 8)));
+        float scale_lo, min_lo, scale_hi, min_hi;
+        q4k_scale_min(2 * chunk, block + 4, &scale_lo, &min_lo);
+        q4k_scale_min(2 * chunk + 1, block + 4, &scale_hi, &min_hi);
+        float d_lo = d * scale_lo, m_lo = dmin * min_lo;
+        float d_hi = d * scale_hi, m_hi = dmin * min_hi;
+        unsigned long long base = sb * Q4K_BLOCK_VALUES + 64 * chunk + offset;
+#pragma unroll
+        for (int r = 0; r < Q8_MATMUL_ROWS; r++) {
+            if (r < (int)rows) {
+                const float* x = a + (first_row + r) * k + base;
+                float dot_lo = 0.0f, sum_lo = 0.0f, dot_hi = 0.0f, sum_hi = 0.0f;
+#pragma unroll
+                for (int j = 0; j < 16; j += 4) {
+                    float4 lo = *reinterpret_cast<const float4*>(x + j);
+                    float4 hi = *reinterpret_cast<const float4*>(x + 32 + j);
+                    dot_lo += lo.x * (float)(q[j] & 0xF) + lo.y * (float)(q[j + 1] & 0xF)
+                        + lo.z * (float)(q[j + 2] & 0xF) + lo.w * (float)(q[j + 3] & 0xF);
+                    dot_hi += hi.x * (float)(q[j] >> 4) + hi.y * (float)(q[j + 1] >> 4)
+                        + hi.z * (float)(q[j + 2] >> 4) + hi.w * (float)(q[j + 3] >> 4);
+                    sum_lo += lo.x + lo.y + lo.z + lo.w;
+                    sum_hi += hi.x + hi.y + hi.z + hi.w;
+                }
+                acc[r] += d_lo * dot_lo - m_lo * sum_lo + d_hi * dot_hi - m_hi * sum_hi;
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < Q8_MATMUL_ROWS; r++) {
+        float sum = acc[r];
+#pragma unroll
+        for (int offset_ = 16; offset_ > 0; offset_ >>= 1) {
+            sum += __shfl_xor_sync(0xffffffffu, sum, offset_);
+        }
+        if (lane == 0 && r < (int)rows) {
+            unsigned long long row = first_row + r;
+            if (addend_mode == 1) {
+                sum += addend[col];
+            } else if (addend_mode == 2) {
+                sum += addend[row * n + col];
+            }
+            out[row * n + col] = sum;
+        }
+    }
+}

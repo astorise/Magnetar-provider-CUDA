@@ -1873,6 +1873,39 @@ fn moe_decode_kernel_times() {
         });
         report(what, ms, q8_bytes(k * n));
     }
+    // The same projections packed `Q4_K` (144 bytes per 256 values).
+    for (what, k, n) in [
+        (
+            "Q4_K attention projection [1, 2048] x [2048, 2048]",
+            hidden,
+            hidden,
+        ),
+        ("Q4_K Mistral 7B q/o [1, 4096] x [4096, 4096]", 4096, 4096),
+        (
+            "Q4_K Mistral 7B gate/up [1, 4096] x [4096, 14336]",
+            4096,
+            14_336,
+        ),
+        (
+            "Q4_K Mistral 7B down [1, 14336] x [14336, 4096]",
+            14_336,
+            4096,
+        ),
+        (
+            "Q4_K output head [1, 2048] x [2048, 151936]",
+            hidden,
+            151_936,
+        ),
+    ] {
+        let a = upload(&kernels, &activations(1, k, 68));
+        let b = kernels
+            .upload_packed_weight(&packed_q4k(n, k, true, 69))
+            .unwrap();
+        let ms = time(&|| {
+            kernels.matmul(&a, &b, false, false).unwrap();
+        });
+        report(what, ms, k * n / 256 * 144);
+    }
 }
 
 /// A deterministic packed `Q8_0` matrix of `stored_rows` x `stored_cols`
@@ -1980,6 +2013,102 @@ fn q8_packed_matmul_matches_reference_cpu() {
             &expected_residual,
             k as f32,
         );
+    }
+}
+
+/// A deterministic packed `Q4_K` matrix of `stored_rows` x `stored_cols`
+/// super-blocks: small positive `d`/`dmin`, every 6-bit scale and min, and
+/// every nibble, exercised.
+fn packed_q4k(stored_rows: u64, stored_cols: u64, transposed: bool, seed: u32) -> PackedWeight {
+    let blocks = stored_rows * stored_cols / 256;
+    let mut bytes = Vec::with_capacity(blocks as usize * 144);
+    let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state
+    };
+    for _ in 0..blocks {
+        for _ in 0..2 {
+            // f16 between about 2^-10 and 2^-6.
+            let exponent = 5 + (next() % 5) as u16;
+            let bits = (exponent << 10) | (next() % 1024) as u16;
+            bytes.extend(bits.to_le_bytes());
+        }
+        bytes.extend((0..12).map(|_| (next() % 256) as u8));
+        bytes.extend((0..128).map(|_| (next() % 256) as u8));
+    }
+    PackedWeight::new(
+        PackedWeightFormat::Q4K,
+        stored_rows,
+        stored_cols,
+        transposed,
+        bytes,
+    )
+    .unwrap()
+}
+
+/// The packed `Q4_K` weight: downloading or expanding it gives back exactly
+/// the Runtime's dequantization, and its decode matmul (rows read packed,
+/// longer ones dequantized for the call), with and without a bias or
+/// residual addend, and a gated matmul over two of them, match the
+/// Reference CPU on the dequantized weights.
+#[test]
+fn q4k_packed_matmul_matches_reference_cpu() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let (k, n) = (1024_u64, 96_u64);
+    let packed = packed_q4k(n, k, true, 21);
+    let dense = packed.dequantize();
+    let weight = kernels.upload_packed_weight(&packed).unwrap();
+    assert!(weight.is_q8() && weight.is_compact());
+    assert_eq!(weight.shape, vec![k, n]);
+    assert_eq!(weight.len(), (k * n) as usize);
+    assert_eq!(download(&kernels, &weight).data, dense.data);
+    assert_eq!(
+        download(&kernels, &kernels.expand(&weight).unwrap()).data,
+        dense.data
+    );
+    let bias = HostTensor::new([n], (0..n).map(|i| i as f32 * 0.01).collect::<Vec<_>>()).unwrap();
+    for m in [1_u64, 3, 8, 9, 65] {
+        let a = activations(m, k, m as u32 + 40);
+        let expected = magnetar_provider_cpu::matmul(&a, &dense, false, false).unwrap();
+        let a_dev = upload(&kernels, &a);
+        let actual = download(
+            &kernels,
+            &kernels.matmul(&a_dev, &weight, false, false).unwrap(),
+        );
+        assert_close_relative(&actual, &expected);
+        let with_bias = kernels
+            .matmul_bias(&a_dev, &weight, &upload(&kernels, &bias), false, false)
+            .unwrap();
+        let expected_bias = magnetar_provider_cpu::add(&expected, &bias).unwrap();
+        assert_close_relative(&download(&kernels, &with_bias), &expected_bias);
+        let residual = activations(m, n, 98);
+        let with_residual = kernels
+            .matmul_residual(&a_dev, &weight, &upload(&kernels, &residual), false, false)
+            .unwrap();
+        let expected_residual = magnetar_provider_cpu::add(&expected, &residual).unwrap();
+        assert_close_relative(&download(&kernels, &with_residual), &expected_residual);
+    }
+    let up = packed_q4k(n, k, true, 22);
+    let up_dense = up.dequantize();
+    let up_weight = kernels.upload_packed_weight(&up).unwrap();
+    for m in [1_u64, 5] {
+        let a = activations(m, k, 7);
+        let expected = magnetar_provider_cpu::mul(
+            &magnetar_provider_cpu::silu(
+                &magnetar_provider_cpu::matmul(&a, &dense, false, false).unwrap(),
+            ),
+            &magnetar_provider_cpu::matmul(&a, &up_dense, false, false).unwrap(),
+        )
+        .unwrap();
+        let actual = kernels
+            .gated_matmul(&upload(&kernels, &a), &weight, &up_weight, false, false)
+            .unwrap();
+        assert_close_relative(&download(&kernels, &actual), &expected);
     }
 }
 
