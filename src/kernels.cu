@@ -2853,13 +2853,13 @@ extern "C" __global__ void q6k_matmul_rows_kernel(
 }
 
 // ---------------------------------------------------------------------------
-// Int8 activations (`MAGNETAR_CUDA_INT8_ACTIVATIONS`): the decode-step
-// packed matmuls can read `a` quantized per 32-value block to signed 8-bit
-// values and one f32 scale (`ggml`'s `block_q8_1` without its sum), and
-// multiply with `__dp4a` (`i8_dot4`), four byte products per instruction, instead of
-// converting every weight value to f32. This changes the arithmetic
-// (activations are rounded to 8 bits), so it is a measured option, not
-// the reference path.
+// Int8 activations (on unless `MAGNETAR_CUDA_INT8_ACTIVATIONS=0`): the
+// decode-step packed matmuls read `a` quantized per 32-value block to
+// signed 8-bit values and one f32 scale (`ggml`'s `block_q8_1` without its
+// sum), and multiply with `__dp4a` (`i8_dot4`), four byte products per
+// instruction, instead of converting every weight value to f32. This
+// rounds the activations; the f32-activation Kernels above stay the
+// disable control.
 
 // Quantizes `blocks` consecutive 32-value blocks of `a`: one warp per
 // block, `aq = round(a / d)` with `d = max |a| / 127` (0 for an all-zero

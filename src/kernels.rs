@@ -60,11 +60,12 @@ pub const TENSOR_CORES_ENV: &str = "MAGNETAR_CUDA_TENSOR_CORES";
 /// Model Loading then hands this Provider their dequantized f32 values, the
 /// disable control for direct quantized execution.
 pub const PACKED_WEIGHTS_ENV: &str = "MAGNETAR_CUDA_PACKED_WEIGHTS";
-/// Set to `1` to let the decode-step packed matmuls read their activations
-/// quantized to 8 bits per 32-value block and multiply with `__dp4a`
-/// (`q8_matmul_rows_int8_kernel` and its `Q4_K`/`Q6_K` forms). Off by
-/// default: it rounds the activations, so outputs differ slightly from the
-/// f32-activation Kernels.
+/// Set to `0` to keep f32 activations in the decode-step packed matmuls.
+/// By default they read their activations quantized to 8 bits per
+/// 32-value block and multiply with `__dp4a` (`q8_matmul_rows_int8_kernel`
+/// and its `Q4_K`/`Q6_K` forms): this rounds the activations, so outputs
+/// can differ slightly from the f32-activation Kernels, which this
+/// disable control restores.
 pub const INT8_ACTIVATIONS_ENV: &str = "MAGNETAR_CUDA_INT8_ACTIVATIONS";
 /// Activation values the int8 scratch holds: `Q8_MATMUL_MAX_ROWS` rows of
 /// up to 32768 columns. A larger matmul keeps f32 activations.
@@ -401,7 +402,8 @@ pub struct CudaKernels {
     /// set they outgrew (a captured step may still read one, so none is
     /// freed before this Provider).
     moe_scratch: std::sync::Mutex<(Option<MoeScratch>, Vec<MoeScratch>)>,
-    /// Whether [`INT8_ACTIVATIONS_ENV`] turned int8 activations on.
+    /// Whether int8 activations are on (unless [`INT8_ACTIVATIONS_ENV`] is
+    /// `0`).
     int8_activations: std::sync::atomic::AtomicBool,
     /// The quantized activations of the current packed matmul and their
     /// block scales, allocated once at [`INT8_SCRATCH_VALUES`] (never
@@ -609,7 +611,7 @@ impl CudaKernels {
             split_scratch: std::sync::Mutex::new((None, Vec::new())),
             moe_scratch: std::sync::Mutex::new((None, Vec::new())),
             int8_activations: std::sync::atomic::AtomicBool::new(
-                std::env::var(INT8_ACTIVATIONS_ENV).as_deref() == Ok("1"),
+                std::env::var(INT8_ACTIVATIONS_ENV).as_deref() != Ok("0"),
             ),
             int8_scratch: std::sync::Mutex::new(None),
         })

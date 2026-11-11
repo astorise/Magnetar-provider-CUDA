@@ -25,9 +25,13 @@ const TOLERANCE: f32 = 1e-3;
 fn kernels_or_skip() -> Option<CudaKernels> {
     let provider = CudaProvider::new();
     let context = provider.context()?;
-    Some(CudaKernels::compile_and_load(&context).expect(
+    let kernels = CudaKernels::compile_and_load(&context).expect(
         "kernel compilation must succeed on a machine that already passed device discovery",
-    ))
+    );
+    // The f32-activation Kernels, which these tests compare with the
+    // Reference CPU tightly; the int8-activation test turns them on.
+    kernels.set_int8_activations(false);
+    Some(kernels)
 }
 
 fn upload(kernels: &CudaKernels, tensor: &HostTensor) -> CudaDeviceBuffer {
