@@ -257,10 +257,11 @@ pub struct CudaDeviceBuffer {
 /// `shape`) is the stored one, or its transpose when `transposed`.
 pub struct CudaQ8Weight {
     /// `Q8_0`: each block's 32 quants, contiguous. `Q4_K`: the super-blocks'
-    /// own 144-byte encoding, as stored.
+    /// own 144-byte encoding, as stored. `Q6_K`: each super-block's first
+    /// 208 bytes (its quants and sub-block scales).
     pub(crate) quants: CudaSlice<i8>,
     /// `Q8_0`: each block's scale. `Q4_K`: unused (the scales live in the
-    /// super-blocks).
+    /// super-blocks). `Q6_K`: each super-block's `d`.
     pub(crate) scales: CudaSlice<f32>,
     /// Which block encoding `quants` holds.
     pub(crate) format: PackedWeightFormat,
@@ -300,8 +301,10 @@ impl CudaDeviceBuffer {
 /// `q8_matmul_rows_kernel` (decode steps and short prompts); a longer
 /// matmul dequantizes the weight to f32 for the duration of the call.
 const Q8_MATMUL_MAX_ROWS: u64 = 64;
-/// Output columns per warp of `q4k_matmul_rows_kernel` (`Q4K_COLS`).
+/// Output columns per warp of `q4k_matmul_rows_kernel` (`Q4K_COLS`) and
+/// `q6k_matmul_rows_kernel` (`Q6K_COLS`).
 const Q4K_MATMUL_COLS: u64 = 2;
+const Q6K_MATMUL_COLS: u64 = 2;
 /// `Q8_MATMUL_ROWS` / `Q8_MATMUL_WARPS` in `kernels.cu`.
 const Q8_MATMUL_ROWS: u64 = 8;
 const Q8_MATMUL_WARPS: u32 = 4;
@@ -1231,6 +1234,36 @@ impl CudaKernels {
         weight: &PackedWeight,
     ) -> Result<CudaDeviceBuffer, CudaError> {
         self.forbid_in_capture("a host-to-device upload")?;
+        if weight.format() == PackedWeightFormat::Q6K {
+            // Each super-block without its trailing f16 `d` (208 bytes,
+            // so every one stays 16-byte aligned), `d` as an f32 apart.
+            let blocks = weight.bytes().as_chunks::<210>().0;
+            let mut quants = Vec::with_capacity(blocks.len() * 208);
+            let mut scales = Vec::with_capacity(blocks.len());
+            for block in blocks {
+                quants.extend(block[..208].iter().map(|&byte| byte as i8));
+                scales.push(half_precision::f16_to_f32(u16::from_le_bytes([
+                    block[208], block[209],
+                ])));
+            }
+            let quants = self.stream.clone_htod(&quants)?;
+            let scales = self.stream.clone_htod(&scales)?;
+            let slice = self.stream.alloc_zeros::<f32>(1)?;
+            self.upload_count.fetch_add(1, Ordering::Relaxed);
+            return Ok(CudaDeviceBuffer {
+                slice,
+                shape: weight.logical_shape().to_vec(),
+                bf16: None,
+                q8: Some(CudaQ8Weight {
+                    quants,
+                    scales,
+                    format: PackedWeightFormat::Q6K,
+                    stored_rows: weight.stored_rows(),
+                    stored_cols: weight.stored_cols(),
+                    transposed: weight.transposed(),
+                }),
+            });
+        }
         if weight.format() == PackedWeightFormat::Q4K {
             // Kept as stored: the Kernels decode the super-blocks.
             let bytes: Vec<i8> = weight.bytes().iter().map(|&byte| byte as i8).collect();
@@ -1293,6 +1326,17 @@ impl CudaKernels {
         match q8.format {
             PackedWeightFormat::Q8_0 => {
                 let func = self.function("q8_dequantize_kernel")?;
+                let mut args = self.stream.launch_builder(&func);
+                args.arg(&q8.quants)
+                    .arg(&q8.scales)
+                    .arg(&mut out)
+                    .arg(&q8.stored_rows)
+                    .arg(&q8.stored_cols)
+                    .arg(&transposed);
+                unsafe { args.launch(LaunchConfig::for_num_elems(elements as u32)) }?;
+            }
+            PackedWeightFormat::Q6K => {
+                let func = self.function("q6k_dequantize_kernel")?;
                 let mut args = self.stream.launch_builder(&func);
                 args.arg(&q8.quants)
                     .arg(&q8.scales)
@@ -2832,6 +2876,52 @@ impl CudaKernels {
         })
     }
 
+    /// `q6k_matmul_rows_kernel`: `a` (`m` contiguous rows of `k`) times the
+    /// packed `Q6_K`, transposed-storage weight `q6k` (`[k, n]` logically).
+    fn q6k_matmul_rows(
+        &self,
+        a: &CudaDeviceBuffer,
+        q6k: &CudaQ8Weight,
+        m: u64,
+        k: u64,
+        n: u64,
+        addend: Option<MatmulAddend<'_>>,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        let mut out_dev = self.alloc_output((m * n) as usize)?;
+        let (addend_buffer, addend_mode) = match addend {
+            None => (a, 0i32),
+            Some(MatmulAddend::Row(bias)) => (bias, 1),
+            Some(MatmulAddend::Full(residual)) => (residual, 2),
+        };
+        let func = self.function("q6k_matmul_rows_kernel")?;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(&a.slice)
+            .arg(&q6k.quants)
+            .arg(&q6k.scales)
+            .arg(&mut out_dev)
+            .arg(&m)
+            .arg(&k)
+            .arg(&n)
+            .arg(&addend_buffer.slice)
+            .arg(&addend_mode);
+        let config = LaunchConfig {
+            grid_dim: (
+                n.div_ceil(u64::from(Q8_MATMUL_WARPS) * Q6K_MATMUL_COLS) as u32,
+                m.div_ceil(Q8_MATMUL_ROWS) as u32,
+                1,
+            ),
+            block_dim: (32, Q8_MATMUL_WARPS, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { args.launch(config) }?;
+        Ok(CudaDeviceBuffer {
+            slice: out_dev,
+            shape: vec![m, n],
+            bf16: None,
+            q8: None,
+        })
+    }
+
     /// `silu(a x gate) * (a x up)` for two transposed-storage packed
     /// weights; see `q8_gated_matmul_rows_kernel`.
     fn q8_gated_matmul_rows(
@@ -2941,6 +3031,7 @@ impl CudaKernels {
                 return match q8.format {
                     PackedWeightFormat::Q8_0 => self.q8_matmul_rows(a, q8, m, k, n, addend),
                     PackedWeightFormat::Q4K => self.q4k_matmul_rows(a, q8, m, k, n, addend),
+                    PackedWeightFormat::Q6K => self.q6k_matmul_rows(a, q8, m, k, n, addend),
                 };
             }
             // Otherwise against the f32 weight, for this call only.
