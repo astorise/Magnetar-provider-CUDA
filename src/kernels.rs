@@ -60,6 +60,15 @@ pub const TENSOR_CORES_ENV: &str = "MAGNETAR_CUDA_TENSOR_CORES";
 /// Model Loading then hands this Provider their dequantized f32 values, the
 /// disable control for direct quantized execution.
 pub const PACKED_WEIGHTS_ENV: &str = "MAGNETAR_CUDA_PACKED_WEIGHTS";
+/// Set to `1` to let the decode-step packed matmuls read their activations
+/// quantized to 8 bits per 32-value block and multiply with `__dp4a`
+/// (`q8_matmul_rows_int8_kernel` and its `Q4_K`/`Q6_K` forms). Off by
+/// default: it rounds the activations, so outputs differ slightly from the
+/// f32-activation Kernels.
+pub const INT8_ACTIVATIONS_ENV: &str = "MAGNETAR_CUDA_INT8_ACTIVATIONS";
+/// Activation values the int8 scratch holds: `Q8_MATMUL_MAX_ROWS` rows of
+/// up to 32768 columns. A larger matmul keeps f32 activations.
+const INT8_SCRATCH_VALUES: u64 = Q8_MATMUL_MAX_ROWS * 32_768;
 
 /// What a fused matmul adds to its product.
 #[derive(Clone, Copy)]
@@ -392,6 +401,19 @@ pub struct CudaKernels {
     /// set they outgrew (a captured step may still read one, so none is
     /// freed before this Provider).
     moe_scratch: std::sync::Mutex<(Option<MoeScratch>, Vec<MoeScratch>)>,
+    /// Whether [`INT8_ACTIVATIONS_ENV`] turned int8 activations on.
+    int8_activations: std::sync::atomic::AtomicBool,
+    /// The quantized activations of the current packed matmul and their
+    /// block scales, allocated once at [`INT8_SCRATCH_VALUES`] (never
+    /// reallocated, so a captured step's addresses stay valid).
+    int8_scratch: std::sync::Mutex<Option<Int8Scratch>>,
+}
+
+/// Int8 activations: [`INT8_SCRATCH_VALUES`] signed bytes and one f32 scale
+/// per 32 of them.
+struct Int8Scratch {
+    values: CudaSlice<i8>,
+    scales: CudaSlice<f32>,
 }
 
 /// `moe-experts` scratch: the routed experts and weights of each
@@ -586,6 +608,10 @@ impl CudaKernels {
             attention_scratch: std::sync::Mutex::new((None, Vec::new())),
             split_scratch: std::sync::Mutex::new((None, Vec::new())),
             moe_scratch: std::sync::Mutex::new((None, Vec::new())),
+            int8_activations: std::sync::atomic::AtomicBool::new(
+                std::env::var(INT8_ACTIVATIONS_ENV).as_deref() == Ok("1"),
+            ),
+            int8_scratch: std::sync::Mutex::new(None),
         })
     }
 
@@ -607,7 +633,79 @@ impl CudaKernels {
         if flag_slot.is_none() {
             *flag_slot = Some(self.stream.alloc_zeros::<i32>(1)?);
         }
+        drop(flag_slot);
+        if self.int8_activations() {
+            self.int8_scratch_slot()?;
+        }
         Ok(())
+    }
+
+    /// Whether the decode-step packed matmuls read int8 activations
+    /// ([`INT8_ACTIVATIONS_ENV`]).
+    pub fn int8_activations(&self) -> bool {
+        self.int8_activations
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Turns int8 activations on or off for later launches (the
+    /// environment variable sets the initial value).
+    pub fn set_int8_activations(&self, on: bool) {
+        self.int8_activations
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The int8 scratch, allocated on first use (never during a capture:
+    /// then `Ok(None)` and the caller keeps f32 activations).
+    fn int8_scratch_slot(
+        &self,
+    ) -> Result<Option<std::sync::MutexGuard<'_, Option<Int8Scratch>>>, CudaError> {
+        let mut slot = self.int8_scratch.lock().unwrap();
+        if slot.is_none() {
+            if self.capture.lock().unwrap().is_some() {
+                return Ok(None);
+            }
+            *slot = Some(Int8Scratch {
+                values: self
+                    .stream
+                    .alloc_zeros::<i8>(INT8_SCRATCH_VALUES as usize)?,
+                scales: self
+                    .stream
+                    .alloc_zeros::<f32>((INT8_SCRATCH_VALUES / 32) as usize)?,
+            });
+        }
+        Ok(Some(slot))
+    }
+
+    /// Quantizes `a` (`m` contiguous rows of `k`) into the int8 scratch
+    /// when int8 activations are on and it fits; `None` keeps the f32
+    /// activations.
+    fn quantize_activations(
+        &self,
+        a: &CudaDeviceBuffer,
+        m: u64,
+        k: u64,
+    ) -> Result<Option<std::sync::MutexGuard<'_, Option<Int8Scratch>>>, CudaError> {
+        if !self.int8_activations() || !k.is_multiple_of(32) || m * k > INT8_SCRATCH_VALUES {
+            return Ok(None);
+        }
+        let Some(mut guard) = self.int8_scratch_slot()? else {
+            return Ok(None);
+        };
+        let scratch = guard.as_mut().expect("allocated above");
+        let blocks = m * k / 32;
+        let func = self.function("quantize_activations_q8_kernel")?;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(&a.slice)
+            .arg(&mut scratch.values)
+            .arg(&mut scratch.scales)
+            .arg(&blocks);
+        let config = LaunchConfig {
+            grid_dim: (blocks.div_ceil(4) as u32, 1, 1),
+            block_dim: (32, 4, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { args.launch(config) }?;
+        Ok(Some(guard))
     }
 
     /// Starts capturing this stream's work into a CUDA graph. Every later
@@ -2637,10 +2735,19 @@ impl CudaKernels {
         {
             Self::require_f32(&[a], "gated-matmul's input")?;
             let mut out_dev = self.alloc_output((m * b_cols) as usize)?;
-            let func = self.function("q4k_gated_matmul_rows_kernel")?;
+            let int8 = self.quantize_activations(a, m, k)?;
+            let int8 = int8.as_ref().and_then(|guard| guard.as_ref());
+            let func = self.function(if int8.is_some() {
+                "q4k_gated_matmul_rows_int8_kernel"
+            } else {
+                "q4k_gated_matmul_rows_kernel"
+            })?;
             let mut args = self.stream.launch_builder(&func);
-            args.arg(&a.slice)
-                .arg(&gate_q4k.quants)
+            match int8 {
+                Some(scratch) => args.arg(&scratch.values).arg(&scratch.scales),
+                None => args.arg(&a.slice),
+            };
+            args.arg(&gate_q4k.quants)
                 .arg(&up_q4k.quants)
                 .arg(&mut out_dev)
                 .arg(&m)
@@ -2802,10 +2909,19 @@ impl CudaKernels {
             Some(MatmulAddend::Row(bias)) => (bias, 1),
             Some(MatmulAddend::Full(residual)) => (residual, 2),
         };
-        let func = self.function("q8_matmul_rows_kernel")?;
+        let int8 = self.quantize_activations(a, m, k)?;
+        let int8 = int8.as_ref().and_then(|guard| guard.as_ref());
+        let func = self.function(if int8.is_some() {
+            "q8_matmul_rows_int8_kernel"
+        } else {
+            "q8_matmul_rows_kernel"
+        })?;
         let mut args = self.stream.launch_builder(&func);
-        args.arg(&a.slice)
-            .arg(&q8.quants)
+        match int8 {
+            Some(scratch) => args.arg(&scratch.values).arg(&scratch.scales),
+            None => args.arg(&a.slice),
+        };
+        args.arg(&q8.quants)
             .arg(&q8.scales)
             .arg(&mut out_dev)
             .arg(&m)
@@ -2848,10 +2964,19 @@ impl CudaKernels {
             Some(MatmulAddend::Row(bias)) => (bias, 1),
             Some(MatmulAddend::Full(residual)) => (residual, 2),
         };
-        let func = self.function("q4k_matmul_rows_kernel")?;
+        let int8 = self.quantize_activations(a, m, k)?;
+        let int8 = int8.as_ref().and_then(|guard| guard.as_ref());
+        let func = self.function(if int8.is_some() {
+            "q4k_matmul_rows_int8_kernel"
+        } else {
+            "q4k_matmul_rows_kernel"
+        })?;
         let mut args = self.stream.launch_builder(&func);
-        args.arg(&a.slice)
-            .arg(&q4k.quants)
+        match int8 {
+            Some(scratch) => args.arg(&scratch.values).arg(&scratch.scales),
+            None => args.arg(&a.slice),
+        };
+        args.arg(&q4k.quants)
             .arg(&mut out_dev)
             .arg(&m)
             .arg(&k)
@@ -2893,10 +3018,19 @@ impl CudaKernels {
             Some(MatmulAddend::Row(bias)) => (bias, 1),
             Some(MatmulAddend::Full(residual)) => (residual, 2),
         };
-        let func = self.function("q6k_matmul_rows_kernel")?;
+        let int8 = self.quantize_activations(a, m, k)?;
+        let int8 = int8.as_ref().and_then(|guard| guard.as_ref());
+        let func = self.function(if int8.is_some() {
+            "q6k_matmul_rows_int8_kernel"
+        } else {
+            "q6k_matmul_rows_kernel"
+        })?;
         let mut args = self.stream.launch_builder(&func);
-        args.arg(&a.slice)
-            .arg(&q6k.quants)
+        match int8 {
+            Some(scratch) => args.arg(&scratch.values).arg(&scratch.scales),
+            None => args.arg(&a.slice),
+        };
+        args.arg(&q6k.quants)
             .arg(&q6k.scales)
             .arg(&mut out_dev)
             .arg(&m)
@@ -2934,10 +3068,19 @@ impl CudaKernels {
         n: u64,
     ) -> Result<CudaDeviceBuffer, CudaError> {
         let mut out_dev = self.alloc_output((m * n) as usize)?;
-        let func = self.function("q8_gated_matmul_rows_kernel")?;
+        let int8 = self.quantize_activations(a, m, k)?;
+        let int8 = int8.as_ref().and_then(|guard| guard.as_ref());
+        let func = self.function(if int8.is_some() {
+            "q8_gated_matmul_rows_int8_kernel"
+        } else {
+            "q8_gated_matmul_rows_kernel"
+        })?;
         let mut args = self.stream.launch_builder(&func);
-        args.arg(&a.slice)
-            .arg(&gate.quants)
+        match int8 {
+            Some(scratch) => args.arg(&scratch.values).arg(&scratch.scales),
+            None => args.arg(&a.slice),
+        };
+        args.arg(&gate.quants)
             .arg(&gate.scales)
             .arg(&up.quants)
             .arg(&up.scales)

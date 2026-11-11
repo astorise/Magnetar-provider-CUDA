@@ -1930,6 +1930,32 @@ fn moe_decode_kernel_times() {
         });
         report(what, ms, k * n / 256 * 210);
     }
+    // The Mistral shapes again with int8 activations (`__dp4a`).
+    kernels.set_int8_activations(true);
+    for (format, k, n) in [
+        ("Q8_0", 4096, 4096),
+        ("Q8_0", 4096, 14_336),
+        ("Q8_0", 14_336, 4096),
+        ("Q4_K", 4096, 4096),
+        ("Q4_K", 4096, 14_336),
+        ("Q4_K", 14_336, 4096),
+        ("Q6_K", 4096, 1024),
+        ("Q6_K", 14_336, 4096),
+        ("Q6_K", 4096, 32_768),
+    ] {
+        let a = upload(&kernels, &activations(1, k, 72));
+        let (packed, bytes) = match format {
+            "Q8_0" => (packed_q8(n, k, true, 73), q8_bytes(k * n)),
+            "Q4_K" => (packed_q4k(n, k, true, 73), k * n / 256 * 144),
+            _ => (packed_q6k(n, k, true, 73), k * n / 256 * 210),
+        };
+        let b = kernels.upload_packed_weight(&packed).unwrap();
+        let ms = time(&|| {
+            kernels.matmul(&a, &b, false, false).unwrap();
+        });
+        report(&format!("int8 {format} [1, {k}] x [{k}, {n}]"), ms, bytes);
+    }
+    kernels.set_int8_activations(false);
 }
 
 /// A deterministic packed `Q8_0` matrix of `stored_rows` x `stored_cols`
@@ -2208,6 +2234,79 @@ fn q6k_packed_matmul_matches_reference_cpu() {
             .unwrap();
         let expected_residual = magnetar_provider_cpu::add(&expected, &residual).unwrap();
         assert_close_relative(&download(&kernels, &with_residual), &expected_residual);
+    }
+}
+
+/// `a` as the int8-activation Kernels see it: each 32-value block rounded
+/// to `d * round(x / d)`, `d = max |x| / 127`.
+fn int8_rounded(a: &HostTensor) -> HostTensor {
+    let mut data = a.data.clone();
+    for block in data.chunks_mut(32) {
+        let amax = block.iter().fold(0.0_f32, |max, x| max.max(x.abs()));
+        let d = amax / 127.0;
+        for x in block {
+            *x = if amax == 0.0 {
+                0.0
+            } else {
+                (*x / d).round_ties_even() * d
+            };
+        }
+    }
+    HostTensor::new(a.shape.clone(), data).unwrap()
+}
+
+/// With int8 activations on, the packed `Q8_0`, `Q4_K` and `Q6_K` decode
+/// matmuls (with a residual addend) and gated matmuls compute the Reference
+/// CPU's result on the rounded activations, and longer matmuls are
+/// unaffected.
+#[test]
+fn int8_activation_matmuls_match_reference_cpu_on_rounded_activations() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    kernels.set_int8_activations(true);
+    let (k, n) = (1024_u64, 97_u64);
+    let weights = [
+        packed_q8(n, k, true, 41),
+        packed_q4k(n, k, true, 42),
+        packed_q6k(n, k, true, 43),
+    ];
+    let ups = [packed_q8(n, k, true, 44), packed_q4k(n, k, true, 45)];
+    for (packed, up) in weights.iter().zip(ups.iter().map(Some).chain([None])) {
+        let dense = packed.dequantize();
+        let weight = kernels.upload_packed_weight(packed).unwrap();
+        for m in [1_u64, 3, 9, 65] {
+            let a = activations(m, k, m as u32 + 60);
+            let rounded = if m <= 64 { int8_rounded(&a) } else { a.clone() };
+            let a_dev = upload(&kernels, &a);
+            let residual = activations(m, n, 61);
+            let expected = magnetar_provider_cpu::add(
+                &magnetar_provider_cpu::matmul(&rounded, &dense, false, false).unwrap(),
+                &residual,
+            )
+            .unwrap();
+            let actual = kernels
+                .matmul_residual(&a_dev, &weight, &upload(&kernels, &residual), false, false)
+                .unwrap();
+            assert_close_relative(&download(&kernels, &actual), &expected);
+            if let Some(up) = up
+                && m <= 64
+            {
+                let up_weight = kernels.upload_packed_weight(up).unwrap();
+                let expected = magnetar_provider_cpu::mul(
+                    &magnetar_provider_cpu::silu(
+                        &magnetar_provider_cpu::matmul(&rounded, &dense, false, false).unwrap(),
+                    ),
+                    &magnetar_provider_cpu::matmul(&rounded, &up.dequantize(), false, false)
+                        .unwrap(),
+                )
+                .unwrap();
+                let actual = kernels
+                    .gated_matmul(&a_dev, &weight, &up_weight, false, false)
+                    .unwrap();
+                assert_close_relative(&download(&kernels, &actual), &expected);
+            }
+        }
     }
 }
 
