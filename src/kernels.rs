@@ -266,6 +266,7 @@ pub struct CudaDeviceBuffer {
 /// `f16` scale, converted exactly). The logical matrix (the buffer's
 /// `shape`) is the stored one, or its transpose when `transposed`.
 pub struct CudaQ8Weight {
+    /// `IQ4_NL`/`IQ4_XS`: see `upload_iq4_weight`.
     /// `Q8_0`: each block's 32 quants, contiguous. `Q4_K`: the super-blocks'
     /// own 144-byte encoding, as stored. `Q6_K`: each super-block's first
     /// 208 bytes (its quants and sub-block scales).
@@ -317,6 +318,24 @@ const Q4K_MATMUL_COLS: u64 = 2;
 const Q6K_MATMUL_COLS: u64 = 2;
 /// `LOWK_COLS` in `kernels.cu`.
 const LOW_BIT_MATMUL_COLS: u64 = 2;
+
+/// `IQ4_NL_FORMAT` / `IQ4_XS_FORMAT` in `kernels.cu`.
+fn iq4_format(format: PackedWeightFormat) -> i32 {
+    match format {
+        PackedWeightFormat::Iq4Nl => 0,
+        _ => 1,
+    }
+}
+
+/// Where an `IQ4_XS` weight's per-run sub-block scales start in its
+/// `quants`, after every run's 16 index bytes.
+fn iq4_subscale_offset(weight: &CudaQ8Weight) -> usize {
+    match weight.format {
+        // No sub-block scales: the kernels never read them.
+        PackedWeightFormat::Iq4Nl => 0,
+        _ => (weight.stored_rows * weight.stored_cols / 32 * 16) as usize,
+    }
+}
 
 /// `LOWK_Q2K` / `LOWK_Q3K` in `kernels.cu`.
 fn low_bit_format(format: PackedWeightFormat) -> i32 {
@@ -1350,6 +1369,12 @@ impl CudaKernels {
         ) {
             return self.upload_low_bit_weight(weight);
         }
+        if matches!(
+            weight.format(),
+            PackedWeightFormat::Iq4Nl | PackedWeightFormat::Iq4Xs
+        ) {
+            return self.upload_iq4_weight(weight);
+        }
         if weight.format() == PackedWeightFormat::Q6K {
             // Each super-block without its trailing f16 `d` (208 bytes,
             // so every one stays 16-byte aligned), `d` as an f32 apart.
@@ -1477,6 +1502,50 @@ impl CudaKernels {
         })
     }
 
+    /// Stores an `IQ4_NL` or `IQ4_XS` weight in the layout
+    /// `iq4_matmul_rows_int8_kernel` reads: every 32-value run's 16 index
+    /// bytes in stored order, then (`IQ4_XS`) one signed byte per run, its
+    /// sub-block scale minus 32; `scales` holds each `IQ4_NL` block's `d`,
+    /// or each `IQ4_XS` super-block's.
+    fn upload_iq4_weight(&self, weight: &PackedWeight) -> Result<CudaDeviceBuffer, CudaError> {
+        let format = weight.format();
+        let block_bytes = format.block_bytes() as usize;
+        let blocks = weight.bytes().chunks_exact(block_bytes);
+        let runs = weight.bytes().len() / block_bytes * (format.block_elements() as usize / 32);
+        let mut quants: Vec<i8> = Vec::with_capacity(runs * 17);
+        let mut subscales = Vec::new();
+        let mut scales = Vec::with_capacity(blocks.len());
+        for block in blocks {
+            scales.push(half_precision::f16_to_f32(u16::from_le_bytes([
+                block[0], block[1],
+            ])));
+            if format == PackedWeightFormat::Iq4Nl {
+                quants.extend(block[2..18].iter().map(|&byte| byte as i8));
+            } else {
+                subscales.extend(magnetar_runtime::model_loading::iq4_xs_scales(&block[2..8]));
+                quants.extend(block[8..136].iter().map(|&byte| byte as i8));
+            }
+        }
+        quants.extend(subscales);
+        let quants = self.stream.clone_htod(&quants)?;
+        let scales = self.stream.clone_htod(&scales)?;
+        let slice = self.stream.alloc_zeros::<f32>(1)?;
+        self.upload_count.fetch_add(1, Ordering::Relaxed);
+        Ok(CudaDeviceBuffer {
+            slice,
+            shape: weight.logical_shape().to_vec(),
+            bf16: None,
+            q8: Some(CudaQ8Weight {
+                quants,
+                scales,
+                format,
+                stored_rows: weight.stored_rows(),
+                stored_cols: weight.stored_cols(),
+                transposed: weight.transposed(),
+            }),
+        })
+    }
+
     /// A packed `Q8_0` buffer's logical matrix as f32, dequantized on the
     /// Device.
     pub fn dequantize_q8(&self, buffer: &CudaDeviceBuffer) -> Result<CudaDeviceBuffer, CudaError> {
@@ -1491,6 +1560,21 @@ impl CudaKernels {
                 let func = self.function("q8_dequantize_kernel")?;
                 let mut args = self.stream.launch_builder(&func);
                 args.arg(&q8.quants)
+                    .arg(&q8.scales)
+                    .arg(&mut out)
+                    .arg(&q8.stored_rows)
+                    .arg(&q8.stored_cols)
+                    .arg(&transposed);
+                unsafe { args.launch(LaunchConfig::for_num_elems(elements as u32)) }?;
+            }
+            PackedWeightFormat::Iq4Nl | PackedWeightFormat::Iq4Xs => {
+                let func = self.function("iq4_dequantize_kernel")?;
+                let format = iq4_format(q8.format);
+                let subscales = q8.quants.slice(iq4_subscale_offset(q8)..);
+                let mut args = self.stream.launch_builder(&func);
+                args.arg(&format)
+                    .arg(&q8.quants)
+                    .arg(&subscales)
                     .arg(&q8.scales)
                     .arg(&mut out)
                     .arg(&q8.stored_rows)
@@ -2801,6 +2885,59 @@ impl CudaKernels {
             Self::require_f32(&[a], "gated-matmul's input")?;
             return self.q8_gated_matmul_rows(a, gate_q8, up_q8, m, k, b_cols);
         }
+        if let (Some(gate_iq), Some(up_iq)) = (&gate.q8, &up.q8)
+            && matches!(
+                gate_iq.format,
+                PackedWeightFormat::Iq4Nl | PackedWeightFormat::Iq4Xs
+            )
+            && up_iq.format == gate_iq.format
+            && gate_iq.transposed
+            && up_iq.transposed
+            && !transpose_a
+            && !transpose_b
+            && m <= Q8_MATMUL_MAX_ROWS
+            && k == b_rows
+        {
+            Self::require_f32(&[a], "gated-matmul's input")?;
+            let int8 = self.quantize_activations(a, m, k)?;
+            if let Some(scratch) = int8.as_ref().and_then(|guard| guard.as_ref()) {
+                let mut out_dev = self.alloc_output((m * b_cols) as usize)?;
+                let format = iq4_format(gate_iq.format);
+                let gate_sub = gate_iq.quants.slice(iq4_subscale_offset(gate_iq)..);
+                let up_sub = up_iq.quants.slice(iq4_subscale_offset(up_iq)..);
+                let func = self.function("iq4_gated_matmul_rows_int8_kernel")?;
+                let mut args = self.stream.launch_builder(&func);
+                args.arg(&format)
+                    .arg(&scratch.values)
+                    .arg(&scratch.scales)
+                    .arg(&gate_iq.quants)
+                    .arg(&gate_sub)
+                    .arg(&gate_iq.scales)
+                    .arg(&up_iq.quants)
+                    .arg(&up_sub)
+                    .arg(&up_iq.scales)
+                    .arg(&mut out_dev)
+                    .arg(&m)
+                    .arg(&k)
+                    .arg(&b_cols);
+                let config = LaunchConfig {
+                    grid_dim: (
+                        b_cols.div_ceil(u64::from(Q8_MATMUL_WARPS)) as u32,
+                        m.div_ceil(Q8_MATMUL_ROWS) as u32,
+                        1,
+                    ),
+                    block_dim: (32, Q8_MATMUL_WARPS, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe { args.launch(config) }?;
+                return Ok(CudaDeviceBuffer {
+                    slice: out_dev,
+                    shape: vec![m, b_cols],
+                    bf16: None,
+                    q8: None,
+                });
+            }
+        }
         if let (Some(gate_low), Some(up_low)) = (&gate.q8, &up.q8)
             && matches!(
                 gate_low.format,
@@ -3128,6 +3265,61 @@ impl CudaKernels {
         })
     }
 
+    /// `iq4_matmul_rows_int8_kernel` for an `IQ4_NL`/`IQ4_XS` weight, when
+    /// the activations can be quantized to int8; `None` otherwise.
+    fn iq4_matmul_rows(
+        &self,
+        a: &CudaDeviceBuffer,
+        weight: &CudaQ8Weight,
+        m: u64,
+        k: u64,
+        n: u64,
+        addend: Option<MatmulAddend<'_>>,
+    ) -> Result<Option<CudaDeviceBuffer>, CudaError> {
+        let int8 = self.quantize_activations(a, m, k)?;
+        let Some(scratch) = int8.as_ref().and_then(|guard| guard.as_ref()) else {
+            return Ok(None);
+        };
+        let mut out_dev = self.alloc_output((m * n) as usize)?;
+        let (addend_buffer, addend_mode) = match addend {
+            None => (a, 0i32),
+            Some(MatmulAddend::Row(bias)) => (bias, 1),
+            Some(MatmulAddend::Full(residual)) => (residual, 2),
+        };
+        let format = iq4_format(weight.format);
+        let subscales = weight.quants.slice(iq4_subscale_offset(weight)..);
+        let func = self.function("iq4_matmul_rows_int8_kernel")?;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(&format)
+            .arg(&scratch.values)
+            .arg(&scratch.scales)
+            .arg(&weight.quants)
+            .arg(&subscales)
+            .arg(&weight.scales)
+            .arg(&mut out_dev)
+            .arg(&m)
+            .arg(&k)
+            .arg(&n)
+            .arg(&addend_buffer.slice)
+            .arg(&addend_mode);
+        let config = LaunchConfig {
+            grid_dim: (
+                n.div_ceil(u64::from(Q8_MATMUL_WARPS)) as u32,
+                m.div_ceil(Q8_MATMUL_ROWS) as u32,
+                1,
+            ),
+            block_dim: (32, Q8_MATMUL_WARPS, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { args.launch(config) }?;
+        Ok(Some(CudaDeviceBuffer {
+            slice: out_dev,
+            shape: vec![m, n],
+            bf16: None,
+            q8: None,
+        }))
+    }
+
     /// `lowk_matmul_rows_int8_kernel` for a `Q2_K`/`Q3_K` weight, when the
     /// activations can be quantized to int8; `None` otherwise.
     fn low_bit_matmul_rows(
@@ -3355,6 +3547,15 @@ impl CudaKernels {
                     PackedWeightFormat::Q8_0 => self.q8_matmul_rows(a, q8, m, k, n, addend),
                     PackedWeightFormat::Q4K => self.q4k_matmul_rows(a, q8, m, k, n, addend),
                     PackedWeightFormat::Q6K => self.q6k_matmul_rows(a, q8, m, k, n, addend),
+                    PackedWeightFormat::Iq4Nl | PackedWeightFormat::Iq4Xs => {
+                        match self.iq4_matmul_rows(a, q8, m, k, n, addend)? {
+                            Some(out) => Ok(out),
+                            None => {
+                                let dense = self.dequantize_q8(b)?;
+                                self.matmul_with_addend(a, &dense, addend, transpose_a, transpose_b)
+                            }
+                        }
+                    }
                     PackedWeightFormat::Q2K | PackedWeightFormat::Q3K => {
                         match self.low_bit_matmul_rows(a, q8, m, k, n, addend)? {
                             Some(out) => Ok(out),

@@ -1952,6 +1952,10 @@ fn moe_decode_kernel_times() {
         ("Q2_K", 4096, 4096),
         ("Q2_K", 4096, 14_336),
         ("Q2_K", 14_336, 4096),
+        ("IQ4_XS", 4096, 4096),
+        ("IQ4_XS", 4096, 14_336),
+        ("IQ4_XS", 14_336, 4096),
+        ("IQ4_NL", 4096, 14_336),
     ] {
         let a = upload(&kernels, &activations(1, k, 72));
         let (packed, bytes) = match format {
@@ -1962,9 +1966,17 @@ fn moe_decode_kernel_times() {
                 packed_low_bit(PackedWeightFormat::Q3K, n, k, 73),
                 k * n / 256 * 110,
             ),
-            _ => (
+            "Q2_K" => (
                 packed_low_bit(PackedWeightFormat::Q2K, n, k, 73),
                 k * n / 256 * 84,
+            ),
+            "IQ4_XS" => (
+                packed_iq4(PackedWeightFormat::Iq4Xs, n, k, 73),
+                k * n / 256 * 136,
+            ),
+            _ => (
+                packed_iq4(PackedWeightFormat::Iq4Nl, n, k, 73),
+                k * n / 32 * 18,
             ),
         };
         let b = kernels.upload_packed_weight(&packed).unwrap();
@@ -2289,6 +2301,95 @@ fn packed_low_bit(
         }
     }
     PackedWeight::new(format, stored_rows, stored_cols, true, bytes).unwrap()
+}
+
+/// A deterministic packed `IQ4_NL` or `IQ4_XS` matrix: a small positive
+/// f16 `d` first in every block, random scales and indices after it.
+fn packed_iq4(
+    format: PackedWeightFormat,
+    stored_rows: u64,
+    stored_cols: u64,
+    seed: u32,
+) -> PackedWeight {
+    let block_elements = format.block_elements();
+    let blocks = stored_rows * stored_cols / block_elements;
+    let block_bytes = format.block_bytes() as usize;
+    let mut bytes = Vec::with_capacity(blocks as usize * block_bytes);
+    let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state
+    };
+    for _ in 0..blocks {
+        // f16 between about 2^-12 and 2^-8.
+        let exponent = 3 + (next() % 5) as u16;
+        let bits = (exponent << 10) | (next() % 1024) as u16;
+        bytes.extend(bits.to_le_bytes());
+        bytes.extend((0..block_bytes - 2).map(|_| (next() % 256) as u8));
+    }
+    PackedWeight::new(format, stored_rows, stored_cols, true, bytes).unwrap()
+}
+
+/// Packed `IQ4_NL` and `IQ4_XS` weights: downloading or expanding gives
+/// back exactly the Runtime's dequantization; with int8 activations their
+/// decode matmul (with a residual addend) and gated matmul match the
+/// Reference CPU on the rounded activations; without, and for longer
+/// matmuls, they match it on the f32 activations.
+#[test]
+fn iq4_packed_matmuls_match_reference_cpu() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let (k, n) = (1024_u64, 97_u64);
+    for format in [PackedWeightFormat::Iq4Nl, PackedWeightFormat::Iq4Xs] {
+        let packed = packed_iq4(format, n, k, 61);
+        let up = packed_iq4(format, n, k, 62);
+        let dense = packed.dequantize();
+        let weight = kernels.upload_packed_weight(&packed).unwrap();
+        let up_weight = kernels.upload_packed_weight(&up).unwrap();
+        assert_eq!(weight.shape, vec![k, n]);
+        assert_eq!(download(&kernels, &weight).data, dense.data, "{format:?}");
+        assert_eq!(
+            download(&kernels, &kernels.expand(&weight).unwrap()).data,
+            dense.data
+        );
+        for int8 in [true, false] {
+            kernels.set_int8_activations(int8);
+            for m in [1_u64, 3, 9, 65] {
+                let a = activations(m, k, m as u32 + 90);
+                let seen = if int8 && m <= 64 {
+                    int8_rounded(&a)
+                } else {
+                    a.clone()
+                };
+                let a_dev = upload(&kernels, &a);
+                let residual = activations(m, n, 91);
+                let expected = magnetar_provider_cpu::add(
+                    &magnetar_provider_cpu::matmul(&seen, &dense, false, false).unwrap(),
+                    &residual,
+                )
+                .unwrap();
+                let actual = kernels
+                    .matmul_residual(&a_dev, &weight, &upload(&kernels, &residual), false, false)
+                    .unwrap();
+                assert_close_relative(&download(&kernels, &actual), &expected);
+                let expected = magnetar_provider_cpu::mul(
+                    &magnetar_provider_cpu::silu(
+                        &magnetar_provider_cpu::matmul(&seen, &dense, false, false).unwrap(),
+                    ),
+                    &magnetar_provider_cpu::matmul(&seen, &up.dequantize(), false, false).unwrap(),
+                )
+                .unwrap();
+                let actual = kernels
+                    .gated_matmul(&a_dev, &weight, &up_weight, false, false)
+                    .unwrap();
+                assert_close_relative(&download(&kernels, &actual), &expected);
+            }
+        }
+    }
+    kernels.set_int8_activations(false);
 }
 
 /// Packed `Q2_K` and `Q3_K` weights: downloading or expanding gives back

@@ -3611,3 +3611,209 @@ extern "C" __global__ void lowk_gated_matmul_rows_int8_kernel(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Packed `IQ4_NL` and `IQ4_XS` weights (`execute-direct-quantized-weights`),
+// read with int8 activations only, like `Q2_K`/`Q3_K`. Both are runs of 32
+// values: 16 bytes whose low nibbles index values 0..15 and high nibbles
+// values 16..31 in the non-linear table below. On the Device every run's
+// 16 bytes are contiguous in stored order; `IQ4_NL` (format 0) keeps one
+// f32 scale per run, `IQ4_XS` (format 1) one f32 `d` per super-block of
+// eight runs and, after all runs' bytes, one signed byte per run: its
+// 6-bit sub-block scale minus 32.
+
+#define IQ4_NL_FORMAT 0
+#define IQ4_XS_FORMAT 1
+
+__constant__ signed char IQ4_VALUES[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+
+// Four table values for the four nibbles in the low halves of `nibbles`'
+// bytes (each byte 0..15).
+__device__ __forceinline__ int iq4_lookup4(unsigned int nibbles) {
+    return (int)((unsigned char)IQ4_VALUES[nibbles & 0xF]
+        | ((unsigned int)(unsigned char)IQ4_VALUES[(nibbles >> 8) & 0xF] << 8)
+        | ((unsigned int)(unsigned char)IQ4_VALUES[(nibbles >> 16) & 0xF] << 16)
+        | ((unsigned int)(unsigned char)IQ4_VALUES[(nibbles >> 24) & 0xF] << 24));
+}
+
+// Run `run`'s scale (`run` counted over the whole stored matrix).
+__device__ __forceinline__ float iq4_run_scale(
+    int format,
+    const float* dscales,
+    const signed char* subscales,
+    unsigned long long run
+) {
+    return format == IQ4_NL_FORMAT ? dscales[run] : dscales[run / 8] * (float)subscales[run];
+}
+
+// The logical matrix as f32, one thread per stored element.
+extern "C" __global__ void iq4_dequantize_kernel(
+    int format,
+    const unsigned char* qs,
+    const signed char* subscales,
+    const float* dscales,
+    float* out,
+    unsigned long long stored_rows,
+    unsigned long long stored_cols,
+    unsigned int transposed
+) {
+    unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= stored_rows * stored_cols) {
+        return;
+    }
+    unsigned long long r = idx / stored_cols;
+    unsigned long long c = idx % stored_cols;
+    unsigned long long run = idx / 32;
+    unsigned int w = (unsigned int)(c % 32);
+    unsigned char byte = qs[run * 16 + (w % 16)];
+    unsigned int index = w < 16 ? (byte & 0xF) : (byte >> 4);
+    float value = iq4_run_scale(format, dscales, subscales, run) * (float)IQ4_VALUES[index];
+    if (transposed) {
+        out[c * stored_rows + r] = value;
+    } else {
+        out[idx] = value;
+    }
+}
+
+// One run's dot product with its 32 int8 activations (`x0` the first 16).
+__device__ __forceinline__ int iq4_run_dot(int4 q, int4 x0, int4 x1) {
+    const unsigned int* w = reinterpret_cast<const unsigned int*>(&q);
+    const int* xa = reinterpret_cast<const int*>(&x0);
+    const int* xb = reinterpret_cast<const int*>(&x1);
+    int dot = 0;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        dot = i8_dot4(iq4_lookup4(w[i] & 0x0F0F0F0Fu), xa[i], dot);
+        dot = i8_dot4(iq4_lookup4((w[i] >> 4) & 0x0F0F0F0Fu), xb[i], dot);
+    }
+    return dot;
+}
+
+// out[r, c] = sum_k a[r, k] * W[k, c] (+ addend) for a packed `IQ4_NL` or
+// `IQ4_XS` weight stored transposed, over int8 activations: one warp per
+// column, one 32-value run (one activation block) per lane per step.
+extern "C" __global__ void iq4_matmul_rows_int8_kernel(
+    int format,
+    const signed char* aq,
+    const float* ad,
+    const unsigned char* qs,
+    const signed char* subscales,
+    const float* dscales,
+    float* out,
+    unsigned long long m,
+    unsigned long long k,
+    unsigned long long n,
+    const float* addend,
+    int addend_mode
+) {
+    unsigned long long col = (unsigned long long)blockIdx.x * Q8_MATMUL_WARPS + threadIdx.y;
+    unsigned long long first_row = (unsigned long long)blockIdx.y * Q8_MATMUL_ROWS;
+    if (col >= n || first_row >= m) {
+        return;
+    }
+    unsigned int rows = (unsigned int)min((unsigned long long)Q8_MATMUL_ROWS, m - first_row);
+    unsigned int lane = threadIdx.x;
+    unsigned long long runs = k / 32;
+    float acc[Q8_MATMUL_ROWS];
+#pragma unroll
+    for (int r = 0; r < Q8_MATMUL_ROWS; r++) {
+        acc[r] = 0.0f;
+    }
+    for (unsigned long long u = lane; u < runs; u += 32) {
+        unsigned long long run = col * runs + u;
+        int4 q = *reinterpret_cast<const int4*>(qs + run * 16);
+        float scale = iq4_run_scale(format, dscales, subscales, run);
+#pragma unroll
+        for (int r = 0; r < Q8_MATMUL_ROWS; r++) {
+            if (r < (int)rows) {
+                unsigned long long at = (first_row + r) * k + u * 32;
+                int4 x0 = *reinterpret_cast<const int4*>(aq + at);
+                int4 x1 = *reinterpret_cast<const int4*>(aq + at + 16);
+                acc[r] += scale * ad[at >> 5] * (float)iq4_run_dot(q, x0, x1);
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < Q8_MATMUL_ROWS; r++) {
+        float sum = acc[r];
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum += __shfl_xor_sync(0xffffffffu, sum, offset);
+        }
+        if (lane == 0 && r < (int)rows) {
+            unsigned long long row = first_row + r;
+            if (addend_mode == 1) {
+                sum += addend[col];
+            } else if (addend_mode == 2) {
+                sum += addend[row * n + col];
+            }
+            out[row * n + col] = sum;
+        }
+    }
+}
+
+// `silu(a x gate) * (a x up)` for two packed `IQ4_NL`/`IQ4_XS` weights of
+// one format, stored transposed, over int8 activations.
+extern "C" __global__ void iq4_gated_matmul_rows_int8_kernel(
+    int format,
+    const signed char* aq,
+    const float* ad,
+    const unsigned char* gate_qs,
+    const signed char* gate_subscales,
+    const float* gate_dscales,
+    const unsigned char* up_qs,
+    const signed char* up_subscales,
+    const float* up_dscales,
+    float* out,
+    unsigned long long m,
+    unsigned long long k,
+    unsigned long long n
+) {
+    unsigned long long col = (unsigned long long)blockIdx.x * Q8_MATMUL_WARPS + threadIdx.y;
+    unsigned long long first_row = (unsigned long long)blockIdx.y * Q8_MATMUL_ROWS;
+    if (col >= n || first_row >= m) {
+        return;
+    }
+    unsigned int rows = (unsigned int)min((unsigned long long)Q8_MATMUL_ROWS, m - first_row);
+    unsigned int lane = threadIdx.x;
+    unsigned long long runs = k / 32;
+    float gate_acc[Q8_MATMUL_ROWS];
+    float up_acc[Q8_MATMUL_ROWS];
+#pragma unroll
+    for (int r = 0; r < Q8_MATMUL_ROWS; r++) {
+        gate_acc[r] = 0.0f;
+        up_acc[r] = 0.0f;
+    }
+    for (unsigned long long u = lane; u < runs; u += 32) {
+        unsigned long long run = col * runs + u;
+        int4 qg = *reinterpret_cast<const int4*>(gate_qs + run * 16);
+        int4 qu = *reinterpret_cast<const int4*>(up_qs + run * 16);
+        float sg = iq4_run_scale(format, gate_dscales, gate_subscales, run);
+        float su = iq4_run_scale(format, up_dscales, up_subscales, run);
+#pragma unroll
+        for (int r = 0; r < Q8_MATMUL_ROWS; r++) {
+            if (r < (int)rows) {
+                unsigned long long at = (first_row + r) * k + u * 32;
+                int4 x0 = *reinterpret_cast<const int4*>(aq + at);
+                int4 x1 = *reinterpret_cast<const int4*>(aq + at + 16);
+                float da = ad[at >> 5];
+                gate_acc[r] += sg * da * (float)iq4_run_dot(qg, x0, x1);
+                up_acc[r] += su * da * (float)iq4_run_dot(qu, x0, x1);
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < Q8_MATMUL_ROWS; r++) {
+        float g = gate_acc[r];
+        float u = up_acc[r];
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            g += __shfl_xor_sync(0xffffffffu, g, offset);
+            u += __shfl_xor_sync(0xffffffffu, u, offset);
+        }
+        if (lane == 0 && r < (int)rows) {
+            out[(first_row + r) * n + col] = g * (1.0f / (1.0f + expf(-g))) * u;
+        }
+    }
+}
