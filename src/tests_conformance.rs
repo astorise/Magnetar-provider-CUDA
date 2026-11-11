@@ -1956,6 +1956,11 @@ fn moe_decode_kernel_times() {
         ("IQ4_XS", 4096, 14_336),
         ("IQ4_XS", 14_336, 4096),
         ("IQ4_NL", 4096, 14_336),
+        ("IQ3_XXS", 4096, 14_336),
+        ("IQ3_S", 4096, 14_336),
+        ("IQ2_XXS", 4096, 14_336),
+        ("IQ2_XS", 4096, 14_336),
+        ("IQ2_S", 4096, 14_336),
     ] {
         let a = upload(&kernels, &activations(1, k, 72));
         let (packed, bytes) = match format {
@@ -1974,6 +1979,19 @@ fn moe_decode_kernel_times() {
                 packed_iq4(PackedWeightFormat::Iq4Xs, n, k, 73),
                 k * n / 256 * 136,
             ),
+            "IQ3_XXS" | "IQ3_S" | "IQ2_XXS" | "IQ2_XS" | "IQ2_S" => {
+                let format = match format {
+                    "IQ3_XXS" => PackedWeightFormat::Iq3Xxs,
+                    "IQ3_S" => PackedWeightFormat::Iq3S,
+                    "IQ2_XXS" => PackedWeightFormat::Iq2Xxs,
+                    "IQ2_XS" => PackedWeightFormat::Iq2Xs,
+                    _ => PackedWeightFormat::Iq2S,
+                };
+                (
+                    packed_iq4(format, n, k, 73),
+                    k * n / 256 * format.block_bytes(),
+                )
+            }
             _ => (
                 packed_iq4(PackedWeightFormat::Iq4Nl, n, k, 73),
                 k * n / 32 * 18,
@@ -2303,8 +2321,9 @@ fn packed_low_bit(
     PackedWeight::new(format, stored_rows, stored_cols, true, bytes).unwrap()
 }
 
-/// A deterministic packed `IQ4_NL` or `IQ4_XS` matrix: a small positive
-/// f16 `d` first in every block, random scales and indices after it.
+/// A deterministic packed i-quant matrix (`IQ4_NL`, `IQ4_XS` or an
+/// IQ2/IQ3 format): a small positive f16 `d` first in every block, random
+/// scales, signs and indices after it.
 fn packed_iq4(
     format: PackedWeightFormat,
     stored_rows: u64,
@@ -2332,18 +2351,27 @@ fn packed_iq4(
     PackedWeight::new(format, stored_rows, stored_cols, true, bytes).unwrap()
 }
 
-/// Packed `IQ4_NL` and `IQ4_XS` weights: downloading or expanding gives
+/// Packed i-quant weights (`IQ4_NL`, `IQ4_XS` and the IQ2/IQ3 formats):
+/// downloading or expanding gives
 /// back exactly the Runtime's dequantization; with int8 activations their
 /// decode matmul (with a residual addend) and gated matmul match the
 /// Reference CPU on the rounded activations; without, and for longer
 /// matmuls, they match it on the f32 activations.
 #[test]
-fn iq4_packed_matmuls_match_reference_cpu() {
+fn iq_packed_matmuls_match_reference_cpu() {
     let Some(kernels) = kernels_or_skip() else {
         return;
     };
     let (k, n) = (1024_u64, 97_u64);
-    for format in [PackedWeightFormat::Iq4Nl, PackedWeightFormat::Iq4Xs] {
+    for format in [
+        PackedWeightFormat::Iq4Nl,
+        PackedWeightFormat::Iq4Xs,
+        PackedWeightFormat::Iq2Xxs,
+        PackedWeightFormat::Iq2Xs,
+        PackedWeightFormat::Iq2S,
+        PackedWeightFormat::Iq3Xxs,
+        PackedWeightFormat::Iq3S,
+    ] {
         let packed = packed_iq4(format, n, k, 61);
         let up = packed_iq4(format, n, k, 62);
         let dense = packed.dequantize();
