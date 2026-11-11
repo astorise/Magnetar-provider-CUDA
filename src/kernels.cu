@@ -3629,12 +3629,18 @@ __constant__ signed char IQ4_VALUES[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
 
 // Four table values for the four nibbles in the low halves of `nibbles`'
-// bytes (each byte 0..15).
+// bytes (each byte 0..15), from registers: `__byte_perm` picks each byte
+// from the first eight table entries and from the last eight by the
+// index's low three bits, and its bit 3 chooses between the two. A
+// lookup in `IQ4_VALUES` instead serializes the warp whenever its lanes
+// read different entries.
 __device__ __forceinline__ int iq4_lookup4(unsigned int nibbles) {
-    return (int)((unsigned char)IQ4_VALUES[nibbles & 0xF]
-        | ((unsigned int)(unsigned char)IQ4_VALUES[(nibbles >> 8) & 0xF] << 8)
-        | ((unsigned int)(unsigned char)IQ4_VALUES[(nibbles >> 16) & 0xF] << 16)
-        | ((unsigned int)(unsigned char)IQ4_VALUES[(nibbles >> 24) & 0xF] << 24));
+    unsigned int selector = (nibbles & 0x7u) | ((nibbles >> 4) & 0x70u)
+        | ((nibbles >> 8) & 0x700u) | ((nibbles >> 12) & 0x7000u);
+    unsigned int low = __byte_perm(0xBFAD9881u, 0xF6EADDCFu, selector);
+    unsigned int high = __byte_perm(0x26190D01u, 0x71594535u, selector);
+    unsigned int upper = ((nibbles >> 3) & 0x01010101u) * 0xFFu;
+    return (int)((low & ~upper) | (high & upper));
 }
 
 // Run `run`'s scale (`run` counted over the whole stored matrix).
