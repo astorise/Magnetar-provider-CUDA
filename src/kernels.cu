@@ -2395,6 +2395,21 @@ extern "C" __global__ void kv_write_kernel(
 #define Q4K_BLOCK_VALUES 256
 #define Q4K_BLOCK_BYTES 144
 
+// An `f16`'s value, converted by the hardware (`cvt.f32.f16`).
+__device__ __forceinline__ float q4k_half(const unsigned char* bytes) {
+    unsigned short bits = (unsigned short)(bytes[0] | (bytes[1] << 8));
+    float value;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(value) : "h"(bits));
+    return value;
+}
+
+// A 4-bit quant as f32, exactly: placed in the low mantissa bits of 2^23,
+// then 2^23 subtracted -- an integer OR and a float add instead of the
+// slower integer-to-float conversion.
+__device__ __forceinline__ float q4k_nibble(unsigned int nibble) {
+    return __int_as_float(0x4B000000 | nibble) - 8388608.0f;
+}
+
 // Sub-block `j`'s 6-bit scale and min (`ggml-quants.c`'s
 // `get_scale_min_k4`).
 __device__ __forceinline__ void q4k_scale_min(
@@ -2486,8 +2501,8 @@ extern "C" __global__ void q4k_matmul_rows_kernel(
         const unsigned char* block = w + sb * Q4K_BLOCK_BYTES;
         int4 packed = *reinterpret_cast<const int4*>(block + 16 + 32 * chunk + offset);
         const unsigned char* q = reinterpret_cast<const unsigned char*>(&packed);
-        float d = half_bits_to_float((unsigned short)(block[0] | (block[1] << 8)));
-        float dmin = half_bits_to_float((unsigned short)(block[2] | (block[3] << 8)));
+        float d = q4k_half(block);
+        float dmin = q4k_half(block + 2);
         float scale_lo, min_lo, scale_hi, min_hi;
         q4k_scale_min(2 * chunk, block + 4, &scale_lo, &min_lo);
         q4k_scale_min(2 * chunk + 1, block + 4, &scale_hi, &min_hi);
@@ -2503,10 +2518,10 @@ extern "C" __global__ void q4k_matmul_rows_kernel(
                 for (int j = 0; j < 16; j += 4) {
                     float4 lo = *reinterpret_cast<const float4*>(x + j);
                     float4 hi = *reinterpret_cast<const float4*>(x + 32 + j);
-                    dot_lo += lo.x * (float)(q[j] & 0xF) + lo.y * (float)(q[j + 1] & 0xF)
-                        + lo.z * (float)(q[j + 2] & 0xF) + lo.w * (float)(q[j + 3] & 0xF);
-                    dot_hi += hi.x * (float)(q[j] >> 4) + hi.y * (float)(q[j + 1] >> 4)
-                        + hi.z * (float)(q[j + 2] >> 4) + hi.w * (float)(q[j + 3] >> 4);
+                    dot_lo += lo.x * q4k_nibble(q[j] & 0xF) + lo.y * q4k_nibble(q[j + 1] & 0xF)
+                        + lo.z * q4k_nibble(q[j + 2] & 0xF) + lo.w * q4k_nibble(q[j + 3] & 0xF);
+                    dot_hi += hi.x * q4k_nibble(q[j] >> 4) + hi.y * q4k_nibble(q[j + 1] >> 4)
+                        + hi.z * q4k_nibble(q[j + 2] >> 4) + hi.w * q4k_nibble(q[j + 3] >> 4);
                     sum_lo += lo.x + lo.y + lo.z + lo.w;
                     sum_hi += hi.x + hi.y + hi.z + hi.w;
                 }
@@ -2545,8 +2560,8 @@ __device__ __forceinline__ float q4k_lane_dot(
 ) {
     int4 packed = *reinterpret_cast<const int4*>(block + 16 + 32 * chunk + offset);
     const unsigned char* q = reinterpret_cast<const unsigned char*>(&packed);
-    float d = half_bits_to_float((unsigned short)(block[0] | (block[1] << 8)));
-    float dmin = half_bits_to_float((unsigned short)(block[2] | (block[3] << 8)));
+    float d = q4k_half(block);
+    float dmin = q4k_half(block + 2);
     float scale_lo, min_lo, scale_hi, min_hi;
     q4k_scale_min(2 * chunk, block + 4, &scale_lo, &min_lo);
     q4k_scale_min(2 * chunk + 1, block + 4, &scale_hi, &min_hi);
@@ -2555,10 +2570,10 @@ __device__ __forceinline__ float q4k_lane_dot(
     for (int j = 0; j < 16; j += 4) {
         float4 lo = *reinterpret_cast<const float4*>(x + j);
         float4 hi = *reinterpret_cast<const float4*>(x + 32 + j);
-        dot_lo += lo.x * (float)(q[j] & 0xF) + lo.y * (float)(q[j + 1] & 0xF)
-            + lo.z * (float)(q[j + 2] & 0xF) + lo.w * (float)(q[j + 3] & 0xF);
-        dot_hi += hi.x * (float)(q[j] >> 4) + hi.y * (float)(q[j + 1] >> 4)
-            + hi.z * (float)(q[j + 2] >> 4) + hi.w * (float)(q[j + 3] >> 4);
+        dot_lo += lo.x * q4k_nibble(q[j] & 0xF) + lo.y * q4k_nibble(q[j + 1] & 0xF)
+            + lo.z * q4k_nibble(q[j + 2] & 0xF) + lo.w * q4k_nibble(q[j + 3] & 0xF);
+        dot_hi += hi.x * q4k_nibble(q[j] >> 4) + hi.y * q4k_nibble(q[j + 1] >> 4)
+            + hi.z * q4k_nibble(q[j + 2] >> 4) + hi.w * q4k_nibble(q[j + 3] >> 4);
         sum_lo += lo.x + lo.y + lo.z + lo.w;
         sum_hi += hi.x + hi.y + hi.z + hi.w;
     }
