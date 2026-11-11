@@ -2059,7 +2059,7 @@ fn q4k_packed_matmul_matches_reference_cpu() {
     let Some(kernels) = kernels_or_skip() else {
         return;
     };
-    let (k, n) = (1024_u64, 96_u64);
+    let (k, n) = (1024_u64, 97_u64); // odd: a warp with one column left
     let packed = packed_q4k(n, k, true, 21);
     let dense = packed.dequantize();
     let weight = kernels.upload_packed_weight(&packed).unwrap();

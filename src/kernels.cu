@@ -2462,13 +2462,18 @@ extern "C" __global__ void q4k_dequantize_kernel(
     }
 }
 
+// Output columns one warp of `q4k_matmul_rows_kernel` computes: each
+// activation load serves all of them.
+#define Q4K_COLS 2
+
 // out[r, c] = sum_k a[r, k] * W[k, c] (+ addend) for a packed `Q4_K` weight
 // stored transposed (stored row c holds column c's `k` values, `k / 256`
-// super-blocks). One warp per output column, up to Q8_MATMUL_ROWS rows of
-// `a`: each step covers four super-blocks, eight lanes each; a lane loads
-// 16 quant bytes (32 values: 16 of sub-block 2c in the low nibbles, 16 of
-// sub-block 2c + 1 in the high ones) and applies the two sub-blocks'
-// scales and mins to its partial sums.
+// super-blocks). One warp per Q4K_COLS output columns, up to
+// Q8_MATMUL_ROWS rows of `a`: each step covers four super-blocks, eight
+// lanes each; a lane loads 16 quant bytes per column (32 values: 16 of
+// sub-block 2c in the low nibbles, 16 of sub-block 2c + 1 in the high
+// ones), the matching 32 activations once for all its columns, and
+// applies each column's sub-block scales and mins.
 extern "C" __global__ void q4k_matmul_rows_kernel(
     const float* a,
     const unsigned char* blocks,
@@ -2479,71 +2484,104 @@ extern "C" __global__ void q4k_matmul_rows_kernel(
     const float* addend,
     int addend_mode
 ) {
-    unsigned long long col = (unsigned long long)blockIdx.x * Q8_MATMUL_WARPS + threadIdx.y;
+    unsigned long long col0 =
+        ((unsigned long long)blockIdx.x * Q8_MATMUL_WARPS + threadIdx.y) * Q4K_COLS;
     unsigned long long first_row = (unsigned long long)blockIdx.y * Q8_MATMUL_ROWS;
-    if (col >= n || first_row >= m) {
+    if (col0 >= n || first_row >= m) {
         return;
     }
     unsigned int rows = (unsigned int)min((unsigned long long)Q8_MATMUL_ROWS, m - first_row);
+    unsigned int cols = (unsigned int)min((unsigned long long)Q4K_COLS, n - col0);
     unsigned int lane = threadIdx.x;
     unsigned long long super_blocks = k / Q4K_BLOCK_VALUES;
-    const unsigned char* w = blocks + col * super_blocks * Q4K_BLOCK_BYTES;
-    // This lane's part of a super-block: 16 bytes of chunk `chunk`.
     unsigned int part = lane % 8;
     unsigned int chunk = part / 2;
     unsigned int offset = 16 * (part % 2);
-    float acc[Q8_MATMUL_ROWS];
+    float acc[Q8_MATMUL_ROWS][Q4K_COLS];
 #pragma unroll
     for (int r = 0; r < Q8_MATMUL_ROWS; r++) {
-        acc[r] = 0.0f;
+#pragma unroll
+        for (int c = 0; c < Q4K_COLS; c++) {
+            acc[r][c] = 0.0f;
+        }
     }
     for (unsigned long long sb = lane / 8; sb < super_blocks; sb += 4) {
-        const unsigned char* block = w + sb * Q4K_BLOCK_BYTES;
-        int4 packed = *reinterpret_cast<const int4*>(block + 16 + 32 * chunk + offset);
-        const unsigned char* q = reinterpret_cast<const unsigned char*>(&packed);
-        float d = q4k_half(block);
-        float dmin = q4k_half(block + 2);
-        float scale_lo, min_lo, scale_hi, min_hi;
-        q4k_scale_min(2 * chunk, block + 4, &scale_lo, &min_lo);
-        q4k_scale_min(2 * chunk + 1, block + 4, &scale_hi, &min_hi);
-        float d_lo = d * scale_lo, m_lo = dmin * min_lo;
-        float d_hi = d * scale_hi, m_hi = dmin * min_hi;
+        int4 packed[Q4K_COLS];
+        float d_lo[Q4K_COLS], m_lo[Q4K_COLS], d_hi[Q4K_COLS], m_hi[Q4K_COLS];
+#pragma unroll
+        for (int c = 0; c < Q4K_COLS; c++) {
+            unsigned int column = (unsigned int)c < cols ? c : 0;
+            const unsigned char* block =
+                blocks + ((col0 + column) * super_blocks + sb) * Q4K_BLOCK_BYTES;
+            packed[c] = *reinterpret_cast<const int4*>(block + 16 + 32 * chunk + offset);
+            float d = q4k_half(block);
+            float dmin = q4k_half(block + 2);
+            float scale_lo, min_lo, scale_hi, min_hi;
+            q4k_scale_min(2 * chunk, block + 4, &scale_lo, &min_lo);
+            q4k_scale_min(2 * chunk + 1, block + 4, &scale_hi, &min_hi);
+            d_lo[c] = d * scale_lo;
+            m_lo[c] = dmin * min_lo;
+            d_hi[c] = d * scale_hi;
+            m_hi[c] = dmin * min_hi;
+        }
         unsigned long long base = sb * Q4K_BLOCK_VALUES + 64 * chunk + offset;
 #pragma unroll
         for (int r = 0; r < Q8_MATMUL_ROWS; r++) {
             if (r < (int)rows) {
                 const float* x = a + (first_row + r) * k + base;
-                float dot_lo = 0.0f, sum_lo = 0.0f, dot_hi = 0.0f, sum_hi = 0.0f;
+                float dot_lo[Q4K_COLS], dot_hi[Q4K_COLS];
+#pragma unroll
+                for (int c = 0; c < Q4K_COLS; c++) {
+                    dot_lo[c] = 0.0f;
+                    dot_hi[c] = 0.0f;
+                }
+                float sum_lo = 0.0f, sum_hi = 0.0f;
 #pragma unroll
                 for (int j = 0; j < 16; j += 4) {
                     float4 lo = *reinterpret_cast<const float4*>(x + j);
                     float4 hi = *reinterpret_cast<const float4*>(x + 32 + j);
-                    dot_lo += lo.x * q4k_nibble(q[j] & 0xF) + lo.y * q4k_nibble(q[j + 1] & 0xF)
-                        + lo.z * q4k_nibble(q[j + 2] & 0xF) + lo.w * q4k_nibble(q[j + 3] & 0xF);
-                    dot_hi += hi.x * q4k_nibble(q[j] >> 4) + hi.y * q4k_nibble(q[j + 1] >> 4)
-                        + hi.z * q4k_nibble(q[j + 2] >> 4) + hi.w * q4k_nibble(q[j + 3] >> 4);
                     sum_lo += lo.x + lo.y + lo.z + lo.w;
                     sum_hi += hi.x + hi.y + hi.z + hi.w;
+#pragma unroll
+                    for (int c = 0; c < Q4K_COLS; c++) {
+                        const unsigned char* q = reinterpret_cast<const unsigned char*>(&packed[c]);
+                        dot_lo[c] += lo.x * q4k_nibble(q[j] & 0xF)
+                            + lo.y * q4k_nibble(q[j + 1] & 0xF)
+                            + lo.z * q4k_nibble(q[j + 2] & 0xF)
+                            + lo.w * q4k_nibble(q[j + 3] & 0xF);
+                        dot_hi[c] += hi.x * q4k_nibble(q[j] >> 4)
+                            + hi.y * q4k_nibble(q[j + 1] >> 4)
+                            + hi.z * q4k_nibble(q[j + 2] >> 4)
+                            + hi.w * q4k_nibble(q[j + 3] >> 4);
+                    }
                 }
-                acc[r] += d_lo * dot_lo - m_lo * sum_lo + d_hi * dot_hi - m_hi * sum_hi;
+#pragma unroll
+                for (int c = 0; c < Q4K_COLS; c++) {
+                    acc[r][c] += d_lo[c] * dot_lo[c] - m_lo[c] * sum_lo
+                        + d_hi[c] * dot_hi[c] - m_hi[c] * sum_hi;
+                }
             }
         }
     }
 #pragma unroll
     for (int r = 0; r < Q8_MATMUL_ROWS; r++) {
-        float sum = acc[r];
 #pragma unroll
-        for (int offset_ = 16; offset_ > 0; offset_ >>= 1) {
-            sum += __shfl_xor_sync(0xffffffffu, sum, offset_);
-        }
-        if (lane == 0 && r < (int)rows) {
-            unsigned long long row = first_row + r;
-            if (addend_mode == 1) {
-                sum += addend[col];
-            } else if (addend_mode == 2) {
-                sum += addend[row * n + col];
+        for (int c = 0; c < Q4K_COLS; c++) {
+            float sum = acc[r][c];
+#pragma unroll
+            for (int offset_ = 16; offset_ > 0; offset_ >>= 1) {
+                sum += __shfl_xor_sync(0xffffffffu, sum, offset_);
             }
-            out[row * n + col] = sum;
+            if (lane == 0 && r < (int)rows && (unsigned int)c < cols) {
+                unsigned long long row = first_row + r;
+                unsigned long long col = col0 + c;
+                if (addend_mode == 1) {
+                    sum += addend[col];
+                } else if (addend_mode == 2) {
+                    sum += addend[row * n + col];
+                }
+                out[row * n + col] = sum;
+            }
         }
     }
 }

@@ -300,6 +300,8 @@ impl CudaDeviceBuffer {
 /// `q8_matmul_rows_kernel` (decode steps and short prompts); a longer
 /// matmul dequantizes the weight to f32 for the duration of the call.
 const Q8_MATMUL_MAX_ROWS: u64 = 64;
+/// Output columns per warp of `q4k_matmul_rows_kernel` (`Q4K_COLS`).
+const Q4K_MATMUL_COLS: u64 = 2;
 /// `Q8_MATMUL_ROWS` / `Q8_MATMUL_WARPS` in `kernels.cu`.
 const Q8_MATMUL_ROWS: u64 = 8;
 const Q8_MATMUL_WARPS: u32 = 4;
@@ -2814,7 +2816,7 @@ impl CudaKernels {
             .arg(&addend_mode);
         let config = LaunchConfig {
             grid_dim: (
-                n.div_ceil(u64::from(Q8_MATMUL_WARPS)) as u32,
+                n.div_ceil(u64::from(Q8_MATMUL_WARPS) * Q4K_MATMUL_COLS) as u32,
                 m.div_ceil(Q8_MATMUL_ROWS) as u32,
                 1,
             ),
