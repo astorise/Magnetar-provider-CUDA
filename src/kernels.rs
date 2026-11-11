@@ -2579,6 +2579,44 @@ impl CudaKernels {
             Self::require_f32(&[a], "gated-matmul's input")?;
             return self.q8_gated_matmul_rows(a, gate_q8, up_q8, m, k, b_cols);
         }
+        if let (Some(gate_q4k), Some(up_q4k)) = (&gate.q8, &up.q8)
+            && gate_q4k.format == PackedWeightFormat::Q4K
+            && up_q4k.format == PackedWeightFormat::Q4K
+            && gate_q4k.transposed
+            && up_q4k.transposed
+            && !transpose_a
+            && !transpose_b
+            && m <= Q8_MATMUL_MAX_ROWS
+            && k == b_rows
+        {
+            Self::require_f32(&[a], "gated-matmul's input")?;
+            let mut out_dev = self.alloc_output((m * b_cols) as usize)?;
+            let func = self.function("q4k_gated_matmul_rows_kernel")?;
+            let mut args = self.stream.launch_builder(&func);
+            args.arg(&a.slice)
+                .arg(&gate_q4k.quants)
+                .arg(&up_q4k.quants)
+                .arg(&mut out_dev)
+                .arg(&m)
+                .arg(&k)
+                .arg(&b_cols);
+            let config = LaunchConfig {
+                grid_dim: (
+                    b_cols.div_ceil(u64::from(Q8_MATMUL_WARPS)) as u32,
+                    m.div_ceil(Q8_MATMUL_ROWS) as u32,
+                    1,
+                ),
+                block_dim: (32, Q8_MATMUL_WARPS, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe { args.launch(config) }?;
+            return Ok(CudaDeviceBuffer {
+                slice: out_dev,
+                shape: vec![m, b_cols],
+                bf16: None,
+                q8: None,
+            });
+        }
         // Other packed weights: each projection through the packed matmul.
         if transpose_b || m > MATMUL_SPLIT_K_MAX_ROWS || k != b_rows || gate.is_q8() || up.is_q8() {
             let gate_out = self.matmul(a, gate, transpose_a, transpose_b)?;

@@ -2532,3 +2532,94 @@ extern "C" __global__ void q4k_matmul_rows_kernel(
         }
     }
 }
+
+// One packed `Q4_K` column's partial dot products for this lane's 32
+// values of super-block `block` against `x` (the row of `a` at the lane's
+// first value): its low-nibble half scaled by sub-block `2c`, its high one
+// by `2c + 1`.
+__device__ __forceinline__ float q4k_lane_dot(
+    const unsigned char* block,
+    unsigned int chunk,
+    unsigned int offset,
+    const float* x
+) {
+    int4 packed = *reinterpret_cast<const int4*>(block + 16 + 32 * chunk + offset);
+    const unsigned char* q = reinterpret_cast<const unsigned char*>(&packed);
+    float d = half_bits_to_float((unsigned short)(block[0] | (block[1] << 8)));
+    float dmin = half_bits_to_float((unsigned short)(block[2] | (block[3] << 8)));
+    float scale_lo, min_lo, scale_hi, min_hi;
+    q4k_scale_min(2 * chunk, block + 4, &scale_lo, &min_lo);
+    q4k_scale_min(2 * chunk + 1, block + 4, &scale_hi, &min_hi);
+    float dot_lo = 0.0f, sum_lo = 0.0f, dot_hi = 0.0f, sum_hi = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 16; j += 4) {
+        float4 lo = *reinterpret_cast<const float4*>(x + j);
+        float4 hi = *reinterpret_cast<const float4*>(x + 32 + j);
+        dot_lo += lo.x * (float)(q[j] & 0xF) + lo.y * (float)(q[j + 1] & 0xF)
+            + lo.z * (float)(q[j + 2] & 0xF) + lo.w * (float)(q[j + 3] & 0xF);
+        dot_hi += hi.x * (float)(q[j] >> 4) + hi.y * (float)(q[j + 1] >> 4)
+            + hi.z * (float)(q[j + 2] >> 4) + hi.w * (float)(q[j + 3] >> 4);
+        sum_lo += lo.x + lo.y + lo.z + lo.w;
+        sum_hi += hi.x + hi.y + hi.z + hi.w;
+    }
+    return (d * scale_lo) * dot_lo - (dmin * min_lo) * sum_lo
+        + (d * scale_hi) * dot_hi - (dmin * min_hi) * sum_hi;
+}
+
+// `silu(a x gate) * (a x up)` for two packed `Q4_K` weights stored
+// transposed: `q4k_matmul_rows_kernel`'s reading pattern over both, so a
+// gated MLP's decode step writes one output and allocates nothing.
+extern "C" __global__ void q4k_gated_matmul_rows_kernel(
+    const float* a,
+    const unsigned char* gate_blocks,
+    const unsigned char* up_blocks,
+    float* out,
+    unsigned long long m,
+    unsigned long long k,
+    unsigned long long n
+) {
+    unsigned long long col = (unsigned long long)blockIdx.x * Q8_MATMUL_WARPS + threadIdx.y;
+    unsigned long long first_row = (unsigned long long)blockIdx.y * Q8_MATMUL_ROWS;
+    if (col >= n || first_row >= m) {
+        return;
+    }
+    unsigned int rows = (unsigned int)min((unsigned long long)Q8_MATMUL_ROWS, m - first_row);
+    unsigned int lane = threadIdx.x;
+    unsigned long long super_blocks = k / Q4K_BLOCK_VALUES;
+    const unsigned char* wg = gate_blocks + col * super_blocks * Q4K_BLOCK_BYTES;
+    const unsigned char* wu = up_blocks + col * super_blocks * Q4K_BLOCK_BYTES;
+    unsigned int part = lane % 8;
+    unsigned int chunk = part / 2;
+    unsigned int offset = 16 * (part % 2);
+    float gate_acc[Q8_MATMUL_ROWS];
+    float up_acc[Q8_MATMUL_ROWS];
+#pragma unroll
+    for (int r = 0; r < Q8_MATMUL_ROWS; r++) {
+        gate_acc[r] = 0.0f;
+        up_acc[r] = 0.0f;
+    }
+    for (unsigned long long sb = lane / 8; sb < super_blocks; sb += 4) {
+        unsigned long long base = sb * Q4K_BLOCK_VALUES + 64 * chunk + offset;
+#pragma unroll
+        for (int r = 0; r < Q8_MATMUL_ROWS; r++) {
+            if (r < (int)rows) {
+                const float* x = a + (first_row + r) * k + base;
+                gate_acc[r] += q4k_lane_dot(wg + sb * Q4K_BLOCK_BYTES, chunk, offset, x);
+                up_acc[r] += q4k_lane_dot(wu + sb * Q4K_BLOCK_BYTES, chunk, offset, x);
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < Q8_MATMUL_ROWS; r++) {
+        float g = gate_acc[r];
+        float u = up_acc[r];
+#pragma unroll
+        for (int offset_ = 16; offset_ > 0; offset_ >>= 1) {
+            g += __shfl_xor_sync(0xffffffffu, g, offset_);
+            u += __shfl_xor_sync(0xffffffffu, u, offset_);
+        }
+        if (lane == 0 && r < (int)rows) {
+            out[(first_row + r) * n + col] = g * (1.0f / (1.0f + expf(-g))) * u;
+        }
+    }
+}
