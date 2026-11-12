@@ -25,6 +25,7 @@ use cudarc::driver::{
 use cudarc::nvrtc::compile_ptx;
 use magnetar_runtime::HostTensor;
 use magnetar_runtime::operator::RopeBandedFrequencyScaling;
+use magnetar_runtime::packed_weight::{PackedWeight, PackedWeightFormat};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -55,6 +56,20 @@ const TCAP_KEYS: u64 = 32;
 /// Set to `0` to keep long prefill matmuls off the Tensor Cores (the
 /// bit-identical CUDA-core tile Kernels then serve them).
 pub const TENSOR_CORES_ENV: &str = "MAGNETAR_CUDA_TENSOR_CORES";
+/// Set to `0` to decline packed weights (`execute-direct-quantized-weights`):
+/// Model Loading then hands this Provider their dequantized f32 values, the
+/// disable control for direct quantized execution.
+pub const PACKED_WEIGHTS_ENV: &str = "MAGNETAR_CUDA_PACKED_WEIGHTS";
+/// Set to `0` to keep f32 activations in the decode-step packed matmuls.
+/// By default they read their activations quantized to 8 bits per
+/// 32-value block and multiply with `__dp4a` (`q8_matmul_rows_int8_kernel`
+/// and its `Q4_K`/`Q6_K` forms): this rounds the activations, so outputs
+/// can differ slightly from the f32-activation Kernels, which this
+/// disable control restores.
+pub const INT8_ACTIVATIONS_ENV: &str = "MAGNETAR_CUDA_INT8_ACTIVATIONS";
+/// Activation values the int8 scratch holds: `Q8_MATMUL_MAX_ROWS` rows of
+/// up to 32768 columns. A larger matmul keeps f32 activations.
+const INT8_SCRATCH_VALUES: u64 = Q8_MATMUL_MAX_ROWS * 32_768;
 
 /// What a fused matmul adds to its product.
 #[derive(Clone, Copy)]
@@ -241,14 +256,39 @@ pub struct CudaDeviceBuffer {
     /// embedding lookup's table. They convert each value back to the same
     /// f32 exactly, so their results are unchanged.
     pub(crate) bf16: Option<CudaSlice<u16>>,
+    /// A packed `Q8_0` weight (`execute-direct-quantized-weights`), stored
+    /// as the checkpoint stored it: no Kernel reads `slice` then either.
+    pub(crate) q8: Option<CudaQ8Weight>,
+}
+
+/// A `Q8_0` matrix on the device: its signed 8-bit quants in stored
+/// row-major order and one `f32` scale per 32-value block (the block's
+/// `f16` scale, converted exactly). The logical matrix (the buffer's
+/// `shape`) is the stored one, or its transpose when `transposed`.
+pub struct CudaQ8Weight {
+    /// `IQ4_NL`/`IQ4_XS`: see `upload_iq4_weight`; IQ2/IQ3: see
+    /// `upload_iq_weight`.
+    /// `Q8_0`: each block's 32 quants, contiguous. `Q4_K`: the super-blocks'
+    /// own 144-byte encoding, as stored. `Q6_K`: each super-block's first
+    /// 208 bytes (its quants and sub-block scales).
+    pub(crate) quants: CudaSlice<i8>,
+    /// `Q8_0`: each block's scale. `Q4_K`: unused (the scales live in the
+    /// super-blocks). `Q6_K`: each super-block's `d`.
+    pub(crate) scales: CudaSlice<f32>,
+    /// Which block encoding `quants` holds.
+    pub(crate) format: PackedWeightFormat,
+    pub(crate) stored_rows: u64,
+    pub(crate) stored_cols: u64,
+    pub(crate) transposed: bool,
 }
 
 impl CudaDeviceBuffer {
     /// Elements, compact or not.
     pub fn len(&self) -> usize {
-        match &self.bf16 {
-            Some(bf16) => bf16.len(),
-            None => self.slice.len(),
+        match (&self.bf16, &self.q8) {
+            (Some(bf16), _) => bf16.len(),
+            (None, Some(q8)) => (q8.stored_rows * q8.stored_cols) as usize,
+            (None, None) => self.slice.len(),
         }
     }
 
@@ -256,11 +296,73 @@ impl CudaDeviceBuffer {
         self.len() == 0
     }
 
-    /// Whether the values are stored as bfloat16 bits.
+    /// Whether the values are stored compact: as bfloat16 bits or as a
+    /// packed `Q8_0` weight. Only Kernels that read a compact operand
+    /// accept one.
     pub fn is_compact(&self) -> bool {
-        self.bf16.is_some()
+        self.bf16.is_some() || self.q8.is_some()
+    }
+
+    /// Whether the values are a packed `Q8_0` weight.
+    pub fn is_q8(&self) -> bool {
+        self.q8.is_some()
     }
 }
+
+/// Rows of a matmul against a packed `Q8_0` weight served by
+/// `q8_matmul_rows_kernel` (decode steps and short prompts); a longer
+/// matmul dequantizes the weight to f32 for the duration of the call.
+const Q8_MATMUL_MAX_ROWS: u64 = 64;
+/// Output columns per warp of `q4k_matmul_rows_kernel` (`Q4K_COLS`) and
+/// `q6k_matmul_rows_kernel` (`Q6K_COLS`).
+const Q4K_MATMUL_COLS: u64 = 2;
+const Q6K_MATMUL_COLS: u64 = 2;
+/// `LOWK_COLS` in `kernels.cu`.
+const LOW_BIT_MATMUL_COLS: u64 = 2;
+
+/// `IQ_COLS` in `kernels.cu`.
+const IQ_MATMUL_COLS: u64 = 2;
+
+/// `IQ_IQ2_XXS` .. `IQ_IQ3_S` in `kernels.cu`, for the IQ2/IQ3 formats.
+fn iq_format(format: PackedWeightFormat) -> Option<i32> {
+    match format {
+        PackedWeightFormat::Iq2Xxs => Some(0),
+        PackedWeightFormat::Iq2Xs => Some(1),
+        PackedWeightFormat::Iq2S => Some(2),
+        PackedWeightFormat::Iq3Xxs => Some(3),
+        PackedWeightFormat::Iq3S => Some(4),
+        _ => None,
+    }
+}
+
+/// `IQ4_NL_FORMAT` / `IQ4_XS_FORMAT` in `kernels.cu`.
+fn iq4_format(format: PackedWeightFormat) -> i32 {
+    match format {
+        PackedWeightFormat::Iq4Nl => 0,
+        _ => 1,
+    }
+}
+
+/// Where an `IQ4_XS` weight's per-run sub-block scales start in its
+/// `quants`, after every run's 16 index bytes.
+fn iq4_subscale_offset(weight: &CudaQ8Weight) -> usize {
+    match weight.format {
+        // No sub-block scales: the kernels never read them.
+        PackedWeightFormat::Iq4Nl => 0,
+        _ => (weight.stored_rows * weight.stored_cols / 32 * 16) as usize,
+    }
+}
+
+/// `LOWK_Q2K` / `LOWK_Q3K` in `kernels.cu`.
+fn low_bit_format(format: PackedWeightFormat) -> i32 {
+    match format {
+        PackedWeightFormat::Q2K => 0,
+        _ => 1,
+    }
+}
+/// `Q8_MATMUL_ROWS` / `Q8_MATMUL_WARPS` in `kernels.cu`.
+const Q8_MATMUL_ROWS: u64 = 8;
+const Q8_MATMUL_WARPS: u32 = 4;
 
 /// Weights at least this large are stored compact when every value is
 /// exactly a bfloat16 value; smaller tensors (biases, norm weights,
@@ -320,6 +422,16 @@ pub struct CudaKernels {
     /// The step capture in progress on this stream, if any
     /// (`capture-and-replay-cuda-graphs`).
     capture: std::sync::Mutex<Option<KernelCapture>>,
+    /// The replay offset of the next capture, allocated ahead by
+    /// [`Self::prepare_capture`].
+    prepared_offset: std::sync::Mutex<Option<CudaSlice<u64>>>,
+    /// Whether captures leave the thread unrestricted
+    /// (`CU_STREAM_CAPTURE_MODE_RELAXED`): set when several GPUs' streams
+    /// are captured from one thread at once, where a thread-local capture
+    /// on one would forbid the others' setup, instantiation and launch.
+    relaxed_capture: std::sync::atomic::AtomicBool,
+    /// See [`CudaKernels::set_peer_access`].
+    peer_access: std::sync::atomic::AtomicBool,
     /// The embedding lookup's invalid-id flag, allocated once.
     embedding_flag: std::sync::Mutex<Option<CudaSlice<i32>>>,
     /// The split-key attention's per-chunk partials: the current buffer,
@@ -330,7 +442,38 @@ pub struct CudaKernels {
     /// `a`: the current buffer, then every buffer it outgrew (kept until
     /// this Provider drops, like the attention scratch).
     split_scratch: std::sync::Mutex<SplitScratch>,
+    /// `moe-experts`' routing and expert activations for a step of up to
+    /// [`MOE_PERSISTENT_TOKENS`] tokens: the current buffers, then every
+    /// set they outgrew (a captured step may still read one, so none is
+    /// freed before this Provider).
+    moe_scratch: std::sync::Mutex<(Option<MoeScratch>, Vec<MoeScratch>)>,
+    /// Whether int8 activations are on (unless [`INT8_ACTIVATIONS_ENV`] is
+    /// `0`).
+    int8_activations: std::sync::atomic::AtomicBool,
+    /// The quantized activations of the current packed matmul and their
+    /// block scales, allocated once at [`INT8_SCRATCH_VALUES`] (never
+    /// reallocated, so a captured step's addresses stay valid).
+    int8_scratch: std::sync::Mutex<Option<Int8Scratch>>,
 }
+
+/// Int8 activations: [`INT8_SCRATCH_VALUES`] signed bytes and one f32 scale
+/// per 32 of them.
+struct Int8Scratch {
+    values: CudaSlice<i8>,
+    scales: CudaSlice<f32>,
+}
+
+/// `moe-experts` scratch: the routed experts and weights of each
+/// `(token, k)` pair, and each pair's expert activation.
+struct MoeScratch {
+    indices: CudaSlice<i32>,
+    weights: CudaSlice<f32>,
+    act: CudaSlice<f32>,
+}
+
+/// Steps of at most this many tokens (decode) route through the persistent
+/// scratch, so they capture; longer ones (prefill) use temporaries.
+const MOE_PERSISTENT_TOKENS: u64 = 64;
 
 /// The current hi/lo split buffer and the ones it outgrew.
 type SplitScratch = (Option<CudaSlice<u16>>, Vec<CudaSlice<u16>>);
@@ -360,6 +503,67 @@ struct KernelCapture {
     /// flag the capture resets once, at its start, so the flag accumulates
     /// every captured lookup's failures.
     has_embedding: bool,
+}
+
+/// What a GPU that joined another GPU's step capture
+/// ([`CudaKernels::join_capture`]) needs to replay its part: the captured
+/// launches live in the other GPU's graph, but read this GPU's own replay
+/// offset.
+pub struct JoinedCapture {
+    offset: CudaSlice<u64>,
+    /// See [`CapturedStep::max_offset`].
+    pub max_offset: u64,
+    /// See [`CapturedStep::has_embedding`].
+    pub has_embedding: bool,
+}
+
+/// A page-locked host buffer every GPU context can copy to and from
+/// (`CU_MEMHOSTALLOC_PORTABLE`): the stage a tensor-parallel reduction
+/// crosses between GPUs without peer access. Copies through it are
+/// ordinary asynchronous copies, which a step capture records.
+pub struct PinnedStage {
+    ptr: *mut f32,
+    len: usize,
+}
+
+// SAFETY: the buffer is only ever read and written by copies queued on
+// GPU streams, ordered by events.
+unsafe impl Send for PinnedStage {}
+unsafe impl Sync for PinnedStage {}
+
+impl PinnedStage {
+    pub fn new(kernels: &CudaKernels, len: usize) -> Result<Self, CudaError> {
+        kernels.stream.context().bind_to_thread()?;
+        // SAFETY: a fresh allocation of `len` floats, freed in `drop`.
+        let ptr = unsafe {
+            cudarc::driver::result::malloc_host(
+                len * std::mem::size_of::<f32>(),
+                sys::CU_MEMHOSTALLOC_PORTABLE,
+            )
+        }? as *mut f32;
+        Ok(Self { ptr, len })
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[allow(clippy::mut_from_ref)]
+    fn host(&self) -> &mut [f32] {
+        // SAFETY: see the `Send`/`Sync` impls: only queued copies touch it.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+impl Drop for PinnedStage {
+    fn drop(&mut self) {
+        // SAFETY: allocated by `malloc_host` in `new`.
+        let _ = unsafe { cudarc::driver::result::free_host(self.ptr.cast()) };
+    }
 }
 
 /// A captured step's CUDA graph and what replaying it needs.
@@ -444,10 +648,111 @@ impl CudaKernels {
             functions: std::sync::Mutex::new(std::collections::HashMap::new()),
             offered_output: std::sync::Mutex::new(None),
             capture: std::sync::Mutex::new(None),
+            prepared_offset: std::sync::Mutex::new(None),
+            relaxed_capture: std::sync::atomic::AtomicBool::new(false),
+            peer_access: std::sync::atomic::AtomicBool::new(false),
             embedding_flag: std::sync::Mutex::new(None),
             attention_scratch: std::sync::Mutex::new((None, Vec::new())),
             split_scratch: std::sync::Mutex::new((None, Vec::new())),
+            moe_scratch: std::sync::Mutex::new((None, Vec::new())),
+            int8_activations: std::sync::atomic::AtomicBool::new(
+                std::env::var(INT8_ACTIVATIONS_ENV).as_deref() != Ok("0"),
+            ),
+            int8_scratch: std::sync::Mutex::new(None),
         })
+    }
+
+    /// See `relaxed_capture`.
+    pub fn set_relaxed_capture(&self, relaxed: bool) {
+        self.relaxed_capture
+            .store(relaxed, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Allocates what the next [`Self::begin_capture`] needs, so that it
+    /// allocates nothing: with several GPUs' streams captured from one
+    /// thread, nothing may allocate once the first capture has begun.
+    pub fn prepare_capture(&self) -> Result<(), CudaError> {
+        let mut prepared = self.prepared_offset.lock().unwrap();
+        if prepared.is_none() {
+            *prepared = Some(self.stream.alloc_zeros::<u64>(1)?);
+        }
+        let mut flag_slot = self.embedding_flag.lock().unwrap();
+        if flag_slot.is_none() {
+            *flag_slot = Some(self.stream.alloc_zeros::<i32>(1)?);
+        }
+        drop(flag_slot);
+        if self.int8_activations() {
+            self.int8_scratch_slot()?;
+        }
+        Ok(())
+    }
+
+    /// Whether the decode-step packed matmuls read int8 activations
+    /// ([`INT8_ACTIVATIONS_ENV`]).
+    pub fn int8_activations(&self) -> bool {
+        self.int8_activations
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Turns int8 activations on or off for later launches (the
+    /// environment variable sets the initial value).
+    pub fn set_int8_activations(&self, on: bool) {
+        self.int8_activations
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The int8 scratch, allocated on first use (never during a capture:
+    /// then `Ok(None)` and the caller keeps f32 activations).
+    fn int8_scratch_slot(
+        &self,
+    ) -> Result<Option<std::sync::MutexGuard<'_, Option<Int8Scratch>>>, CudaError> {
+        let mut slot = self.int8_scratch.lock().unwrap();
+        if slot.is_none() {
+            if self.capture.lock().unwrap().is_some() {
+                return Ok(None);
+            }
+            *slot = Some(Int8Scratch {
+                values: self
+                    .stream
+                    .alloc_zeros::<i8>(INT8_SCRATCH_VALUES as usize)?,
+                scales: self
+                    .stream
+                    .alloc_zeros::<f32>((INT8_SCRATCH_VALUES / 32) as usize)?,
+            });
+        }
+        Ok(Some(slot))
+    }
+
+    /// Quantizes `a` (`m` contiguous rows of `k`) into the int8 scratch
+    /// when int8 activations are on and it fits; `None` keeps the f32
+    /// activations.
+    fn quantize_activations(
+        &self,
+        a: &CudaDeviceBuffer,
+        m: u64,
+        k: u64,
+    ) -> Result<Option<std::sync::MutexGuard<'_, Option<Int8Scratch>>>, CudaError> {
+        if !self.int8_activations() || !k.is_multiple_of(32) || m * k > INT8_SCRATCH_VALUES {
+            return Ok(None);
+        }
+        let Some(mut guard) = self.int8_scratch_slot()? else {
+            return Ok(None);
+        };
+        let scratch = guard.as_mut().expect("allocated above");
+        let blocks = m * k / 32;
+        let func = self.function("quantize_activations_q8_kernel")?;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(&a.slice)
+            .arg(&mut scratch.values)
+            .arg(&mut scratch.scales)
+            .arg(&blocks);
+        let config = LaunchConfig {
+            grid_dim: (blocks.div_ceil(4) as u32, 1, 1),
+            block_dim: (32, 4, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { args.launch(config) }?;
+        Ok(Some(guard))
     }
 
     /// Starts capturing this stream's work into a CUDA graph. Every later
@@ -463,14 +768,26 @@ impl CudaKernels {
         }
         // Allocated before the capture starts: nothing allocates while
         // capturing.
-        let offset = self.stream.alloc_zeros::<u64>(1)?;
+        let prepared = self.prepared_offset.lock().unwrap().take();
+        // Zeroed when allocated; each launch writes it anyway.
+        let offset = match prepared {
+            Some(offset) => offset,
+            None => self.stream.alloc_zeros::<u64>(1)?,
+        };
         let mut flag_slot = self.embedding_flag.lock().unwrap();
         let flag = match flag_slot.as_mut() {
             Some(flag) => flag,
             None => flag_slot.insert(self.stream.alloc_zeros::<i32>(1)?),
         };
-        self.stream
-            .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+        let mode = if self
+            .relaxed_capture
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED
+        } else {
+            sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL
+        };
+        self.stream.begin_capture(mode)?;
         // The captured step's first work: one reset of the invalid-id flag,
         // which its embedding lookups then only ever set.
         if let Err(error) = self.stream.memset_zeros(flag) {
@@ -490,6 +807,226 @@ impl CudaKernels {
         Ok(())
     }
 
+    /// Joins `host`'s step capture, in progress: this stream waits on
+    /// `host`'s, which makes every later launch on it part of `host`'s
+    /// graph, until [`Self::leave_capture`]. One graph then holds every
+    /// GPU's work of a tensor-parallel step and the reductions between
+    /// them. Needs [`Self::prepare_capture`] first: nothing may allocate
+    /// while capturing.
+    pub fn join_capture(
+        &self,
+        host: &CudaKernels,
+        advancing: BTreeSet<String>,
+    ) -> Result<(), CudaError> {
+        let mut capture = self.capture.lock().unwrap();
+        let prepared = self.prepared_offset.lock().unwrap().take();
+        let (Some(offset), true) = (prepared, capture.is_none()) else {
+            return Err(CudaError::new(
+                CudaErrorCode::CaptureUnsupported,
+                "joining a step capture needs a prepared, idle stream",
+            ));
+        };
+        self.stream.wait(&host.stream.record_event(None)?)?;
+        let mut flag_slot = self.embedding_flag.lock().unwrap();
+        if let Some(flag) = flag_slot.as_mut() {
+            self.stream.memset_zeros(flag)?;
+        }
+        drop(flag_slot);
+        *capture = Some(KernelCapture {
+            advancing,
+            offset,
+            max_offset: u64::MAX,
+            failure: None,
+            has_embedding: false,
+        });
+        Ok(())
+    }
+
+    /// Leaves `host`'s step capture: `host`'s stream waits on this one, so
+    /// `host`'s graph ends after this GPU's captured work. Fails when
+    /// anything the capture cannot replay happened here.
+    /// Leaves `host`'s capture whatever its state, discarding this GPU's
+    /// part and any error recorded meanwhile, so `host` can end or abort
+    /// its capture and this stream works again afterwards.
+    pub fn abandon_join(&self, host: &CudaKernels) {
+        if self.capture.lock().unwrap().take().is_some() {
+            let _ = self.take_deferred_error();
+            if let Ok(event) = self.stream.record_event(None) {
+                let _ = host.stream.wait(&event);
+            }
+            let _ = self.take_deferred_error();
+        }
+    }
+
+    pub fn leave_capture(&self, host: &CudaKernels) -> Result<JoinedCapture, CudaError> {
+        let capture = self.capture.lock().unwrap().take().ok_or_else(|| {
+            CudaError::new(
+                CudaErrorCode::CaptureUnsupported,
+                "no joined step capture is in progress",
+            )
+        })?;
+        let deferred = self.take_deferred_error();
+        host.stream.wait(&self.stream.record_event(None)?)?;
+        if let Some(failure) = capture.failure {
+            return Err(CudaError::new(CudaErrorCode::CaptureUnsupported, failure));
+        }
+        if let Err(error) = deferred {
+            let failure = format!("the step capture met a driver error: {error:?}");
+            return Err(CudaError::new(CudaErrorCode::CaptureUnsupported, failure));
+        }
+        Ok(JoinedCapture {
+            offset: capture.offset,
+            max_offset: capture.max_offset,
+            has_embedding: capture.has_embedding,
+        })
+    }
+
+    /// Writes a joined capture's replay offset, before `host` launches the
+    /// graph: `host`'s stream then waits on this one.
+    pub fn write_joined_offset(
+        &self,
+        joined: &mut JoinedCapture,
+        offset: u64,
+        host: &CudaKernels,
+    ) -> Result<(), CudaError> {
+        self.stream.memcpy_htod(&[offset], &mut joined.offset)?;
+        host.stream.join(&self.stream)?;
+        Ok(())
+    }
+
+    /// Makes this stream wait for everything queued on `host`'s so far.
+    pub fn follow(&self, host: &CudaKernels) -> Result<(), CudaError> {
+        self.stream.join(&host.stream)?;
+        Ok(())
+    }
+
+    /// Whether this GPU may read other GPUs' memory directly (peer access
+    /// enabled towards every other GPU of its Provider).
+    pub fn set_peer_access(&self, enabled: bool) {
+        self.peer_access
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn has_peer_access(&self) -> bool {
+        self.peer_access.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Copies `src`, held by `peer`'s GPU, into this GPU's `dst`, after
+    /// `peer`'s stream has written it. With peer access, a Kernel reading
+    /// `peer`'s memory directly, which a step capture records; else the
+    /// driver's peer copy, which cannot be captured.
+    pub fn copy_from_peer(
+        &self,
+        peer: &CudaKernels,
+        src: &CudaSlice<f32>,
+        dst: &mut CudaSlice<f32>,
+    ) -> Result<(), CudaError> {
+        if src.len() != dst.len() {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!("peer copy of {} floats into {}", src.len(), dst.len()),
+            ));
+        }
+        if !self.has_peer_access() {
+            self.stream.memcpy_dtod(src, dst)?;
+            return Ok(());
+        }
+        self.stream.wait(&peer.stream.record_event(None)?)?;
+        let source = src.device_ptr(&peer.stream).0;
+        let n = src.len() as u64;
+        let func = self.function("copy_kernel")?;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(dst).arg(&source).arg(&n);
+        unsafe { args.launch(LaunchConfig::for_num_elems(n as u32)) }?;
+        Ok(())
+    }
+
+    /// Copies `src` into `stage` on this stream.
+    pub fn stage_out(&self, src: &CudaSlice<f32>, stage: &PinnedStage) -> Result<(), CudaError> {
+        if src.len() != stage.len() {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!("staging {} floats through {}", src.len(), stage.len()),
+            ));
+        }
+        self.stream.context().bind_to_thread()?;
+        let source = src.device_ptr(&self.stream).0;
+        // SAFETY: `stage` holds `len` floats and outlives the copy.
+        unsafe {
+            cudarc::driver::result::memcpy_dtoh_async(stage.host(), source, self.stream.cu_stream())
+        }?;
+        Ok(())
+    }
+
+    /// Copies `stage` into `dst` on this stream.
+    pub fn stage_in(&self, stage: &PinnedStage, dst: &mut CudaSlice<f32>) -> Result<(), CudaError> {
+        if dst.len() != stage.len() {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!("staging {} floats into {}", stage.len(), dst.len()),
+            ));
+        }
+        self.stream.context().bind_to_thread()?;
+        let destination = dst.device_ptr(&self.stream).0;
+        // SAFETY: `stage` holds `len` floats and outlives the copy.
+        unsafe {
+            cudarc::driver::result::memcpy_htod_async(
+                destination,
+                stage.host(),
+                self.stream.cu_stream(),
+            )
+        }?;
+        Ok(())
+    }
+
+    /// `a += b` with `b` held by `peer`'s GPU, read directly (peer access
+    /// enabled) after `peer`'s stream has written it: a tensor-parallel
+    /// reduction that allocates nothing and can be captured.
+    pub fn accumulate_from_peer(
+        &self,
+        a: &mut CudaDeviceBuffer,
+        peer: &CudaKernels,
+        b: &CudaDeviceBuffer,
+    ) -> Result<(), CudaError> {
+        Self::require_f32(&[a, b], "accumulate")?;
+        if a.shape != b.shape {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!("accumulate: shape mismatch {:?} vs {:?}", a.shape, b.shape),
+            ));
+        }
+        self.stream.wait(&peer.stream.record_event(None)?)?;
+        let addend = b.slice.device_ptr(&peer.stream).0;
+        let n = a.slice.len() as u64;
+        let func = self.function("accumulate_kernel")?;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(&mut a.slice).arg(&addend).arg(&n);
+        unsafe { args.launch(LaunchConfig::for_num_elems(n as u32)) }?;
+        Ok(())
+    }
+
+    /// `a += b`, element-wise, in place: plain f32 buffers of the same
+    /// shape. Allocates nothing, so it can be captured.
+    pub fn accumulate(
+        &self,
+        a: &mut CudaDeviceBuffer,
+        b: &CudaDeviceBuffer,
+    ) -> Result<(), CudaError> {
+        Self::require_f32(&[a, b], "accumulate")?;
+        if a.shape != b.shape {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!("accumulate: shape mismatch {:?} vs {:?}", a.shape, b.shape),
+            ));
+        }
+        let n = a.slice.len() as u64;
+        let func = self.function("accumulate_kernel")?;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(&mut a.slice).arg(&b.slice).arg(&n);
+        unsafe { args.launch(LaunchConfig::for_num_elems(n as u32)) }?;
+        Ok(())
+    }
+
     /// Ends the capture and instantiates its graph. Fails when anything
     /// the capture cannot replay happened while capturing.
     pub fn end_capture(&self) -> Result<CapturedStep, CudaError> {
@@ -499,10 +1036,15 @@ impl CudaKernels {
                 "no step capture is in progress",
             )
         })?;
+        let deferred = self.take_deferred_error();
         let graph = self.stream.end_capture(
             sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
         );
         if let Some(failure) = capture.failure {
+            return Err(CudaError::new(CudaErrorCode::CaptureUnsupported, failure));
+        }
+        if let Err(error) = deferred {
+            let failure = format!("the step capture met a driver error: {error:?}");
             return Err(CudaError::new(CudaErrorCode::CaptureUnsupported, failure));
         }
         let graph = graph?.ok_or_else(|| {
@@ -519,9 +1061,18 @@ impl CudaKernels {
         })
     }
 
+    /// Takes the error cudarc recorded from work it could not report
+    /// (freeing a buffer dropped while capturing). Left in place, it would
+    /// fail the next driver call -- ending the capture included, leaving
+    /// the stream capturing.
+    pub(crate) fn take_deferred_error(&self) -> Result<(), cudarc::driver::DriverError> {
+        self.stream.context().check_err()
+    }
+
     /// Ends the capture in progress, if any, and discards it.
     pub fn abort_capture(&self) {
         if self.capture.lock().unwrap().take().is_some() {
+            let _ = self.take_deferred_error();
             let _ = self.stream.end_capture(
                 sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
             );
@@ -543,9 +1094,10 @@ impl CudaKernels {
 
     /// The device address of `buffer`'s allocation, as a capture records it.
     pub fn address(&self, buffer: &CudaDeviceBuffer) -> u64 {
-        match &buffer.bf16 {
-            Some(bf16) => bf16.device_ptr(&self.stream).0,
-            None => buffer.slice.device_ptr(&self.stream).0,
+        match (&buffer.bf16, &buffer.q8) {
+            (Some(bf16), _) => bf16.device_ptr(&self.stream).0,
+            (None, Some(q8)) => q8.quants.device_ptr(&self.stream).0,
+            (None, None) => buffer.slice.device_ptr(&self.stream).0,
         }
     }
 
@@ -738,6 +1290,7 @@ impl CudaKernels {
             slice,
             shape: tensor.shape.clone(),
             bf16: None,
+            q8: None,
         })
     }
 
@@ -760,6 +1313,7 @@ impl CudaKernels {
             slice: self.stream.alloc_zeros::<f32>(len)?,
             shape: shape.to_vec(),
             bf16: None,
+            q8: None,
         })
     }
 
@@ -803,14 +1357,342 @@ impl CudaKernels {
             slice,
             shape: tensor.shape.clone(),
             bf16: Some(bf16),
+            q8: None,
         })
     }
 
     /// The same values as a compact `buffer`, stored as f32: for a Kernel
     /// that only reads f32 operands.
     pub fn expand(&self, buffer: &CudaDeviceBuffer) -> Result<CudaDeviceBuffer, CudaError> {
+        if buffer.is_q8() {
+            return self.dequantize_q8(buffer);
+        }
         let tensor = self.download(buffer)?;
         self.upload(&tensor)
+    }
+
+    /// Stores a packed weight as the checkpoint stored it
+    /// (`execute-direct-quantized-weights`): its `Q8_0` quants and one f32
+    /// scale per block, with the buffer shaped as the logical matrix.
+    pub fn upload_packed_weight(
+        &self,
+        weight: &PackedWeight,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        self.forbid_in_capture("a host-to-device upload")?;
+        if matches!(
+            weight.format(),
+            PackedWeightFormat::Q2K | PackedWeightFormat::Q3K
+        ) {
+            return self.upload_low_bit_weight(weight);
+        }
+        if matches!(
+            weight.format(),
+            PackedWeightFormat::Iq4Nl | PackedWeightFormat::Iq4Xs
+        ) {
+            return self.upload_iq4_weight(weight);
+        }
+        if iq_format(weight.format()).is_some() {
+            return self.upload_iq_weight(weight);
+        }
+        if weight.format() == PackedWeightFormat::Q6K {
+            // Each super-block without its trailing f16 `d` (208 bytes,
+            // so every one stays 16-byte aligned), `d` as an f32 apart.
+            let blocks = weight.bytes().as_chunks::<210>().0;
+            let mut quants = Vec::with_capacity(blocks.len() * 208);
+            let mut scales = Vec::with_capacity(blocks.len());
+            for block in blocks {
+                quants.extend(block[..208].iter().map(|&byte| byte as i8));
+                scales.push(half_precision::f16_to_f32(u16::from_le_bytes([
+                    block[208], block[209],
+                ])));
+            }
+            let quants = self.stream.clone_htod(&quants)?;
+            let scales = self.stream.clone_htod(&scales)?;
+            let slice = self.stream.alloc_zeros::<f32>(1)?;
+            self.upload_count.fetch_add(1, Ordering::Relaxed);
+            return Ok(CudaDeviceBuffer {
+                slice,
+                shape: weight.logical_shape().to_vec(),
+                bf16: None,
+                q8: Some(CudaQ8Weight {
+                    quants,
+                    scales,
+                    format: PackedWeightFormat::Q6K,
+                    stored_rows: weight.stored_rows(),
+                    stored_cols: weight.stored_cols(),
+                    transposed: weight.transposed(),
+                }),
+            });
+        }
+        if weight.format() == PackedWeightFormat::Q4K {
+            // Kept as stored: the Kernels decode the super-blocks.
+            let bytes: Vec<i8> = weight.bytes().iter().map(|&byte| byte as i8).collect();
+            let quants = self.stream.clone_htod(&bytes)?;
+            let scales = self.stream.alloc_zeros::<f32>(1)?;
+            let slice = self.stream.alloc_zeros::<f32>(1)?;
+            self.upload_count.fetch_add(1, Ordering::Relaxed);
+            return Ok(CudaDeviceBuffer {
+                slice,
+                shape: weight.logical_shape().to_vec(),
+                bf16: None,
+                q8: Some(CudaQ8Weight {
+                    quants,
+                    scales,
+                    format: PackedWeightFormat::Q4K,
+                    stored_rows: weight.stored_rows(),
+                    stored_cols: weight.stored_cols(),
+                    transposed: weight.transposed(),
+                }),
+            });
+        }
+        let blocks = weight.bytes().as_chunks::<34>().0;
+        let mut quants = Vec::with_capacity(blocks.len() * 32);
+        let mut scales = Vec::with_capacity(blocks.len());
+        for block in blocks {
+            scales.push(half_precision::f16_to_f32(u16::from_le_bytes([
+                block[0], block[1],
+            ])));
+            quants.extend(block[2..].iter().map(|&q| q as i8));
+        }
+        let quants = self.stream.clone_htod(&quants)?;
+        let scales = self.stream.clone_htod(&scales)?;
+        // The f32 placeholder no Kernel reads.
+        let slice = self.stream.alloc_zeros::<f32>(1)?;
+        self.upload_count.fetch_add(1, Ordering::Relaxed);
+        Ok(CudaDeviceBuffer {
+            slice,
+            shape: weight.logical_shape().to_vec(),
+            bf16: None,
+            q8: Some(CudaQ8Weight {
+                quants,
+                scales,
+                format: PackedWeightFormat::Q8_0,
+                stored_rows: weight.stored_rows(),
+                stored_cols: weight.stored_cols(),
+                transposed: weight.transposed(),
+            }),
+        })
+    }
+
+    /// Stores a `Q2_K` or `Q3_K` weight in the layout
+    /// `lowk_matmul_rows_int8_kernel` reads: `Q2_K` super-blocks without
+    /// their `d` and `dmin` (80 bytes), those two as f32 apart; `Q3_K`
+    /// super-blocks as their mask and quants with the sixteen scales
+    /// unpacked to signed bytes (112 bytes), `d` as an f32 apart. Every
+    /// super-block stays 16-byte aligned.
+    fn upload_low_bit_weight(&self, weight: &PackedWeight) -> Result<CudaDeviceBuffer, CudaError> {
+        let format = weight.format();
+        let block_bytes = format.block_bytes() as usize;
+        let blocks = weight.bytes().chunks_exact(block_bytes);
+        let mut quants = Vec::with_capacity(blocks.len() * 112);
+        let mut scales = Vec::with_capacity(blocks.len() * 2);
+        let half = |lo: u8, hi: u8| half_precision::f16_to_f32(u16::from_le_bytes([lo, hi]));
+        for block in blocks {
+            if format == PackedWeightFormat::Q2K {
+                quants.extend(block[..80].iter().map(|&byte| byte as i8));
+                scales.push(half(block[80], block[81]));
+                scales.push(half(block[82], block[83]));
+            } else {
+                quants.extend(block[..96].iter().map(|&byte| byte as i8));
+                quants.extend(
+                    magnetar_runtime::model_loading::q3_k_scales(&block[96..108])
+                        .iter()
+                        .map(|&scale| scale - 32),
+                );
+                scales.push(half(block[108], block[109]));
+            }
+        }
+        let quants = self.stream.clone_htod(&quants)?;
+        let scales = self.stream.clone_htod(&scales)?;
+        let slice = self.stream.alloc_zeros::<f32>(1)?;
+        self.upload_count.fetch_add(1, Ordering::Relaxed);
+        Ok(CudaDeviceBuffer {
+            slice,
+            shape: weight.logical_shape().to_vec(),
+            bf16: None,
+            q8: Some(CudaQ8Weight {
+                quants,
+                scales,
+                format,
+                stored_rows: weight.stored_rows(),
+                stored_cols: weight.stored_cols(),
+                transposed: weight.transposed(),
+            }),
+        })
+    }
+
+    /// Stores an `IQ4_NL` or `IQ4_XS` weight in the layout
+    /// `iq4_matmul_rows_int8_kernel` reads: every 32-value run's 16 index
+    /// bytes in stored order, then (`IQ4_XS`) one signed byte per run, its
+    /// sub-block scale minus 32; `scales` holds each `IQ4_NL` block's `d`,
+    /// or each `IQ4_XS` super-block's.
+    fn upload_iq4_weight(&self, weight: &PackedWeight) -> Result<CudaDeviceBuffer, CudaError> {
+        let format = weight.format();
+        let block_bytes = format.block_bytes() as usize;
+        let blocks = weight.bytes().chunks_exact(block_bytes);
+        let runs = weight.bytes().len() / block_bytes * (format.block_elements() as usize / 32);
+        let mut quants: Vec<i8> = Vec::with_capacity(runs * 17);
+        let mut subscales = Vec::new();
+        let mut scales = Vec::with_capacity(blocks.len());
+        for block in blocks {
+            scales.push(half_precision::f16_to_f32(u16::from_le_bytes([
+                block[0], block[1],
+            ])));
+            if format == PackedWeightFormat::Iq4Nl {
+                quants.extend(block[2..18].iter().map(|&byte| byte as i8));
+            } else {
+                subscales.extend(magnetar_runtime::model_loading::iq4_xs_scales(&block[2..8]));
+                quants.extend(block[8..136].iter().map(|&byte| byte as i8));
+            }
+        }
+        quants.extend(subscales);
+        let quants = self.stream.clone_htod(&quants)?;
+        let scales = self.stream.clone_htod(&scales)?;
+        let slice = self.stream.alloc_zeros::<f32>(1)?;
+        self.upload_count.fetch_add(1, Ordering::Relaxed);
+        Ok(CudaDeviceBuffer {
+            slice,
+            shape: weight.logical_shape().to_vec(),
+            bf16: None,
+            q8: Some(CudaQ8Weight {
+                quants,
+                scales,
+                format,
+                stored_rows: weight.stored_rows(),
+                stored_cols: weight.stored_cols(),
+                transposed: weight.transposed(),
+            }),
+        })
+    }
+
+    /// Stores an IQ2/IQ3 weight in the layout `iq_matmul_rows_int8_kernel`
+    /// reads: each super-block's bytes after its leading `f16` `d` (a
+    /// multiple of four, so word loads stay aligned), `d` as an f32 apart.
+    fn upload_iq_weight(&self, weight: &PackedWeight) -> Result<CudaDeviceBuffer, CudaError> {
+        let format = weight.format();
+        let block_bytes = format.block_bytes() as usize;
+        let blocks = weight.bytes().chunks_exact(block_bytes);
+        let mut quants = Vec::with_capacity(blocks.len() * (block_bytes - 2));
+        let mut scales = Vec::with_capacity(blocks.len());
+        for block in blocks {
+            scales.push(half_precision::f16_to_f32(u16::from_le_bytes([
+                block[0], block[1],
+            ])));
+            quants.extend(block[2..].iter().map(|&byte| byte as i8));
+        }
+        let quants = self.stream.clone_htod(&quants)?;
+        let scales = self.stream.clone_htod(&scales)?;
+        let slice = self.stream.alloc_zeros::<f32>(1)?;
+        self.upload_count.fetch_add(1, Ordering::Relaxed);
+        Ok(CudaDeviceBuffer {
+            slice,
+            shape: weight.logical_shape().to_vec(),
+            bf16: None,
+            q8: Some(CudaQ8Weight {
+                quants,
+                scales,
+                format,
+                stored_rows: weight.stored_rows(),
+                stored_cols: weight.stored_cols(),
+                transposed: weight.transposed(),
+            }),
+        })
+    }
+
+    /// A packed `Q8_0` buffer's logical matrix as f32, dequantized on the
+    /// Device.
+    pub fn dequantize_q8(&self, buffer: &CudaDeviceBuffer) -> Result<CudaDeviceBuffer, CudaError> {
+        let q8 = buffer.q8.as_ref().ok_or_else(|| {
+            CudaError::new(CudaErrorCode::DTypeUnsupported, "not a packed weight")
+        })?;
+        let elements = q8.stored_rows * q8.stored_cols;
+        let mut out = self.alloc_output(elements as usize)?;
+        let transposed = u32::from(q8.transposed);
+        match q8.format {
+            PackedWeightFormat::Q8_0 => {
+                let func = self.function("q8_dequantize_kernel")?;
+                let mut args = self.stream.launch_builder(&func);
+                args.arg(&q8.quants)
+                    .arg(&q8.scales)
+                    .arg(&mut out)
+                    .arg(&q8.stored_rows)
+                    .arg(&q8.stored_cols)
+                    .arg(&transposed);
+                unsafe { args.launch(LaunchConfig::for_num_elems(elements as u32)) }?;
+            }
+            PackedWeightFormat::Iq2Xxs
+            | PackedWeightFormat::Iq2Xs
+            | PackedWeightFormat::Iq2S
+            | PackedWeightFormat::Iq3Xxs
+            | PackedWeightFormat::Iq3S => {
+                let func = self.function("iq_dequantize_kernel")?;
+                let format = iq_format(q8.format).expect("an IQ2/IQ3 format");
+                let mut args = self.stream.launch_builder(&func);
+                args.arg(&format)
+                    .arg(&q8.quants)
+                    .arg(&q8.scales)
+                    .arg(&mut out)
+                    .arg(&q8.stored_rows)
+                    .arg(&q8.stored_cols)
+                    .arg(&transposed);
+                unsafe { args.launch(LaunchConfig::for_num_elems(elements as u32)) }?;
+            }
+            PackedWeightFormat::Iq4Nl | PackedWeightFormat::Iq4Xs => {
+                let func = self.function("iq4_dequantize_kernel")?;
+                let format = iq4_format(q8.format);
+                let subscales = q8.quants.slice(iq4_subscale_offset(q8)..);
+                let mut args = self.stream.launch_builder(&func);
+                args.arg(&format)
+                    .arg(&q8.quants)
+                    .arg(&subscales)
+                    .arg(&q8.scales)
+                    .arg(&mut out)
+                    .arg(&q8.stored_rows)
+                    .arg(&q8.stored_cols)
+                    .arg(&transposed);
+                unsafe { args.launch(LaunchConfig::for_num_elems(elements as u32)) }?;
+            }
+            PackedWeightFormat::Q2K | PackedWeightFormat::Q3K => {
+                let func = self.function("lowk_dequantize_kernel")?;
+                let format = low_bit_format(q8.format);
+                let mut args = self.stream.launch_builder(&func);
+                args.arg(&format)
+                    .arg(&q8.quants)
+                    .arg(&q8.scales)
+                    .arg(&mut out)
+                    .arg(&q8.stored_rows)
+                    .arg(&q8.stored_cols)
+                    .arg(&transposed);
+                unsafe { args.launch(LaunchConfig::for_num_elems(elements as u32)) }?;
+            }
+            PackedWeightFormat::Q6K => {
+                let func = self.function("q6k_dequantize_kernel")?;
+                let mut args = self.stream.launch_builder(&func);
+                args.arg(&q8.quants)
+                    .arg(&q8.scales)
+                    .arg(&mut out)
+                    .arg(&q8.stored_rows)
+                    .arg(&q8.stored_cols)
+                    .arg(&transposed);
+                unsafe { args.launch(LaunchConfig::for_num_elems(elements as u32)) }?;
+            }
+            PackedWeightFormat::Q4K => {
+                let func = self.function("q4k_dequantize_kernel")?;
+                let mut args = self.stream.launch_builder(&func);
+                args.arg(&q8.quants)
+                    .arg(&mut out)
+                    .arg(&q8.stored_rows)
+                    .arg(&q8.stored_cols)
+                    .arg(&transposed);
+                unsafe { args.launch(LaunchConfig::for_num_elems(elements as u32)) }?;
+            }
+        }
+        Ok(CudaDeviceBuffer {
+            slice: out,
+            shape: buffer.shape.clone(),
+            bf16: None,
+            q8: None,
+        })
     }
 
     /// Downloads a device buffer to host-visible bytes. The only
@@ -820,6 +1702,9 @@ impl CudaKernels {
     /// as an automatic step of every Kernel invocation.
     pub fn download(&self, buffer: &CudaDeviceBuffer) -> Result<HostTensor, CudaError> {
         self.forbid_in_capture("a device-to-host download")?;
+        if buffer.is_q8() {
+            return self.download(&self.dequantize_q8(buffer)?);
+        }
         let data = match &buffer.bf16 {
             Some(bf16) => {
                 let bits = self.stream.clone_dtoh(bf16)?;
@@ -1051,6 +1936,12 @@ impl CudaKernels {
     pub fn clone_buffer(&self, buffer: &CudaDeviceBuffer) -> Result<CudaDeviceBuffer, CudaError> {
         self.forbid_in_capture("a buffer copy")?;
         let slice = self.stream.clone_dtod(&buffer.slice)?;
+        if buffer.is_q8() {
+            return Err(CudaError::new(
+                CudaErrorCode::DTypeUnsupported,
+                "a packed weight is never copied",
+            ));
+        }
         let bf16 = match &buffer.bf16 {
             Some(bf16) => Some(self.stream.clone_dtod(bf16)?),
             None => None,
@@ -1059,6 +1950,7 @@ impl CudaKernels {
             slice,
             shape: buffer.shape.clone(),
             bf16,
+            q8: None,
         })
     }
 
@@ -1085,6 +1977,7 @@ impl CudaKernels {
                 slice: out_dev,
                 shape: a.shape.clone(),
                 bf16: None,
+                q8: None,
             });
         }
         let cols = *a.shape.last().ok_or_else(|| {
@@ -1122,6 +2015,7 @@ impl CudaKernels {
             slice: out_dev,
             shape: a.shape.clone(),
             bf16: None,
+            q8: None,
         })
     }
 
@@ -1142,6 +2036,7 @@ impl CudaKernels {
             slice: out_dev,
             shape: a.shape.clone(),
             bf16: None,
+            q8: None,
         })
     }
 
@@ -1204,6 +2099,7 @@ impl CudaKernels {
             slice: out_dev,
             shape,
             bf16: None,
+            q8: None,
         })
     }
 
@@ -1219,7 +2115,268 @@ impl CudaKernels {
             slice: out_dev,
             shape: input.shape.clone(),
             bf16: None,
+            q8: None,
         })
+    }
+
+    /// `sigmoid(x)`, element-wise (`activation` with `kind = sigmoid`).
+    pub fn sigmoid(&self, input: &CudaDeviceBuffer) -> Result<CudaDeviceBuffer, CudaError> {
+        Self::require_f32(&[input], "sigmoid")?;
+        let n = input.slice.len() as u64;
+        let mut out_dev = self.alloc_output(input.slice.len())?;
+        let func = self.function("sigmoid_kernel")?;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(&input.slice).arg(&mut out_dev).arg(&n);
+        unsafe { args.launch(LaunchConfig::for_num_elems(n as u32)) }?;
+        Ok(CudaDeviceBuffer {
+            slice: out_dev,
+            shape: input.shape.clone(),
+            bf16: None,
+            q8: None,
+        })
+    }
+
+    /// `out[t, :] = x[t, :] * scale[t]`, `scale` of `[T, 1]` or `[T]`.
+    pub fn row_scale(
+        &self,
+        x: &CudaDeviceBuffer,
+        scale: &CudaDeviceBuffer,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        Self::require_f32(&[x, scale], "row-scale")?;
+        let (rows, cols) = rows_cols_buf(x)?;
+        if scale.slice.len() as u64 != rows {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!(
+                    "row-scale expects one scale per row of {:?}, got {:?}",
+                    x.shape, scale.shape
+                ),
+            ));
+        }
+        let n = x.slice.len() as u64;
+        let mut out_dev = self.alloc_output(x.slice.len())?;
+        let func = self.function("row_scale_kernel")?;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(&x.slice)
+            .arg(&scale.slice)
+            .arg(&mut out_dev)
+            .arg(&cols)
+            .arg(&n);
+        unsafe { args.launch(LaunchConfig::for_num_elems(n as u32)) }?;
+        Ok(CudaDeviceBuffer {
+            slice: out_dev,
+            shape: x.shape.clone(),
+            bf16: None,
+            q8: None,
+        })
+    }
+
+    /// The most routed experts `moe_route_kernel` handles (`kernels.cu`'s
+    /// `MOE_ROUTE_EXPERTS_PER_LANE` lanes of 32).
+    const MOE_ROUTE_MAX_EXPERTS: u64 = 8 * 32;
+
+    /// The `moe-experts` Operator (`execute-and-cache-moe-experts` F02):
+    /// `magnetar_runtime::reference_cpu::moe_experts`' semantics. Routing
+    /// stays on the Device. Packed `Q8_0` experts (transposed storage,
+    /// each expert a run of stored rows) are read packed; f32 experts
+    /// directly; any other compact storage is expanded for this call.
+    pub fn moe_experts(
+        &self,
+        h: &CudaDeviceBuffer,
+        logits: &CudaDeviceBuffer,
+        [gate, up, down]: [&CudaDeviceBuffer; 3],
+        routing: magnetar_runtime::reference_cpu::MoeRouting,
+        (expert_first, local_experts): (u64, u64),
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        Self::require_f32(&[h, logits], "moe-experts' activations")?;
+        let shape_error = |reason: String| CudaError::new(CudaErrorCode::ShapeUnsupported, reason);
+        let (tokens, hidden) = rows_cols_buf(h)?;
+        let (logit_rows, experts) = rows_cols_buf(logits)?;
+        let top_k = routing.top_k;
+        if experts != routing.experts
+            || logit_rows != tokens
+            || top_k == 0
+            || top_k > experts
+            || local_experts == 0
+            || expert_first
+                .checked_add(local_experts)
+                .is_none_or(|end| end > experts)
+            || experts > Self::MOE_ROUTE_MAX_EXPERTS
+        {
+            return Err(shape_error(format!(
+                "moe-experts routes top {top_k} of {} experts over [{logit_rows}, {experts}] \
+                 logits for {tokens} tokens",
+                routing.experts
+            )));
+        }
+        let (gate_rows, gate_cols) = rows_cols_buf(gate)?;
+        let (down_rows, down_cols) = rows_cols_buf(down)?;
+        if gate_rows != hidden
+            || !gate_cols.is_multiple_of(local_experts)
+            || up.shape != gate.shape
+            || down_cols != local_experts * hidden
+            || down_rows != gate_cols / local_experts
+        {
+            return Err(shape_error(format!(
+                "moe-experts expects gate/up [{hidden}, {local_experts} * I] and down [I, \
+                 {local_experts} * {hidden}], got {:?}, {:?} and {:?}",
+                gate.shape, up.shape, down.shape
+            )));
+        }
+        let inter = gate_cols / local_experts;
+        let pairs = tokens * top_k;
+
+        let mut scratch_slot = self.moe_scratch.lock().unwrap();
+        let mut temporary = None;
+        let scratch: &mut MoeScratch = if tokens <= MOE_PERSISTENT_TOKENS {
+            let fits = scratch_slot.0.as_ref().is_some_and(|scratch| {
+                scratch.indices.len() as u64 >= pairs && scratch.act.len() as u64 >= pairs * inter
+            });
+            if !fits {
+                self.forbid_in_capture("growing the moe-experts scratch")?;
+                let capacity = MOE_PERSISTENT_TOKENS * top_k;
+                let grown = MoeScratch {
+                    indices: self.stream.alloc_zeros::<i32>(capacity as usize)?,
+                    weights: self.stream.alloc_zeros::<f32>(capacity as usize)?,
+                    act: self
+                        .stream
+                        .alloc_zeros::<f32>((capacity * inter) as usize)?,
+                };
+                if let Some(outgrown) = scratch_slot.0.replace(grown) {
+                    scratch_slot.1.push(outgrown);
+                }
+            }
+            scratch_slot.0.as_mut().expect("ensured above")
+        } else {
+            self.forbid_in_capture("a moe-experts prefill scratch")?;
+            temporary.insert(MoeScratch {
+                indices: self.stream.alloc_zeros::<i32>(pairs as usize)?,
+                weights: self.stream.alloc_zeros::<f32>(pairs as usize)?,
+                act: self.stream.alloc_zeros::<f32>((pairs * inter) as usize)?,
+            })
+        };
+
+        let normalize = i32::from(routing.normalize);
+        let func = self.function("moe_route_kernel")?;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(&logits.slice)
+            .arg(&mut scratch.indices)
+            .arg(&mut scratch.weights)
+            .arg(&tokens)
+            .arg(&experts)
+            .arg(&top_k)
+            .arg(&normalize)
+            .arg(&expert_first)
+            .arg(&local_experts);
+        // One warp per token, four tokens per block.
+        let route_config = LaunchConfig {
+            grid_dim: (tokens.div_ceil(4) as u32, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { args.launch(route_config) }?;
+
+        fn packed(buffer: &CudaDeviceBuffer, stored_cols: u64) -> Option<&CudaQ8Weight> {
+            buffer.q8.as_ref().filter(|q8| {
+                q8.format == PackedWeightFormat::Q8_0
+                    && q8.transposed
+                    && q8.stored_cols == stored_cols
+            })
+        }
+        let warps_grid = |cols: u64, rows: u64| LaunchConfig {
+            grid_dim: (
+                cols.div_ceil(u64::from(Q8_MATMUL_WARPS)) as u32,
+                rows as u32,
+                1,
+            ),
+            block_dim: (32, Q8_MATMUL_WARPS, 1),
+            shared_mem_bytes: 0,
+        };
+        if let (Some(gate_q8), Some(up_q8)) = (packed(gate, hidden), packed(up, hidden)) {
+            let func = self.function("moe_q8_gated_kernel")?;
+            let mut args = self.stream.launch_builder(&func);
+            args.arg(&h.slice)
+                .arg(&scratch.indices)
+                .arg(&gate_q8.quants)
+                .arg(&gate_q8.scales)
+                .arg(&up_q8.quants)
+                .arg(&up_q8.scales)
+                .arg(&mut scratch.act)
+                .arg(&top_k)
+                .arg(&hidden)
+                .arg(&inter);
+            unsafe { args.launch(warps_grid(inter, pairs)) }?;
+        } else {
+            let (mut gate_f32, mut up_f32) = (None, None);
+            let gate = self.as_f32(gate, &mut gate_f32)?;
+            let up = self.as_f32(up, &mut up_f32)?;
+            let func = self.function("moe_f32_gated_kernel")?;
+            let mut args = self.stream.launch_builder(&func);
+            args.arg(&h.slice)
+                .arg(&scratch.indices)
+                .arg(&gate.slice)
+                .arg(&up.slice)
+                .arg(&mut scratch.act)
+                .arg(&pairs)
+                .arg(&top_k)
+                .arg(&hidden)
+                .arg(&inter)
+                .arg(&local_experts);
+            unsafe { args.launch(LaunchConfig::for_num_elems((pairs * inter) as u32)) }?;
+        }
+
+        let mut out_dev = self.alloc_output((tokens * hidden) as usize)?;
+        if let Some(down_q8) = packed(down, inter) {
+            let func = self.function("moe_q8_down_kernel")?;
+            let mut args = self.stream.launch_builder(&func);
+            args.arg(&scratch.act)
+                .arg(&scratch.indices)
+                .arg(&scratch.weights)
+                .arg(&down_q8.quants)
+                .arg(&down_q8.scales)
+                .arg(&mut out_dev)
+                .arg(&top_k)
+                .arg(&hidden)
+                .arg(&inter);
+            unsafe { args.launch(warps_grid(hidden, tokens)) }?;
+        } else {
+            let mut down_f32 = None;
+            let down = self.as_f32(down, &mut down_f32)?;
+            let func = self.function("moe_f32_down_kernel")?;
+            let mut args = self.stream.launch_builder(&func);
+            args.arg(&scratch.act)
+                .arg(&scratch.indices)
+                .arg(&scratch.weights)
+                .arg(&down.slice)
+                .arg(&mut out_dev)
+                .arg(&tokens)
+                .arg(&top_k)
+                .arg(&hidden)
+                .arg(&inter)
+                .arg(&local_experts);
+            unsafe { args.launch(LaunchConfig::for_num_elems((tokens * hidden) as u32)) }?;
+        }
+        drop(temporary);
+        drop(scratch_slot);
+        Ok(CudaDeviceBuffer {
+            slice: out_dev,
+            shape: vec![tokens, hidden],
+            bf16: None,
+            q8: None,
+        })
+    }
+
+    /// `buffer` as plain f32: itself, or its expansion for this call,
+    /// kept in `expanded`.
+    fn as_f32<'b>(
+        &self,
+        buffer: &'b CudaDeviceBuffer,
+        expanded: &'b mut Option<CudaDeviceBuffer>,
+    ) -> Result<&'b CudaDeviceBuffer, CudaError> {
+        if !buffer.is_compact() {
+            return Ok(buffer);
+        }
+        Ok(expanded.insert(self.expand(buffer)?))
     }
 
     pub fn embedding_lookup(
@@ -1229,23 +2386,64 @@ impl CudaKernels {
     ) -> Result<CudaDeviceBuffer, CudaError> {
         let (vocab, dim) = rows_cols_buf(table)?;
         Self::require_f32(&[ids], "the embedding lookup's ids")?;
+        // A packed table read row by row must be stored untransposed.
+        let context = |step: &'static str| {
+            let packed = table.is_q8();
+            move |error: CudaError| {
+                CudaError::new(
+                    CudaErrorCode::ExecutionFailed,
+                    format!(
+                        "embedding lookup {step} ({} ids, table {vocab}x{dim}, packed {packed}): \
+                         {error}",
+                        ids.slice.len()
+                    ),
+                )
+            }
+        };
+        if table
+            .q8
+            .as_ref()
+            .is_some_and(|q8| q8.transposed || q8.format != PackedWeightFormat::Q8_0)
+        {
+            let dense = self
+                .dequantize_q8(table)
+                .map_err(context("dequantizing a transposed table"))?;
+            return self.embedding_lookup(&dense, ids);
+        }
         let table16 = self.bf16_address(table);
+        let (table_q8, table_q8_scales) = match &table.q8 {
+            Some(q8) => (
+                q8.quants.device_ptr(&self.stream).0,
+                q8.scales.device_ptr(&self.stream).0,
+            ),
+            None => (0, 0),
+        };
         let num_ids = ids.slice.len() as u64;
         // Rows of invalid ids stay unwritten, but those fail the lookup.
-        let mut out_dev = self.alloc_output(ids.slice.len() * dim as usize)?;
+        let mut out_dev = self
+            .alloc_output(ids.slice.len() * dim as usize)
+            .map_err(context("output allocation"))?;
         let mut flag_slot = self.embedding_flag.lock().unwrap();
         let mut invalid_id_flag = match flag_slot.take() {
             Some(flag) => flag,
             None => {
                 self.forbid_in_capture("a device allocation")?;
-                self.stream.alloc_zeros::<i32>(1)?
+                self.stream
+                    .alloc_zeros::<i32>(1)
+                    .map_err(CudaError::from)
+                    .map_err(context("flag allocation"))?
             }
         };
         // A captured step resets the flag once, at its start.
         if !self.is_capturing() {
-            self.stream.memset_zeros(&mut invalid_id_flag)?;
+            self.stream
+                .memset_zeros(&mut invalid_id_flag)
+                .map_err(CudaError::from)
+                .map_err(context("flag reset"))?;
         }
-        let func = self.function("embedding_lookup_kernel")?;
+        let func = self
+            .function("embedding_lookup_kernel")
+            .map_err(context("function load"))?;
         let mut args = self.stream.launch_builder(&func);
         args.arg(&table.slice)
             .arg(&ids.slice)
@@ -1254,8 +2452,20 @@ impl CudaKernels {
             .arg(&num_ids)
             .arg(&vocab)
             .arg(&mut invalid_id_flag)
-            .arg(&table16);
-        let launched = unsafe { args.launch(LaunchConfig::for_num_elems(num_ids as u32)) };
+            .arg(&table16)
+            .arg(&table_q8)
+            .arg(&table_q8_scales);
+        let launched =
+            unsafe { args.launch(LaunchConfig::for_num_elems(num_ids as u32)) }.map_err(|error| {
+                CudaError::new(
+                    CudaErrorCode::ExecutionFailed,
+                    format!(
+                        "embedding_lookup_kernel launch ({num_ids} ids, table {vocab}x{dim}, \
+                         packed {}): {error}",
+                        table.is_q8()
+                    ),
+                )
+            });
         *flag_slot = Some(invalid_id_flag);
         drop(flag_slot);
         launched?;
@@ -1268,17 +2478,28 @@ impl CudaKernels {
                 slice: out_dev,
                 shape: vec![num_ids, dim],
                 bf16: None,
+                q8: None,
             });
         }
         // Data-dependent failure (an out-of-range or non-integer token id)
         // can only be observed by downloading this one-element flag -- the
         // same device-computed-flag pattern `softmax_rows` already uses
         // below, not a blanket per-kernel host round-trip.
-        self.check_embedding_flag()?;
+        self.check_embedding_flag().map_err(|error| {
+            CudaError::new(
+                CudaErrorCode::ExecutionFailed,
+                format!(
+                    "embedding lookup ({num_ids} ids, table {vocab}x{dim}, packed {}) \
+                     completion: {error}",
+                    table.is_q8()
+                ),
+            )
+        })?;
         Ok(CudaDeviceBuffer {
             slice: out_dev,
             shape: vec![num_ids, dim],
             bf16: None,
+            q8: None,
         })
     }
 
@@ -1361,6 +2582,7 @@ impl CudaKernels {
             slice: out_dev,
             shape: input.shape.clone(),
             bf16: None,
+            q8: None,
         })
     }
 
@@ -1519,6 +2741,7 @@ impl CudaKernels {
             slice: out_dev,
             shape: input.shape.clone(),
             bf16: None,
+            q8: None,
         })
     }
 
@@ -1548,6 +2771,7 @@ impl CudaKernels {
             slice: out_dev,
             shape: input.shape.clone(),
             bf16: None,
+            q8: None,
         })
     }
 
@@ -1683,6 +2907,7 @@ impl CudaKernels {
             slice: out_dev,
             shape: gate.shape.clone(),
             bf16: None,
+            q8: None,
         })
     }
 
@@ -1714,7 +2939,218 @@ impl CudaKernels {
         } else {
             (a_rows, a_cols)
         };
-        if transpose_b || m > MATMUL_SPLIT_K_MAX_ROWS || k != b_rows {
+        // Packed weights read packed against a few contiguous rows: both
+        // projections in one launch, with no intermediate to allocate (a
+        // captured decode step allocates nothing).
+        if let (Some(gate_q8), Some(up_q8)) = (&gate.q8, &up.q8)
+            && gate_q8.format == PackedWeightFormat::Q8_0
+            && up_q8.format == PackedWeightFormat::Q8_0
+            && gate_q8.transposed
+            && up_q8.transposed
+            && !transpose_a
+            && !transpose_b
+            && m <= Q8_MATMUL_MAX_ROWS
+            && k == b_rows
+        {
+            Self::require_f32(&[a], "gated-matmul's input")?;
+            return self.q8_gated_matmul_rows(a, gate_q8, up_q8, m, k, b_cols);
+        }
+        if let (Some(gate_iq), Some(up_iq)) = (&gate.q8, &up.q8)
+            && let Some(format) = iq_format(gate_iq.format)
+            && up_iq.format == gate_iq.format
+            && gate_iq.transposed
+            && up_iq.transposed
+            && !transpose_a
+            && !transpose_b
+            && m <= Q8_MATMUL_MAX_ROWS
+            && k == b_rows
+        {
+            Self::require_f32(&[a], "gated-matmul's input")?;
+            let int8 = self.quantize_activations(a, m, k)?;
+            if let Some(scratch) = int8.as_ref().and_then(|guard| guard.as_ref()) {
+                let mut out_dev = self.alloc_output((m * b_cols) as usize)?;
+                let func = self.function("iq_gated_matmul_rows_int8_kernel")?;
+                let mut args = self.stream.launch_builder(&func);
+                args.arg(&format)
+                    .arg(&scratch.values)
+                    .arg(&scratch.scales)
+                    .arg(&gate_iq.quants)
+                    .arg(&gate_iq.scales)
+                    .arg(&up_iq.quants)
+                    .arg(&up_iq.scales)
+                    .arg(&mut out_dev)
+                    .arg(&m)
+                    .arg(&k)
+                    .arg(&b_cols);
+                let config = LaunchConfig {
+                    grid_dim: (
+                        b_cols.div_ceil(u64::from(Q8_MATMUL_WARPS)) as u32,
+                        m.div_ceil(Q8_MATMUL_ROWS) as u32,
+                        1,
+                    ),
+                    block_dim: (32, Q8_MATMUL_WARPS, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe { args.launch(config) }?;
+                return Ok(CudaDeviceBuffer {
+                    slice: out_dev,
+                    shape: vec![m, b_cols],
+                    bf16: None,
+                    q8: None,
+                });
+            }
+        }
+        if let (Some(gate_iq), Some(up_iq)) = (&gate.q8, &up.q8)
+            && matches!(
+                gate_iq.format,
+                PackedWeightFormat::Iq4Nl | PackedWeightFormat::Iq4Xs
+            )
+            && up_iq.format == gate_iq.format
+            && gate_iq.transposed
+            && up_iq.transposed
+            && !transpose_a
+            && !transpose_b
+            && m <= Q8_MATMUL_MAX_ROWS
+            && k == b_rows
+        {
+            Self::require_f32(&[a], "gated-matmul's input")?;
+            let int8 = self.quantize_activations(a, m, k)?;
+            if let Some(scratch) = int8.as_ref().and_then(|guard| guard.as_ref()) {
+                let mut out_dev = self.alloc_output((m * b_cols) as usize)?;
+                let format = iq4_format(gate_iq.format);
+                let gate_sub = gate_iq.quants.slice(iq4_subscale_offset(gate_iq)..);
+                let up_sub = up_iq.quants.slice(iq4_subscale_offset(up_iq)..);
+                let func = self.function("iq4_gated_matmul_rows_int8_kernel")?;
+                let mut args = self.stream.launch_builder(&func);
+                args.arg(&format)
+                    .arg(&scratch.values)
+                    .arg(&scratch.scales)
+                    .arg(&gate_iq.quants)
+                    .arg(&gate_sub)
+                    .arg(&gate_iq.scales)
+                    .arg(&up_iq.quants)
+                    .arg(&up_sub)
+                    .arg(&up_iq.scales)
+                    .arg(&mut out_dev)
+                    .arg(&m)
+                    .arg(&k)
+                    .arg(&b_cols);
+                let config = LaunchConfig {
+                    grid_dim: (
+                        b_cols.div_ceil(u64::from(Q8_MATMUL_WARPS)) as u32,
+                        m.div_ceil(Q8_MATMUL_ROWS) as u32,
+                        1,
+                    ),
+                    block_dim: (32, Q8_MATMUL_WARPS, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe { args.launch(config) }?;
+                return Ok(CudaDeviceBuffer {
+                    slice: out_dev,
+                    shape: vec![m, b_cols],
+                    bf16: None,
+                    q8: None,
+                });
+            }
+        }
+        if let (Some(gate_low), Some(up_low)) = (&gate.q8, &up.q8)
+            && matches!(
+                gate_low.format,
+                PackedWeightFormat::Q2K | PackedWeightFormat::Q3K
+            )
+            && up_low.format == gate_low.format
+            && gate_low.transposed
+            && up_low.transposed
+            && !transpose_a
+            && !transpose_b
+            && m <= Q8_MATMUL_MAX_ROWS
+            && k == b_rows
+        {
+            Self::require_f32(&[a], "gated-matmul's input")?;
+            let int8 = self.quantize_activations(a, m, k)?;
+            if let Some(scratch) = int8.as_ref().and_then(|guard| guard.as_ref()) {
+                let mut out_dev = self.alloc_output((m * b_cols) as usize)?;
+                let format = low_bit_format(gate_low.format);
+                let func = self.function("lowk_gated_matmul_rows_int8_kernel")?;
+                let mut args = self.stream.launch_builder(&func);
+                args.arg(&format)
+                    .arg(&scratch.values)
+                    .arg(&scratch.scales)
+                    .arg(&gate_low.quants)
+                    .arg(&gate_low.scales)
+                    .arg(&up_low.quants)
+                    .arg(&up_low.scales)
+                    .arg(&mut out_dev)
+                    .arg(&m)
+                    .arg(&k)
+                    .arg(&b_cols);
+                let config = LaunchConfig {
+                    grid_dim: (
+                        b_cols.div_ceil(u64::from(Q8_MATMUL_WARPS)) as u32,
+                        m.div_ceil(Q8_MATMUL_ROWS) as u32,
+                        1,
+                    ),
+                    block_dim: (32, Q8_MATMUL_WARPS, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe { args.launch(config) }?;
+                return Ok(CudaDeviceBuffer {
+                    slice: out_dev,
+                    shape: vec![m, b_cols],
+                    bf16: None,
+                    q8: None,
+                });
+            }
+        }
+        if let (Some(gate_q4k), Some(up_q4k)) = (&gate.q8, &up.q8)
+            && gate_q4k.format == PackedWeightFormat::Q4K
+            && up_q4k.format == PackedWeightFormat::Q4K
+            && gate_q4k.transposed
+            && up_q4k.transposed
+            && !transpose_a
+            && !transpose_b
+            && m <= Q8_MATMUL_MAX_ROWS
+            && k == b_rows
+        {
+            Self::require_f32(&[a], "gated-matmul's input")?;
+            let mut out_dev = self.alloc_output((m * b_cols) as usize)?;
+            let int8 = self.quantize_activations(a, m, k)?;
+            let int8 = int8.as_ref().and_then(|guard| guard.as_ref());
+            let func = self.function(if int8.is_some() {
+                "q4k_gated_matmul_rows_int8_kernel"
+            } else {
+                "q4k_gated_matmul_rows_kernel"
+            })?;
+            let mut args = self.stream.launch_builder(&func);
+            match int8 {
+                Some(scratch) => args.arg(&scratch.values).arg(&scratch.scales),
+                None => args.arg(&a.slice),
+            };
+            args.arg(&gate_q4k.quants)
+                .arg(&up_q4k.quants)
+                .arg(&mut out_dev)
+                .arg(&m)
+                .arg(&k)
+                .arg(&b_cols);
+            let config = LaunchConfig {
+                grid_dim: (
+                    b_cols.div_ceil(u64::from(Q8_MATMUL_WARPS)) as u32,
+                    m.div_ceil(Q8_MATMUL_ROWS) as u32,
+                    1,
+                ),
+                block_dim: (32, Q8_MATMUL_WARPS, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe { args.launch(config) }?;
+            return Ok(CudaDeviceBuffer {
+                slice: out_dev,
+                shape: vec![m, b_cols],
+                bf16: None,
+                q8: None,
+            });
+        }
+        // Other packed weights: each projection through the packed matmul.
+        if transpose_b || m > MATMUL_SPLIT_K_MAX_ROWS || k != b_rows || gate.is_q8() || up.is_q8() {
             let gate_out = self.matmul(a, gate, transpose_a, transpose_b)?;
             let up_out = self.matmul(a, up, transpose_a, transpose_b)?;
             return self.silu_mul(&gate_out, &up_out);
@@ -1763,6 +3199,7 @@ impl CudaKernels {
                 slice: out_dev,
                 shape: vec![m, n],
                 bf16: None,
+                q8: None,
             });
         }
         if m >= MATMUL_TILE_MIN_ROWS
@@ -1794,6 +3231,7 @@ impl CudaKernels {
                 slice: out_dev,
                 shape: vec![m, n],
                 bf16: None,
+                q8: None,
             });
         }
         let (name, grid_dim) = split_k_rows(
@@ -1829,6 +3267,382 @@ impl CudaKernels {
             slice: out_dev,
             shape: vec![m, n],
             bf16: None,
+            q8: None,
+        })
+    }
+
+    /// `q8_matmul_rows_kernel`: `a` (`m` contiguous rows of `k`) times the
+    /// packed, transposed-storage weight `q8` (`[k, n]` logically).
+    fn q8_matmul_rows(
+        &self,
+        a: &CudaDeviceBuffer,
+        q8: &CudaQ8Weight,
+        m: u64,
+        k: u64,
+        n: u64,
+        addend: Option<MatmulAddend<'_>>,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        let mut out_dev = self.alloc_output((m * n) as usize)?;
+        let (addend_buffer, addend_mode) = match addend {
+            None => (a, 0i32),
+            Some(MatmulAddend::Row(bias)) => (bias, 1),
+            Some(MatmulAddend::Full(residual)) => (residual, 2),
+        };
+        let int8 = self.quantize_activations(a, m, k)?;
+        let int8 = int8.as_ref().and_then(|guard| guard.as_ref());
+        let func = self.function(if int8.is_some() {
+            "q8_matmul_rows_int8_kernel"
+        } else {
+            "q8_matmul_rows_kernel"
+        })?;
+        let mut args = self.stream.launch_builder(&func);
+        match int8 {
+            Some(scratch) => args.arg(&scratch.values).arg(&scratch.scales),
+            None => args.arg(&a.slice),
+        };
+        args.arg(&q8.quants)
+            .arg(&q8.scales)
+            .arg(&mut out_dev)
+            .arg(&m)
+            .arg(&k)
+            .arg(&n)
+            .arg(&addend_buffer.slice)
+            .arg(&addend_mode);
+        let config = LaunchConfig {
+            grid_dim: (
+                n.div_ceil(u64::from(Q8_MATMUL_WARPS)) as u32,
+                m.div_ceil(Q8_MATMUL_ROWS) as u32,
+                1,
+            ),
+            block_dim: (32, Q8_MATMUL_WARPS, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { args.launch(config) }?;
+        Ok(CudaDeviceBuffer {
+            slice: out_dev,
+            shape: vec![m, n],
+            bf16: None,
+            q8: None,
+        })
+    }
+
+    /// `q4k_matmul_rows_kernel`: `a` (`m` contiguous rows of `k`) times the
+    /// packed `Q4_K`, transposed-storage weight `q4k` (`[k, n]` logically).
+    fn q4k_matmul_rows(
+        &self,
+        a: &CudaDeviceBuffer,
+        q4k: &CudaQ8Weight,
+        m: u64,
+        k: u64,
+        n: u64,
+        addend: Option<MatmulAddend<'_>>,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        let mut out_dev = self.alloc_output((m * n) as usize)?;
+        let (addend_buffer, addend_mode) = match addend {
+            None => (a, 0i32),
+            Some(MatmulAddend::Row(bias)) => (bias, 1),
+            Some(MatmulAddend::Full(residual)) => (residual, 2),
+        };
+        let int8 = self.quantize_activations(a, m, k)?;
+        let int8 = int8.as_ref().and_then(|guard| guard.as_ref());
+        let func = self.function(if int8.is_some() {
+            "q4k_matmul_rows_int8_kernel"
+        } else {
+            "q4k_matmul_rows_kernel"
+        })?;
+        let mut args = self.stream.launch_builder(&func);
+        match int8 {
+            Some(scratch) => args.arg(&scratch.values).arg(&scratch.scales),
+            None => args.arg(&a.slice),
+        };
+        args.arg(&q4k.quants)
+            .arg(&mut out_dev)
+            .arg(&m)
+            .arg(&k)
+            .arg(&n)
+            .arg(&addend_buffer.slice)
+            .arg(&addend_mode);
+        let config = LaunchConfig {
+            grid_dim: (
+                n.div_ceil(u64::from(Q8_MATMUL_WARPS) * Q4K_MATMUL_COLS) as u32,
+                m.div_ceil(Q8_MATMUL_ROWS) as u32,
+                1,
+            ),
+            block_dim: (32, Q8_MATMUL_WARPS, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { args.launch(config) }?;
+        Ok(CudaDeviceBuffer {
+            slice: out_dev,
+            shape: vec![m, n],
+            bf16: None,
+            q8: None,
+        })
+    }
+
+    /// `iq_matmul_rows_int8_kernel` for an IQ2/IQ3 weight, when the
+    /// activations can be quantized to int8; `None` otherwise.
+    fn iq_matmul_rows(
+        &self,
+        a: &CudaDeviceBuffer,
+        weight: &CudaQ8Weight,
+        m: u64,
+        k: u64,
+        n: u64,
+        addend: Option<MatmulAddend<'_>>,
+    ) -> Result<Option<CudaDeviceBuffer>, CudaError> {
+        let int8 = self.quantize_activations(a, m, k)?;
+        let Some(scratch) = int8.as_ref().and_then(|guard| guard.as_ref()) else {
+            return Ok(None);
+        };
+        let mut out_dev = self.alloc_output((m * n) as usize)?;
+        let (addend_buffer, addend_mode) = match addend {
+            None => (a, 0i32),
+            Some(MatmulAddend::Row(bias)) => (bias, 1),
+            Some(MatmulAddend::Full(residual)) => (residual, 2),
+        };
+        let format = iq_format(weight.format).expect("an IQ2/IQ3 format");
+        let func = self.function("iq_matmul_rows_int8_kernel")?;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(&format)
+            .arg(&scratch.values)
+            .arg(&scratch.scales)
+            .arg(&weight.quants)
+            .arg(&weight.scales)
+            .arg(&mut out_dev)
+            .arg(&m)
+            .arg(&k)
+            .arg(&n)
+            .arg(&addend_buffer.slice)
+            .arg(&addend_mode);
+        let config = LaunchConfig {
+            grid_dim: (
+                n.div_ceil(u64::from(Q8_MATMUL_WARPS) * IQ_MATMUL_COLS) as u32,
+                m.div_ceil(Q8_MATMUL_ROWS) as u32,
+                1,
+            ),
+            block_dim: (32, Q8_MATMUL_WARPS, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { args.launch(config) }?;
+        Ok(Some(CudaDeviceBuffer {
+            slice: out_dev,
+            shape: vec![m, n],
+            bf16: None,
+            q8: None,
+        }))
+    }
+
+    /// `iq4_matmul_rows_int8_kernel` for an `IQ4_NL`/`IQ4_XS` weight, when
+    /// the activations can be quantized to int8; `None` otherwise.
+    fn iq4_matmul_rows(
+        &self,
+        a: &CudaDeviceBuffer,
+        weight: &CudaQ8Weight,
+        m: u64,
+        k: u64,
+        n: u64,
+        addend: Option<MatmulAddend<'_>>,
+    ) -> Result<Option<CudaDeviceBuffer>, CudaError> {
+        let int8 = self.quantize_activations(a, m, k)?;
+        let Some(scratch) = int8.as_ref().and_then(|guard| guard.as_ref()) else {
+            return Ok(None);
+        };
+        let mut out_dev = self.alloc_output((m * n) as usize)?;
+        let (addend_buffer, addend_mode) = match addend {
+            None => (a, 0i32),
+            Some(MatmulAddend::Row(bias)) => (bias, 1),
+            Some(MatmulAddend::Full(residual)) => (residual, 2),
+        };
+        let format = iq4_format(weight.format);
+        let subscales = weight.quants.slice(iq4_subscale_offset(weight)..);
+        let func = self.function("iq4_matmul_rows_int8_kernel")?;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(&format)
+            .arg(&scratch.values)
+            .arg(&scratch.scales)
+            .arg(&weight.quants)
+            .arg(&subscales)
+            .arg(&weight.scales)
+            .arg(&mut out_dev)
+            .arg(&m)
+            .arg(&k)
+            .arg(&n)
+            .arg(&addend_buffer.slice)
+            .arg(&addend_mode);
+        let config = LaunchConfig {
+            grid_dim: (
+                n.div_ceil(u64::from(Q8_MATMUL_WARPS)) as u32,
+                m.div_ceil(Q8_MATMUL_ROWS) as u32,
+                1,
+            ),
+            block_dim: (32, Q8_MATMUL_WARPS, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { args.launch(config) }?;
+        Ok(Some(CudaDeviceBuffer {
+            slice: out_dev,
+            shape: vec![m, n],
+            bf16: None,
+            q8: None,
+        }))
+    }
+
+    /// `lowk_matmul_rows_int8_kernel` for a `Q2_K`/`Q3_K` weight, when the
+    /// activations can be quantized to int8; `None` otherwise.
+    fn low_bit_matmul_rows(
+        &self,
+        a: &CudaDeviceBuffer,
+        weight: &CudaQ8Weight,
+        m: u64,
+        k: u64,
+        n: u64,
+        addend: Option<MatmulAddend<'_>>,
+    ) -> Result<Option<CudaDeviceBuffer>, CudaError> {
+        let int8 = self.quantize_activations(a, m, k)?;
+        let Some(scratch) = int8.as_ref().and_then(|guard| guard.as_ref()) else {
+            return Ok(None);
+        };
+        let mut out_dev = self.alloc_output((m * n) as usize)?;
+        let (addend_buffer, addend_mode) = match addend {
+            None => (a, 0i32),
+            Some(MatmulAddend::Row(bias)) => (bias, 1),
+            Some(MatmulAddend::Full(residual)) => (residual, 2),
+        };
+        let format = low_bit_format(weight.format);
+        let func = self.function("lowk_matmul_rows_int8_kernel")?;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(&format)
+            .arg(&scratch.values)
+            .arg(&scratch.scales)
+            .arg(&weight.quants)
+            .arg(&weight.scales)
+            .arg(&mut out_dev)
+            .arg(&m)
+            .arg(&k)
+            .arg(&n)
+            .arg(&addend_buffer.slice)
+            .arg(&addend_mode);
+        let config = LaunchConfig {
+            grid_dim: (
+                n.div_ceil(u64::from(Q8_MATMUL_WARPS) * LOW_BIT_MATMUL_COLS) as u32,
+                m.div_ceil(Q8_MATMUL_ROWS) as u32,
+                1,
+            ),
+            block_dim: (32, Q8_MATMUL_WARPS, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { args.launch(config) }?;
+        Ok(Some(CudaDeviceBuffer {
+            slice: out_dev,
+            shape: vec![m, n],
+            bf16: None,
+            q8: None,
+        }))
+    }
+
+    /// `q6k_matmul_rows_kernel`: `a` (`m` contiguous rows of `k`) times the
+    /// packed `Q6_K`, transposed-storage weight `q6k` (`[k, n]` logically).
+    fn q6k_matmul_rows(
+        &self,
+        a: &CudaDeviceBuffer,
+        q6k: &CudaQ8Weight,
+        m: u64,
+        k: u64,
+        n: u64,
+        addend: Option<MatmulAddend<'_>>,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        let mut out_dev = self.alloc_output((m * n) as usize)?;
+        let (addend_buffer, addend_mode) = match addend {
+            None => (a, 0i32),
+            Some(MatmulAddend::Row(bias)) => (bias, 1),
+            Some(MatmulAddend::Full(residual)) => (residual, 2),
+        };
+        let int8 = self.quantize_activations(a, m, k)?;
+        let int8 = int8.as_ref().and_then(|guard| guard.as_ref());
+        let func = self.function(if int8.is_some() {
+            "q6k_matmul_rows_int8_kernel"
+        } else {
+            "q6k_matmul_rows_kernel"
+        })?;
+        let mut args = self.stream.launch_builder(&func);
+        match int8 {
+            Some(scratch) => args.arg(&scratch.values).arg(&scratch.scales),
+            None => args.arg(&a.slice),
+        };
+        args.arg(&q6k.quants)
+            .arg(&q6k.scales)
+            .arg(&mut out_dev)
+            .arg(&m)
+            .arg(&k)
+            .arg(&n)
+            .arg(&addend_buffer.slice)
+            .arg(&addend_mode);
+        let config = LaunchConfig {
+            grid_dim: (
+                n.div_ceil(u64::from(Q8_MATMUL_WARPS) * Q6K_MATMUL_COLS) as u32,
+                m.div_ceil(Q8_MATMUL_ROWS) as u32,
+                1,
+            ),
+            block_dim: (32, Q8_MATMUL_WARPS, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { args.launch(config) }?;
+        Ok(CudaDeviceBuffer {
+            slice: out_dev,
+            shape: vec![m, n],
+            bf16: None,
+            q8: None,
+        })
+    }
+
+    /// `silu(a x gate) * (a x up)` for two transposed-storage packed
+    /// weights; see `q8_gated_matmul_rows_kernel`.
+    fn q8_gated_matmul_rows(
+        &self,
+        a: &CudaDeviceBuffer,
+        gate: &CudaQ8Weight,
+        up: &CudaQ8Weight,
+        m: u64,
+        k: u64,
+        n: u64,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        let mut out_dev = self.alloc_output((m * n) as usize)?;
+        let int8 = self.quantize_activations(a, m, k)?;
+        let int8 = int8.as_ref().and_then(|guard| guard.as_ref());
+        let func = self.function(if int8.is_some() {
+            "q8_gated_matmul_rows_int8_kernel"
+        } else {
+            "q8_gated_matmul_rows_kernel"
+        })?;
+        let mut args = self.stream.launch_builder(&func);
+        match int8 {
+            Some(scratch) => args.arg(&scratch.values).arg(&scratch.scales),
+            None => args.arg(&a.slice),
+        };
+        args.arg(&gate.quants)
+            .arg(&gate.scales)
+            .arg(&up.quants)
+            .arg(&up.scales)
+            .arg(&mut out_dev)
+            .arg(&m)
+            .arg(&k)
+            .arg(&n);
+        let config = LaunchConfig {
+            grid_dim: (
+                n.div_ceil(u64::from(Q8_MATMUL_WARPS)) as u32,
+                m.div_ceil(Q8_MATMUL_ROWS) as u32,
+                1,
+            ),
+            block_dim: (32, Q8_MATMUL_WARPS, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { args.launch(config) }?;
+        Ok(CudaDeviceBuffer {
+            slice: out_dev,
+            shape: vec![m, n],
+            bf16: None,
+            q8: None,
         })
     }
 
@@ -1893,6 +3707,52 @@ impl CudaKernels {
         if let Some(MatmulAddend::Row(addend) | MatmulAddend::Full(addend)) = addend {
             Self::require_f32(&[addend], "a fused matmul's addend")?;
         }
+        if let Some(q8) = &b.q8 {
+            // Read packed: a transposed-storage weight (each output
+            // column's quants contiguous) against a few contiguous rows.
+            if q8.transposed && !transpose_a && !transpose_b && m <= Q8_MATMUL_MAX_ROWS {
+                return match q8.format {
+                    PackedWeightFormat::Q8_0 => self.q8_matmul_rows(a, q8, m, k, n, addend),
+                    PackedWeightFormat::Q4K => self.q4k_matmul_rows(a, q8, m, k, n, addend),
+                    PackedWeightFormat::Q6K => self.q6k_matmul_rows(a, q8, m, k, n, addend),
+                    PackedWeightFormat::Iq2Xxs
+                    | PackedWeightFormat::Iq2Xs
+                    | PackedWeightFormat::Iq2S
+                    | PackedWeightFormat::Iq3Xxs
+                    | PackedWeightFormat::Iq3S => {
+                        match self.iq_matmul_rows(a, q8, m, k, n, addend)? {
+                            Some(out) => Ok(out),
+                            None => {
+                                let dense = self.dequantize_q8(b)?;
+                                self.matmul_with_addend(a, &dense, addend, transpose_a, transpose_b)
+                            }
+                        }
+                    }
+                    PackedWeightFormat::Iq4Nl | PackedWeightFormat::Iq4Xs => {
+                        match self.iq4_matmul_rows(a, q8, m, k, n, addend)? {
+                            Some(out) => Ok(out),
+                            None => {
+                                let dense = self.dequantize_q8(b)?;
+                                self.matmul_with_addend(a, &dense, addend, transpose_a, transpose_b)
+                            }
+                        }
+                    }
+                    PackedWeightFormat::Q2K | PackedWeightFormat::Q3K => {
+                        match self.low_bit_matmul_rows(a, q8, m, k, n, addend)? {
+                            Some(out) => Ok(out),
+                            // No int8 activations: against the f32 weight.
+                            None => {
+                                let dense = self.dequantize_q8(b)?;
+                                self.matmul_with_addend(a, &dense, addend, transpose_a, transpose_b)
+                            }
+                        }
+                    }
+                };
+            }
+            // Otherwise against the f32 weight, for this call only.
+            let dense = self.dequantize_q8(b)?;
+            return self.matmul_with_addend(a, &dense, addend, transpose_a, transpose_b);
+        }
         let b16 = self.bf16_address(b);
         let mut out_dev = self.alloc_output((m * n) as usize)?;
         let (addend_buffer, addend_mode) = match addend {
@@ -1935,6 +3795,7 @@ impl CudaKernels {
                 slice: out_dev,
                 shape: vec![m, n],
                 bf16: None,
+                q8: None,
             });
         }
         if m >= MATMUL_TILE_MIN_ROWS
@@ -1968,6 +3829,7 @@ impl CudaKernels {
                 slice: out_dev,
                 shape: vec![m, n],
                 bf16: None,
+                q8: None,
             });
         }
         if b_col_stride == 1 && m <= MATMUL_SPLIT_K_MAX_ROWS {
@@ -2009,6 +3871,7 @@ impl CudaKernels {
                 slice: out_dev,
                 shape: vec![m, n],
                 bf16: None,
+                q8: None,
             });
         }
         let func = self.function("matmul_kernel")?;
@@ -2029,6 +3892,7 @@ impl CudaKernels {
             slice: out_dev,
             shape: vec![m, n],
             bf16: None,
+            q8: None,
         };
         match addend {
             Some(MatmulAddend::Row(addend) | MatmulAddend::Full(addend)) => {
@@ -2230,6 +4094,7 @@ impl CudaKernels {
                 slice: out_dev,
                 shape: q.shape.clone(),
                 bf16: None,
+                q8: None,
             });
         }
         let tiled = match head_dimension {
@@ -2283,6 +4148,7 @@ impl CudaKernels {
                 slice: out_dev,
                 shape: q.shape.clone(),
                 bf16: None,
+                q8: None,
             });
         }
 
@@ -2338,6 +4204,7 @@ impl CudaKernels {
                 slice: out_dev,
                 shape: q.shape.clone(),
                 bf16: None,
+                q8: None,
             });
         }
         if self.is_capturing() {
@@ -2366,6 +4233,7 @@ impl CudaKernels {
             slice: out_dev,
             shape: q.shape.clone(),
             bf16: None,
+            q8: None,
         })
     }
 }
@@ -2520,6 +4388,7 @@ impl CudaKernels {
             slice: out_dev,
             shape: q.shape.clone(),
             bf16: None,
+            q8: None,
         })
     }
 }

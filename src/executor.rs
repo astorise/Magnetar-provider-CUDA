@@ -40,6 +40,7 @@ use magnetar_runtime::memory::{
 use magnetar_runtime::operator::{
     OperatorAttributeValue, OperatorSpec, RopeBandedFrequencyScaling,
 };
+use magnetar_runtime::packed_weight::{PackedWeight, PackedWeightWrite};
 use magnetar_runtime::provider::{
     ProviderExecutionApi, StepCaptureId, StepCaptureRequest, StepReplayError, TensorValue,
     TensorValueAdmissionError,
@@ -51,7 +52,7 @@ use magnetar_runtime::scheduler::{
 };
 use magnetar_runtime::{ExecutionPlanId, HostTensor};
 
-use crate::error::CudaError;
+use crate::error::{CudaError, CudaErrorCode};
 use crate::kernels::{CapturedStep, CudaDeviceBuffer, CudaHalfDType, CudaKernels, CudaRopePairing};
 
 /// Reads which half-precision format an `add-half`/`mul-half` invocation
@@ -92,6 +93,15 @@ pub struct CudaExecutor {
     next_execution_ordinal: AtomicU64,
     /// Decode-step capture and replay (`capture-and-replay-cuda-graphs`).
     step_capture: Mutex<StepCaptureState>,
+    /// Each tensor-parallel reduction's copy of a peer's partial sum, kept
+    /// so that reducing allocates nothing after the first time.
+    reduce_scratch: Mutex<BTreeMap<TensorResourceId, CudaDeviceBuffer>>,
+    /// Each tensor-parallel reduction's page-locked stage, for GPUs without
+    /// peer access.
+    /// Page-locked stages of reductions without peer access, one per
+    /// tensor and other GPU: a stage is never shared between two GPUs'
+    /// copies, so one GPU's write cannot overtake another's pending read.
+    reduce_stages: Mutex<BTreeMap<(TensorResourceId, DeviceId), crate::kernels::PinnedStage>>,
 }
 
 /// The device address and length (in floats) of a resource's buffer, as a
@@ -114,6 +124,13 @@ struct CaptureRecording {
     /// The token-id inputs of captured embedding lookups, with their table's
     /// vocabulary size: replayed ids are checked on the host.
     embedding_ids: BTreeMap<TensorResourceId, u64>,
+}
+
+/// A GPU's part of a step captured into another GPU's graph
+/// ([`CudaExecutor::join_step_capture`]).
+pub struct JoinedStep {
+    joined: crate::kernels::JoinedCapture,
+    recording: CaptureRecording,
 }
 
 /// One captured step: its graph, and the exact buffers it reads and writes.
@@ -139,6 +156,8 @@ impl CudaExecutor {
             resource_allocations: Mutex::new(BTreeMap::new()),
             next_execution_ordinal: AtomicU64::new(0),
             step_capture: Mutex::new(StepCaptureState::default()),
+            reduce_scratch: Mutex::new(BTreeMap::new()),
+            reduce_stages: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -154,6 +173,21 @@ impl CudaExecutor {
             Some(self.device_binding()),
             detail,
         )
+    }
+
+    /// Captures this executor's steps without restricting the rest of the
+    /// thread, for a caller capturing several GPUs from one thread.
+    pub fn set_concurrent_capture(&self, concurrent: bool) {
+        self.kernels.set_relaxed_capture(concurrent);
+    }
+
+    /// Allocates ahead what [`Self::begin_step_capture`] needs: a caller
+    /// opening several GPUs' captures from one thread prepares every one of
+    /// them before beginning any.
+    pub fn prepare_step_capture(&self) -> Result<(), ProviderExecutionError> {
+        self.kernels.prepare_capture().map_err(|error| {
+            self.step_capture_error(ProviderExecutionPhase::Submit, error.to_string())
+        })
     }
 
     /// See [`ProviderExecutionApi::begin_step_capture`]: the invocations up
@@ -352,6 +386,22 @@ impl CudaExecutor {
         let buffer = self.kernels.upload_weight(&tensor)?;
         self.storage.lock().unwrap().insert(id, buffer);
         Ok(())
+    }
+
+    /// See [`ProviderExecutionApi::write_packed_weight_tensor`]: a `Q8_0`
+    /// weight is stored packed ([`CudaKernels::upload_packed_weight`])
+    /// unless [`crate::kernels::PACKED_WEIGHTS_ENV`] is `0`.
+    pub fn write_packed_weight_tensor(
+        &self,
+        id: TensorResourceId,
+        weight: &PackedWeight,
+    ) -> Result<PackedWeightWrite, CudaError> {
+        if std::env::var(crate::kernels::PACKED_WEIGHTS_ENV).as_deref() == Ok("0") {
+            return Ok(PackedWeightWrite::Declined);
+        }
+        let buffer = self.kernels.upload_packed_weight(weight)?;
+        self.storage.lock().unwrap().insert(id, buffer);
+        Ok(PackedWeightWrite::Stored)
     }
 
     pub fn write_tensor(&self, id: TensorResourceId, tensor: HostTensor) -> Result<(), CudaError> {
@@ -586,6 +636,314 @@ impl CudaExecutor {
         }
         self.storage.lock().unwrap().insert(to, cloned_buffer);
         Ok(allocation.id)
+    }
+
+    /// Waits for every operation queued on this executor's stream: a peer
+    /// reading one of its buffers must not start before it is written.
+    pub fn synchronize(&self) -> Result<(), CudaError> {
+        self.kernels.stream().synchronize()?;
+        Ok(())
+    }
+
+    /// Copies `peer`'s current `id` into this executor's existing `id`
+    /// buffer, in place (its device address unchanged, so a captured step
+    /// reading it stays valid). `false`, copying nothing, when either side
+    /// lacks a plain f32 buffer of the same length. The copy waits on
+    /// `peer`'s stream, and can be captured.
+    pub fn copy_from_peer_in_place(
+        &self,
+        peer: &CudaExecutor,
+        id: &TensorResourceId,
+    ) -> Result<bool, CudaError> {
+        let peer_storage = peer.storage.lock().unwrap();
+        let Some(source) = peer_storage.get(id) else {
+            return Ok(false);
+        };
+        let mut storage = self.storage.lock().unwrap();
+        let Some(destination) = storage.get_mut(id) else {
+            return Ok(false);
+        };
+        if source.is_compact() || destination.is_compact() || source.len() != destination.len() {
+            return Ok(false);
+        }
+        self.kernels
+            .copy_from_peer(&peer.kernels, &source.slice, &mut destination.slice)?;
+        Ok(true)
+    }
+
+    /// Adds `peer`'s `id` into this executor's `id`, in place (its device
+    /// address unchanged): the reduction of a tensor-parallel partial sum.
+    /// Both must be plain f32 buffers of the same shape. `peer`'s partial is
+    /// first copied into a scratch buffer kept per `id`, so after the first
+    /// time nothing allocates and the reduction can be captured. The copy
+    /// waits on `peer`'s stream.
+    pub fn accumulate_from_peer(
+        &self,
+        peer: &CudaExecutor,
+        id: &TensorResourceId,
+    ) -> Result<(), CudaError> {
+        let missing = |side: &str| {
+            CudaError::new(
+                CudaErrorCode::ExecutionFailed,
+                format!("cannot reduce '{id}': the {side} GPU holds no plain f32 buffer for it"),
+            )
+        };
+        let peer_storage = peer.storage.lock().unwrap();
+        let source = peer_storage.get(id).ok_or_else(|| missing("peer"))?;
+        if source.is_compact() {
+            return Err(missing("peer"));
+        }
+        if self.kernels.has_peer_access() {
+            let mut storage = self.storage.lock().unwrap();
+            let destination = storage.get_mut(id).ok_or_else(|| missing("reducing"))?;
+            if destination.is_compact() {
+                return Err(missing("reducing"));
+            }
+            return self
+                .kernels
+                .accumulate_from_peer(destination, &peer.kernels, source);
+        }
+        // Without peer access: `peer` stages its partial in page-locked
+        // host memory, this GPU copies it into a scratch buffer and adds it,
+        // all queued copies a capture records.
+        let mut stages = self.reduce_stages.lock().unwrap();
+        let stage = self.reduce_stage(&mut stages, id, peer.device_id(), source.len())?;
+        peer.kernels.stage_out(&source.slice, stage)?;
+        drop(peer_storage);
+        self.kernels.follow(&peer.kernels)?;
+        let mut storage = self.storage.lock().unwrap();
+        let destination = storage.get_mut(id).ok_or_else(|| missing("reducing"))?;
+        if destination.is_compact() {
+            return Err(missing("reducing"));
+        }
+        let mut scratch = self.reduce_scratch.lock().unwrap();
+        if !scratch
+            .get(id)
+            .is_some_and(|partial| partial.shape == destination.shape && !partial.is_compact())
+        {
+            scratch.insert(id.clone(), self.kernels.clone_buffer(destination)?);
+        }
+        let partial = scratch.get_mut(id).expect("inserted above");
+        self.kernels.stage_in(stage, &mut partial.slice)?;
+        self.kernels.accumulate(destination, partial)
+    }
+
+    /// This GPU's page-locked stage for `id` exchanged with `other`, made
+    /// (or remade at a new size) on first use.
+    fn reduce_stage<'s>(
+        &self,
+        stages: &'s mut BTreeMap<(TensorResourceId, DeviceId), crate::kernels::PinnedStage>,
+        id: &TensorResourceId,
+        other: &DeviceId,
+        len: usize,
+    ) -> Result<&'s crate::kernels::PinnedStage, CudaError> {
+        let key = (id.clone(), other.clone());
+        if !stages.get(&key).is_some_and(|stage| stage.len() == len) {
+            stages.insert(
+                key.clone(),
+                crate::kernels::PinnedStage::new(&self.kernels, len)?,
+            );
+        }
+        Ok(&stages[&key])
+    }
+
+    /// Copies `root`'s reduced `id` into this GPU's `id`, in place: the
+    /// second half of a tensor-parallel reduction. With peer access, read
+    /// directly; without, staged through `root`'s page-locked stage for
+    /// `id`. Either way after `root`'s stream, and capturable.
+    pub fn copy_reduced_from_peer(
+        &self,
+        root: &CudaExecutor,
+        id: &TensorResourceId,
+    ) -> Result<bool, CudaError> {
+        if self.kernels.has_peer_access() {
+            return self.copy_from_peer_in_place(root, id);
+        }
+        let root_storage = root.storage.lock().unwrap();
+        let Some(source) = root_storage.get(id) else {
+            return Ok(false);
+        };
+        let mut storage = self.storage.lock().unwrap();
+        let Some(destination) = storage.get_mut(id) else {
+            return Ok(false);
+        };
+        if source.is_compact() || destination.is_compact() || source.len() != destination.len() {
+            return Ok(false);
+        }
+        // This GPU's own stage on `root`, made here when `root` reduced
+        // over peer access and so staged nothing from it.
+        let mut stages = root.reduce_stages.lock().unwrap();
+        let stage = root.reduce_stage(&mut stages, id, self.device_id(), source.len())?;
+        root.kernels.stage_out(&source.slice, stage)?;
+        self.kernels.follow(&root.kernels)?;
+        self.kernels.stage_in(stage, &mut destination.slice)?;
+        Ok(true)
+    }
+
+    /// Lets this GPU read other GPUs' memory directly in reductions and
+    /// copies (peer access enabled towards every other GPU).
+    pub fn set_peer_access(&self, enabled: bool) {
+        self.kernels.set_peer_access(enabled);
+    }
+
+    /// Joins `host`'s step capture, in progress, until
+    /// [`Self::leave_step_capture`]: this GPU's work then belongs to
+    /// `host`'s graph (a tensor-parallel step captured as one graph).
+    pub fn join_step_capture(
+        &self,
+        host: &CudaExecutor,
+        request: &StepCaptureRequest,
+    ) -> Result<(), ProviderExecutionError> {
+        let mut state = self.step_capture.lock().unwrap();
+        if state.recording.is_some() {
+            return Err(self.step_capture_error(
+                ProviderExecutionPhase::Submit,
+                "a step capture is already in progress".into(),
+            ));
+        }
+        self.kernels
+            .join_capture(
+                &host.kernels,
+                request.advancing_attributes.iter().cloned().collect(),
+            )
+            .map_err(|error| {
+                self.step_capture_error(ProviderExecutionPhase::Submit, error.to_string())
+            })?;
+        state.recording = Some(CaptureRecording::default());
+        Ok(())
+    }
+
+    /// Leaves `host`'s step capture; what replaying this GPU's part needs.
+    pub fn leave_step_capture(
+        &self,
+        host: &CudaExecutor,
+    ) -> Result<JoinedStep, ProviderExecutionError> {
+        let recording = self.step_capture.lock().unwrap().recording.take();
+        let left = self.kernels.leave_capture(&host.kernels);
+        let (Some(recording), Ok(joined)) = (recording, left) else {
+            return Err(self.step_capture_error(
+                ProviderExecutionPhase::Complete,
+                "this GPU's part of the step capture cannot be replayed".into(),
+            ));
+        };
+        Ok(JoinedStep { joined, recording })
+    }
+
+    /// Abandons a joined step capture, rejoining `host`'s stream so that
+    /// `host` can end its capture.
+    pub fn abandon_joined_capture(&self, host: &CudaExecutor) {
+        self.step_capture.lock().unwrap().recording = None;
+        self.kernels.abandon_join(&host.kernels);
+    }
+
+    /// Discards any driver error recorded but not yet reported (after an
+    /// abandoned capture), so the next call starts clean.
+    pub fn clear_deferred_errors(&self) {
+        let _ = self.kernels.take_deferred_error();
+    }
+
+    /// Readies this GPU's part of a replay of `host`'s graph: checks the
+    /// captured buffers are still in place, writes `inputs` and the replay
+    /// `offset`, and makes `host`'s stream wait for those writes.
+    pub fn prepare_joined_replay(
+        &self,
+        step: &mut JoinedStep,
+        offset: u64,
+        inputs: Vec<(TensorResourceId, HostTensor)>,
+        host: &CudaExecutor,
+    ) -> Result<(), StepReplayError> {
+        let invalidated = |reason: String| StepReplayError::Invalidated { reason };
+        // The previous launch of `host`'s graph may still read this GPU's
+        // inputs and offset: overwrite them only after it.
+        self.kernels.follow(&host.kernels).map_err(|error| {
+            StepReplayError::Failed(
+                self.step_capture_error(ProviderExecutionPhase::Submit, error.to_string()),
+            )
+        })?;
+        if offset > step.joined.max_offset {
+            return Err(invalidated(format!(
+                "offset {offset} leaves the captured bounds (at most {})",
+                step.joined.max_offset
+            )));
+        }
+        let mut storage = self.storage.lock().unwrap();
+        for (resource, (address, len)) in &step.recording.resources {
+            let current = storage
+                .get(resource)
+                .map(|buffer| (self.kernels.address(buffer), buffer.len()));
+            if current != Some((*address, *len)) {
+                return Err(invalidated(format!(
+                    "resource '{resource}' no longer has its captured storage"
+                )));
+            }
+        }
+        let failed = |error: CudaError| {
+            StepReplayError::Failed(
+                self.step_capture_error(ProviderExecutionPhase::Submit, error.to_string()),
+            )
+        };
+        for (resource, tensor) in inputs {
+            if !step.recording.resources.contains_key(&resource) {
+                continue;
+            }
+            if let Some(&vocab) = step.recording.embedding_ids.get(&resource)
+                && tensor.data.iter().any(|&value| {
+                    !(value >= 0.0 && value == value.floor() && (value as u64) < vocab)
+                })
+            {
+                return Err(StepReplayError::Failed(self.step_capture_error(
+                    ProviderExecutionPhase::Submit,
+                    "embedding lookup id is not a valid in-range non-negative integer".into(),
+                )));
+            }
+            let buffer = storage
+                .get_mut(&resource)
+                .expect("every captured resource was checked above");
+            self.kernels
+                .write_into(buffer, &tensor.data)
+                .map_err(failed)?;
+        }
+        drop(storage);
+        self.kernels
+            .write_joined_offset(&mut step.joined, offset, &host.kernels)
+            .map_err(failed)
+    }
+
+    /// After `host` ran a graph this GPU joined for the first time, checks
+    /// its embedding lookups' invalid-id flag.
+    pub fn check_joined_embedding(
+        &self,
+        step: &JoinedStep,
+        host: &CudaExecutor,
+    ) -> Result<(), ProviderExecutionError> {
+        if !step.joined.has_embedding {
+            return Ok(());
+        }
+        let failed = |error: CudaError| {
+            self.step_capture_error(ProviderExecutionPhase::Complete, error.to_string())
+        };
+        self.kernels.follow(&host.kernels).map_err(failed)?;
+        self.kernels.check_embedding_flag().map_err(failed)
+    }
+
+    /// Makes this executor's stream wait, on the device, for everything
+    /// queued on `peer`'s stream so far, without blocking the host.
+    pub fn wait_for_peer(&self, peer: &CudaExecutor) -> Result<(), CudaError> {
+        self.kernels.stream().join(peer.kernels.stream())?;
+        Ok(())
+    }
+
+    /// This executor's stream capture status, for diagnostics.
+    pub fn capture_status(&self) -> String {
+        match self.kernels.stream().capture_status() {
+            Ok(status) => format!("{status:?}"),
+            Err(error) => format!("unknown ({error:?})"),
+        }
+    }
+
+    /// This executor's Device.
+    pub fn device_id(&self) -> &DeviceId {
+        &self.device_id
     }
 
     /// Copies `peer_id`'s current device allocation from `peer`'s own
@@ -871,6 +1229,7 @@ impl CudaExecutor {
                     slice,
                     shape,
                     bf16: None,
+                    q8: None,
                 },
             );
         }
@@ -888,6 +1247,9 @@ impl CudaExecutor {
         let reads_compact = |index: usize| match invocation.kernel.name.as_str() {
             "matmul" | "matmul-bias" | "matmul-residual" => index == 1,
             "gated-matmul" => index == 1 || index == 2,
+            // The stacked expert weights: packed experts are read packed,
+            // other compact ones expanded per call.
+            "moe-experts" => index >= 2,
             "embedding" => index == 0,
             _ => false,
         };
@@ -897,10 +1259,14 @@ impl CudaExecutor {
             if reads_compact(index) || !storage.get(id).is_some_and(CudaDeviceBuffer::is_compact) {
                 continue;
             }
-            let expanded = self
-                .kernels
-                .expand(&storage[id])
-                .map_err(KernelError::from)?;
+            let expanded = self.kernels.expand(&storage[id]).map_err(|error| {
+                KernelError::KernelExecutionFailed {
+                    reason: format!(
+                        "expanding compact input {index} of {}: {error}",
+                        invocation.kernel.name
+                    ),
+                }
+            })?;
             storage.insert(id.clone(), expanded);
         }
         Ok(())
@@ -1194,6 +1560,55 @@ impl CudaExecutor {
                         .map_err(KernelError::from)?
                 }
                 "silu" => self.kernels.silu(get(0)?).map_err(KernelError::from)?,
+                "activation" => match invocation.attributes.get("kind") {
+                    Some(OperatorAttributeValue::String(kind)) if kind == "sigmoid" => {
+                        self.kernels.sigmoid(get(0)?).map_err(KernelError::from)?
+                    }
+                    Some(OperatorAttributeValue::String(kind)) if kind == "silu" => {
+                        self.kernels.silu(get(0)?).map_err(KernelError::from)?
+                    }
+                    other => {
+                        return Err(KernelError::KernelAttributeUnsupported {
+                            attribute: format!("activation kind {other:?} is not implemented"),
+                        });
+                    }
+                },
+                "row-scale" => self
+                    .kernels
+                    .row_scale(get(0)?, get(1)?)
+                    .map_err(KernelError::from)?,
+                // `execute-and-cache-moe-experts` F02.
+                "moe-experts" => {
+                    let integer = |name: &str| {
+                        Self::attribute_integer(&invocation.attributes, name)
+                            .filter(|value| *value > 0)
+                            .ok_or_else(|| KernelError::KernelAttributeUnsupported {
+                                attribute: name.into(),
+                            })
+                    };
+                    let routing = magnetar_runtime::reference_cpu::MoeRouting {
+                        experts: integer("experts")?,
+                        top_k: integer("top_k")?,
+                        normalize: Self::attribute_bool(
+                            &invocation.attributes,
+                            "normalize_top_k",
+                            false,
+                        ),
+                    };
+                    let local = magnetar_runtime::reference_cpu::moe_local_experts(
+                        &invocation.attributes,
+                        routing.experts,
+                    );
+                    self.kernels
+                        .moe_experts(
+                            get(0)?,
+                            get(1)?,
+                            [get(2)?, get(3)?, get(4)?],
+                            routing,
+                            local,
+                        )
+                        .map_err(KernelError::from)?
+                }
                 "add" => {
                     let a = get(0)?;
                     let b = get(1)?;
@@ -1597,6 +2012,22 @@ impl ProviderExecutionApi for CudaExecutor {
                 self.provider_binding(),
                 Some(self.device_binding()),
                 format!("CUDA device upload failed: {error}"),
+            )
+        })
+    }
+
+    fn write_packed_weight_tensor(
+        &self,
+        id: TensorResourceId,
+        weight: PackedWeight,
+    ) -> Result<PackedWeightWrite, ProviderExecutionError> {
+        CudaExecutor::write_packed_weight_tensor(self, id, &weight).map_err(|error| {
+            ProviderExecutionError::new(
+                ProviderExecutionErrorCode::MaterializationFailed,
+                ProviderExecutionPhase::Submit,
+                self.provider_binding(),
+                Some(self.device_binding()),
+                format!("CUDA packed weight upload failed: {error}"),
             )
         })
     }

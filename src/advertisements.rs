@@ -143,6 +143,24 @@ pub fn cuda_kernel_advertisements(
             provider_name,
         ),
         baseline_advertisement(
+            "moe-experts",
+            OperatorFamily::LinearAlgebra,
+            device_id,
+            provider_name,
+        ),
+        baseline_advertisement(
+            "row-scale",
+            OperatorFamily::Tensor,
+            device_id,
+            provider_name,
+        ),
+        baseline_advertisement(
+            "activation",
+            OperatorFamily::Activation,
+            device_id,
+            provider_name,
+        ),
+        baseline_advertisement(
             "embedding",
             OperatorFamily::Tensor,
             device_id,

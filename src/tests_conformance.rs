@@ -14,6 +14,7 @@
 //! `CudaExecutor` itself uses, not an implicit per-kernel round trip.
 
 use magnetar_runtime::HostTensor;
+use magnetar_runtime::packed_weight::{PackedWeight, PackedWeightFormat};
 
 use crate::half_precision;
 use crate::kernels::{CudaDeviceBuffer, CudaHalfDType, CudaKernels};
@@ -24,9 +25,13 @@ const TOLERANCE: f32 = 1e-3;
 fn kernels_or_skip() -> Option<CudaKernels> {
     let provider = CudaProvider::new();
     let context = provider.context()?;
-    Some(CudaKernels::compile_and_load(&context).expect(
+    let kernels = CudaKernels::compile_and_load(&context).expect(
         "kernel compilation must succeed on a machine that already passed device discovery",
-    ))
+    );
+    // The f32-activation Kernels, which these tests compare with the
+    // Reference CPU tightly; the int8-activation test turns them on.
+    kernels.set_int8_activations(false);
+    Some(kernels)
 }
 
 fn upload(kernels: &CudaKernels, tensor: &HostTensor) -> CudaDeviceBuffer {
@@ -1779,4 +1784,1259 @@ fn decode_matmul_bandwidth() {
             gb(k * n * 2, bf16_ms),
         );
     }
+}
+
+/// The Device time of a mixture-of-experts decode step's Kernels at
+/// Qwen1.5-MoE-A2.7B's shapes (hidden 2048, 60 experts of 1408, top 4, a
+/// 5632 shared expert, 2048-wide attention projections, a 151936-token
+/// output head), packed `Q8_0`, one token: each Kernel's time and the
+/// bandwidth of the weight bytes it must read. Also the routed experts
+/// split in two (30 held), as each GPU runs them under tensor parallelism.
+#[test]
+#[ignore = "GPU timing diagnostic"]
+fn moe_decode_kernel_times() {
+    use magnetar_runtime::reference_cpu::MoeRouting;
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let context = kernels.stream().context().clone();
+    let timing = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
+    let repeats = 100;
+    let time = |run: &dyn Fn()| -> f32 {
+        run();
+        let start = context.new_event(timing).unwrap();
+        let end = context.new_event(timing).unwrap();
+        start.record(kernels.stream()).unwrap();
+        for _ in 0..repeats {
+            run();
+        }
+        end.record(kernels.stream()).unwrap();
+        start.elapsed_ms(&end).unwrap() / repeats as f32
+    };
+    let q8_bytes = |elements: u64| elements / 32 * 34;
+    let report = |what: &str, ms: f32, bytes: u64| {
+        eprintln!(
+            "{what}: {:.1} us ({:.0} GB/s over {:.1} MB)",
+            ms * 1e3,
+            bytes as f32 / ms / 1e6,
+            bytes as f32 / 1e6
+        );
+    };
+    let (hidden, inter, experts, top_k) = (2048_u64, 1408_u64, 60_u64, 4_u64);
+    let h = upload(&kernels, &activations(1, hidden, 61));
+    let logits = upload(&kernels, &activations(1, experts, 62));
+    let routing = MoeRouting {
+        experts,
+        top_k,
+        normalize: false,
+    };
+    for held in [experts, experts / 2] {
+        let gate = kernels
+            .upload_packed_weight(&packed_q8(held * inter, hidden, true, 63))
+            .unwrap();
+        let up = kernels
+            .upload_packed_weight(&packed_q8(held * inter, hidden, true, 64))
+            .unwrap();
+        let down = kernels
+            .upload_packed_weight(&packed_q8(held * hidden, inter, true, 65))
+            .unwrap();
+        let ms = time(&|| {
+            kernels
+                .moe_experts(&h, &logits, [&gate, &up, &down], routing, (0, held))
+                .unwrap();
+        });
+        // At most top_k experts' three matrices are read.
+        let routed = top_k.min(held);
+        report(
+            &format!("moe-experts, {held} of {experts} experts held"),
+            ms,
+            routed * 3 * q8_bytes(hidden * inter),
+        );
+    }
+    for (what, k, n) in [
+        (
+            "attention projection [1, 2048] x [2048, 2048]",
+            hidden,
+            hidden,
+        ),
+        ("shared expert up [1, 2048] x [2048, 5632]", hidden, 5632),
+        ("shared expert down [1, 5632] x [5632, 2048]", 5632, hidden),
+        ("router [1, 2048] x [2048, 60]", hidden, experts),
+        ("output head [1, 2048] x [2048, 151936]", hidden, 151_936),
+        ("Mistral 7B q/o [1, 4096] x [4096, 4096]", 4096, 4096),
+        ("Mistral 7B k/v [1, 4096] x [4096, 1024]", 4096, 1024),
+        ("Mistral 7B gate/up [1, 4096] x [4096, 14336]", 4096, 14_336),
+        ("Mistral 7B down [1, 14336] x [14336, 4096]", 14_336, 4096),
+    ] {
+        let a = upload(&kernels, &activations(1, k, 66));
+        let b = kernels
+            .upload_packed_weight(&packed_q8(n, k, true, 67))
+            .unwrap();
+        let ms = time(&|| {
+            kernels.matmul(&a, &b, false, false).unwrap();
+        });
+        report(what, ms, q8_bytes(k * n));
+    }
+    // The same projections packed `Q4_K` (144 bytes per 256 values).
+    for (what, k, n) in [
+        (
+            "Q4_K attention projection [1, 2048] x [2048, 2048]",
+            hidden,
+            hidden,
+        ),
+        ("Q4_K Mistral 7B q/o [1, 4096] x [4096, 4096]", 4096, 4096),
+        (
+            "Q4_K Mistral 7B gate/up [1, 4096] x [4096, 14336]",
+            4096,
+            14_336,
+        ),
+        (
+            "Q4_K Mistral 7B down [1, 14336] x [14336, 4096]",
+            14_336,
+            4096,
+        ),
+        (
+            "Q4_K output head [1, 2048] x [2048, 151936]",
+            hidden,
+            151_936,
+        ),
+    ] {
+        let a = upload(&kernels, &activations(1, k, 68));
+        let b = kernels
+            .upload_packed_weight(&packed_q4k(n, k, true, 69))
+            .unwrap();
+        let ms = time(&|| {
+            kernels.matmul(&a, &b, false, false).unwrap();
+        });
+        report(what, ms, k * n / 256 * 144);
+    }
+    // `Q6_K` (210 bytes per 256 values): `Q4_K_M`'s output head, `attn_v`
+    // and half of its `ffn_down`.
+    for (what, k, n) in [
+        ("Q6_K Mistral 7B v [1, 4096] x [4096, 1024]", 4096, 1024),
+        (
+            "Q6_K Mistral 7B down [1, 14336] x [14336, 4096]",
+            14_336,
+            4096,
+        ),
+        (
+            "Q6_K Mistral 7B output head [1, 4096] x [4096, 32768]",
+            4096,
+            32_768,
+        ),
+    ] {
+        let a = upload(&kernels, &activations(1, k, 70));
+        let b = kernels
+            .upload_packed_weight(&packed_q6k(n, k, true, 71))
+            .unwrap();
+        let ms = time(&|| {
+            kernels.matmul(&a, &b, false, false).unwrap();
+        });
+        report(what, ms, k * n / 256 * 210);
+    }
+    // The Mistral shapes again with int8 activations (`__dp4a`).
+    kernels.set_int8_activations(true);
+    for (format, k, n) in [
+        ("Q8_0", 4096, 4096),
+        ("Q8_0", 4096, 14_336),
+        ("Q8_0", 14_336, 4096),
+        ("Q4_K", 4096, 4096),
+        ("Q4_K", 4096, 14_336),
+        ("Q4_K", 14_336, 4096),
+        ("Q6_K", 4096, 1024),
+        ("Q6_K", 14_336, 4096),
+        ("Q6_K", 4096, 32_768),
+        ("Q3_K", 4096, 4096),
+        ("Q3_K", 4096, 14_336),
+        ("Q3_K", 14_336, 4096),
+        ("Q2_K", 4096, 4096),
+        ("Q2_K", 4096, 14_336),
+        ("Q2_K", 14_336, 4096),
+        ("IQ4_XS", 4096, 4096),
+        ("IQ4_XS", 4096, 14_336),
+        ("IQ4_XS", 14_336, 4096),
+        ("IQ4_NL", 4096, 14_336),
+        ("IQ3_XXS", 4096, 14_336),
+        ("IQ3_S", 4096, 14_336),
+        ("IQ2_XXS", 4096, 14_336),
+        ("IQ2_XS", 4096, 14_336),
+        ("IQ2_S", 4096, 14_336),
+    ] {
+        let a = upload(&kernels, &activations(1, k, 72));
+        let (packed, bytes) = match format {
+            "Q8_0" => (packed_q8(n, k, true, 73), q8_bytes(k * n)),
+            "Q4_K" => (packed_q4k(n, k, true, 73), k * n / 256 * 144),
+            "Q6_K" => (packed_q6k(n, k, true, 73), k * n / 256 * 210),
+            "Q3_K" => (
+                packed_low_bit(PackedWeightFormat::Q3K, n, k, 73),
+                k * n / 256 * 110,
+            ),
+            "Q2_K" => (
+                packed_low_bit(PackedWeightFormat::Q2K, n, k, 73),
+                k * n / 256 * 84,
+            ),
+            "IQ4_XS" => (
+                packed_iq4(PackedWeightFormat::Iq4Xs, n, k, 73),
+                k * n / 256 * 136,
+            ),
+            "IQ3_XXS" | "IQ3_S" | "IQ2_XXS" | "IQ2_XS" | "IQ2_S" => {
+                let format = match format {
+                    "IQ3_XXS" => PackedWeightFormat::Iq3Xxs,
+                    "IQ3_S" => PackedWeightFormat::Iq3S,
+                    "IQ2_XXS" => PackedWeightFormat::Iq2Xxs,
+                    "IQ2_XS" => PackedWeightFormat::Iq2Xs,
+                    _ => PackedWeightFormat::Iq2S,
+                };
+                (
+                    packed_iq4(format, n, k, 73),
+                    k * n / 256 * format.block_bytes(),
+                )
+            }
+            _ => (
+                packed_iq4(PackedWeightFormat::Iq4Nl, n, k, 73),
+                k * n / 32 * 18,
+            ),
+        };
+        let b = kernels.upload_packed_weight(&packed).unwrap();
+        let ms = time(&|| {
+            kernels.matmul(&a, &b, false, false).unwrap();
+        });
+        report(&format!("int8 {format} [1, {k}] x [{k}, {n}]"), ms, bytes);
+    }
+    kernels.set_int8_activations(false);
+}
+
+/// A deterministic packed `Q8_0` matrix of `stored_rows` x `stored_cols`
+/// (`execute-direct-quantized-weights`), with varied scales and quants
+/// covering the full signed 8-bit range.
+fn packed_q8(stored_rows: u64, stored_cols: u64, transposed: bool, seed: u32) -> PackedWeight {
+    let blocks = stored_rows * stored_cols / 32;
+    let mut bytes = Vec::with_capacity(blocks as usize * 34);
+    let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state
+    };
+    for _ in 0..blocks {
+        // f16 scales between about 2^-9 and 2^-5.
+        let exponent = 6 + (next() % 5) as u16;
+        let d_bits = (exponent << 10) | (next() % 1024) as u16;
+        bytes.extend(d_bits.to_le_bytes());
+        bytes.extend(
+            (0..32)
+                .map(|_| (next() % 255) as i32 - 127)
+                .map(|q| q as i8 as u8),
+        );
+    }
+    PackedWeight::new(
+        PackedWeightFormat::Q8_0,
+        stored_rows,
+        stored_cols,
+        transposed,
+        bytes,
+    )
+    .unwrap()
+}
+
+fn activations(rows: u64, cols: u64, seed: u32) -> HostTensor {
+    let data = (0..rows * cols)
+        .map(|i| {
+            (((i as u32).wrapping_mul(2_246_822_519).wrapping_add(seed) % 2001) as f32 - 1000.0)
+                / 1000.0
+        })
+        .collect::<Vec<_>>();
+    HostTensor::new([rows, cols], data).unwrap()
+}
+
+/// `actual` against `expected` with a tolerance scaled to the products'
+/// magnitude: the packed kernels sum in another order than the Reference.
+fn assert_close_scaled(actual: &HostTensor, expected: &HostTensor, scale: f32) {
+    assert_eq!(actual.shape, expected.shape);
+    for (index, (a, e)) in actual.data.iter().zip(&expected.data).enumerate() {
+        assert!(
+            (a - e).abs() <= 1e-5 + 1e-5 * scale,
+            "index {index}: {a} vs {e}"
+        );
+    }
+}
+
+/// The packed `Q8_0` matmul (decode rows read packed, longer ones
+/// dequantized for the call) matches the Reference CPU matmul of the
+/// dequantized weight, with and without a bias or residual addend, and
+/// download/expand give back exactly the dequantized weight.
+#[test]
+fn q8_packed_matmul_matches_reference_cpu() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let (k, n) = (256_u64, 96_u64);
+    // Stored as n rows of k quants: the graph sees [k, n].
+    let packed = packed_q8(n, k, true, 7);
+    let dense = packed.dequantize();
+    let weight = kernels.upload_packed_weight(&packed).unwrap();
+    assert!(weight.is_q8() && weight.is_compact());
+    assert_eq!(weight.shape, vec![k, n]);
+    assert_eq!(download(&kernels, &weight).data, dense.data);
+    assert_eq!(
+        download(&kernels, &kernels.expand(&weight).unwrap()).data,
+        dense.data
+    );
+
+    let bias = HostTensor::new([n], (0..n).map(|i| i as f32 * 0.01).collect::<Vec<_>>()).unwrap();
+    for m in [1_u64, 3, 8, 64, 65] {
+        let a = activations(m, k, m as u32);
+        let expected = magnetar_provider_cpu::matmul(&a, &dense, false, false).unwrap();
+        let a_dev = upload(&kernels, &a);
+        let actual = download(
+            &kernels,
+            &kernels.matmul(&a_dev, &weight, false, false).unwrap(),
+        );
+        assert_close_scaled(&actual, &expected, k as f32);
+
+        let with_bias = kernels
+            .matmul_bias(&a_dev, &weight, &upload(&kernels, &bias), false, false)
+            .unwrap();
+        let expected_bias = magnetar_provider_cpu::add(&expected, &bias).unwrap();
+        assert_close_scaled(&download(&kernels, &with_bias), &expected_bias, k as f32);
+
+        let residual = activations(m, n, 99);
+        let with_residual = kernels
+            .matmul_residual(&a_dev, &weight, &upload(&kernels, &residual), false, false)
+            .unwrap();
+        let expected_residual = magnetar_provider_cpu::add(&expected, &residual).unwrap();
+        assert_close_scaled(
+            &download(&kernels, &with_residual),
+            &expected_residual,
+            k as f32,
+        );
+    }
+}
+
+/// A deterministic packed `Q4_K` matrix of `stored_rows` x `stored_cols`
+/// super-blocks: small positive `d`/`dmin`, every 6-bit scale and min, and
+/// every nibble, exercised.
+fn packed_q4k(stored_rows: u64, stored_cols: u64, transposed: bool, seed: u32) -> PackedWeight {
+    let blocks = stored_rows * stored_cols / 256;
+    let mut bytes = Vec::with_capacity(blocks as usize * 144);
+    let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state
+    };
+    for _ in 0..blocks {
+        for _ in 0..2 {
+            // f16 between about 2^-10 and 2^-6.
+            let exponent = 5 + (next() % 5) as u16;
+            let bits = (exponent << 10) | (next() % 1024) as u16;
+            bytes.extend(bits.to_le_bytes());
+        }
+        bytes.extend((0..12).map(|_| (next() % 256) as u8));
+        bytes.extend((0..128).map(|_| (next() % 256) as u8));
+    }
+    PackedWeight::new(
+        PackedWeightFormat::Q4K,
+        stored_rows,
+        stored_cols,
+        transposed,
+        bytes,
+    )
+    .unwrap()
+}
+
+/// The packed `Q4_K` weight: downloading or expanding it gives back exactly
+/// the Runtime's dequantization, and its decode matmul (rows read packed,
+/// longer ones dequantized for the call), with and without a bias or
+/// residual addend, and a gated matmul over two of them, match the
+/// Reference CPU on the dequantized weights.
+#[test]
+fn q4k_packed_matmul_matches_reference_cpu() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let (k, n) = (1024_u64, 97_u64); // odd: a warp with one column left
+    let packed = packed_q4k(n, k, true, 21);
+    let dense = packed.dequantize();
+    let weight = kernels.upload_packed_weight(&packed).unwrap();
+    assert!(weight.is_q8() && weight.is_compact());
+    assert_eq!(weight.shape, vec![k, n]);
+    assert_eq!(weight.len(), (k * n) as usize);
+    assert_eq!(download(&kernels, &weight).data, dense.data);
+    assert_eq!(
+        download(&kernels, &kernels.expand(&weight).unwrap()).data,
+        dense.data
+    );
+    let bias = HostTensor::new([n], (0..n).map(|i| i as f32 * 0.01).collect::<Vec<_>>()).unwrap();
+    for m in [1_u64, 3, 8, 9, 65] {
+        let a = activations(m, k, m as u32 + 40);
+        let expected = magnetar_provider_cpu::matmul(&a, &dense, false, false).unwrap();
+        let a_dev = upload(&kernels, &a);
+        let actual = download(
+            &kernels,
+            &kernels.matmul(&a_dev, &weight, false, false).unwrap(),
+        );
+        assert_close_relative(&actual, &expected);
+        let with_bias = kernels
+            .matmul_bias(&a_dev, &weight, &upload(&kernels, &bias), false, false)
+            .unwrap();
+        let expected_bias = magnetar_provider_cpu::add(&expected, &bias).unwrap();
+        assert_close_relative(&download(&kernels, &with_bias), &expected_bias);
+        let residual = activations(m, n, 98);
+        let with_residual = kernels
+            .matmul_residual(&a_dev, &weight, &upload(&kernels, &residual), false, false)
+            .unwrap();
+        let expected_residual = magnetar_provider_cpu::add(&expected, &residual).unwrap();
+        assert_close_relative(&download(&kernels, &with_residual), &expected_residual);
+    }
+    let up = packed_q4k(n, k, true, 22);
+    let up_dense = up.dequantize();
+    let up_weight = kernels.upload_packed_weight(&up).unwrap();
+    for m in [1_u64, 5] {
+        let a = activations(m, k, 7);
+        let expected = magnetar_provider_cpu::mul(
+            &magnetar_provider_cpu::silu(
+                &magnetar_provider_cpu::matmul(&a, &dense, false, false).unwrap(),
+            ),
+            &magnetar_provider_cpu::matmul(&a, &up_dense, false, false).unwrap(),
+        )
+        .unwrap();
+        let actual = kernels
+            .gated_matmul(&upload(&kernels, &a), &weight, &up_weight, false, false)
+            .unwrap();
+        assert_close_relative(&download(&kernels, &actual), &expected);
+    }
+}
+
+/// A deterministic packed `Q6_K` matrix of `stored_rows` x `stored_cols`
+/// super-blocks: small positive `d`, signed sub-block scales, and every
+/// 6-bit quant exercised.
+fn packed_q6k(stored_rows: u64, stored_cols: u64, transposed: bool, seed: u32) -> PackedWeight {
+    let blocks = stored_rows * stored_cols / 256;
+    let mut bytes = Vec::with_capacity(blocks as usize * 210);
+    let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state
+    };
+    for _ in 0..blocks {
+        bytes.extend((0..192).map(|_| (next() % 256) as u8));
+        bytes.extend((0..16).map(|_| (next() % 256) as u8));
+        // f16 between about 2^-12 and 2^-8.
+        let exponent = 3 + (next() % 5) as u16;
+        let bits = (exponent << 10) | (next() % 1024) as u16;
+        bytes.extend(bits.to_le_bytes());
+    }
+    PackedWeight::new(
+        PackedWeightFormat::Q6K,
+        stored_rows,
+        stored_cols,
+        transposed,
+        bytes,
+    )
+    .unwrap()
+}
+
+/// The packed `Q6_K` weight: downloading or expanding it gives back exactly
+/// the Runtime's dequantization, and its decode matmul (rows read packed,
+/// longer ones dequantized for the call), with and without a bias or
+/// residual addend, matches the Reference CPU on the dequantized weight.
+#[test]
+fn q6k_packed_matmul_matches_reference_cpu() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let (k, n) = (1024_u64, 97_u64); // odd: a warp with one column left
+    let packed = packed_q6k(n, k, true, 31);
+    let dense = packed.dequantize();
+    let weight = kernels.upload_packed_weight(&packed).unwrap();
+    assert!(weight.is_q8() && weight.is_compact());
+    assert_eq!(weight.shape, vec![k, n]);
+    assert_eq!(download(&kernels, &weight).data, dense.data);
+    assert_eq!(
+        download(&kernels, &kernels.expand(&weight).unwrap()).data,
+        dense.data
+    );
+    let bias = HostTensor::new([n], (0..n).map(|i| i as f32 * 0.01).collect::<Vec<_>>()).unwrap();
+    for m in [1_u64, 3, 8, 9, 65] {
+        let a = activations(m, k, m as u32 + 50);
+        let expected = magnetar_provider_cpu::matmul(&a, &dense, false, false).unwrap();
+        let a_dev = upload(&kernels, &a);
+        let actual = download(
+            &kernels,
+            &kernels.matmul(&a_dev, &weight, false, false).unwrap(),
+        );
+        assert_close_relative(&actual, &expected);
+        let with_bias = kernels
+            .matmul_bias(&a_dev, &weight, &upload(&kernels, &bias), false, false)
+            .unwrap();
+        let expected_bias = magnetar_provider_cpu::add(&expected, &bias).unwrap();
+        assert_close_relative(&download(&kernels, &with_bias), &expected_bias);
+        let residual = activations(m, n, 97);
+        let with_residual = kernels
+            .matmul_residual(&a_dev, &weight, &upload(&kernels, &residual), false, false)
+            .unwrap();
+        let expected_residual = magnetar_provider_cpu::add(&expected, &residual).unwrap();
+        assert_close_relative(&download(&kernels, &with_residual), &expected_residual);
+    }
+}
+
+/// A deterministic packed `Q2_K` or `Q3_K` matrix of `stored_rows` x
+/// `stored_cols` super-blocks: random quants, masks and scales, small
+/// positive f16 `d` (and `dmin`).
+fn packed_low_bit(
+    format: PackedWeightFormat,
+    stored_rows: u64,
+    stored_cols: u64,
+    seed: u32,
+) -> PackedWeight {
+    let blocks = stored_rows * stored_cols / 256;
+    let block_bytes = format.block_bytes() as usize;
+    let halves = if format == PackedWeightFormat::Q2K {
+        2
+    } else {
+        1
+    };
+    let mut bytes = Vec::with_capacity(blocks as usize * block_bytes);
+    let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state
+    };
+    for _ in 0..blocks {
+        bytes.extend((0..block_bytes - 2 * halves).map(|_| (next() % 256) as u8));
+        for _ in 0..halves {
+            // f16 between about 2^-10 and 2^-6.
+            let exponent = 5 + (next() % 5) as u16;
+            let bits = (exponent << 10) | (next() % 1024) as u16;
+            bytes.extend(bits.to_le_bytes());
+        }
+    }
+    PackedWeight::new(format, stored_rows, stored_cols, true, bytes).unwrap()
+}
+
+/// A deterministic packed i-quant matrix (`IQ4_NL`, `IQ4_XS` or an
+/// IQ2/IQ3 format): a small positive f16 `d` first in every block, random
+/// scales, signs and indices after it.
+fn packed_iq4(
+    format: PackedWeightFormat,
+    stored_rows: u64,
+    stored_cols: u64,
+    seed: u32,
+) -> PackedWeight {
+    let block_elements = format.block_elements();
+    let blocks = stored_rows * stored_cols / block_elements;
+    let block_bytes = format.block_bytes() as usize;
+    let mut bytes = Vec::with_capacity(blocks as usize * block_bytes);
+    let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state
+    };
+    for _ in 0..blocks {
+        // f16 between about 2^-12 and 2^-8.
+        let exponent = 3 + (next() % 5) as u16;
+        let bits = (exponent << 10) | (next() % 1024) as u16;
+        bytes.extend(bits.to_le_bytes());
+        bytes.extend((0..block_bytes - 2).map(|_| (next() % 256) as u8));
+    }
+    PackedWeight::new(format, stored_rows, stored_cols, true, bytes).unwrap()
+}
+
+/// Packed i-quant weights (`IQ4_NL`, `IQ4_XS` and the IQ2/IQ3 formats):
+/// downloading or expanding gives
+/// back exactly the Runtime's dequantization; with int8 activations their
+/// decode matmul (with a residual addend) and gated matmul match the
+/// Reference CPU on the rounded activations; without, and for longer
+/// matmuls, they match it on the f32 activations.
+#[test]
+fn iq_packed_matmuls_match_reference_cpu() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let (k, n) = (1024_u64, 97_u64);
+    for format in [
+        PackedWeightFormat::Iq4Nl,
+        PackedWeightFormat::Iq4Xs,
+        PackedWeightFormat::Iq2Xxs,
+        PackedWeightFormat::Iq2Xs,
+        PackedWeightFormat::Iq2S,
+        PackedWeightFormat::Iq3Xxs,
+        PackedWeightFormat::Iq3S,
+    ] {
+        let packed = packed_iq4(format, n, k, 61);
+        let up = packed_iq4(format, n, k, 62);
+        let dense = packed.dequantize();
+        let weight = kernels.upload_packed_weight(&packed).unwrap();
+        let up_weight = kernels.upload_packed_weight(&up).unwrap();
+        assert_eq!(weight.shape, vec![k, n]);
+        assert_eq!(download(&kernels, &weight).data, dense.data, "{format:?}");
+        assert_eq!(
+            download(&kernels, &kernels.expand(&weight).unwrap()).data,
+            dense.data
+        );
+        for int8 in [true, false] {
+            kernels.set_int8_activations(int8);
+            for m in [1_u64, 3, 9, 65] {
+                let a = activations(m, k, m as u32 + 90);
+                let seen = if int8 && m <= 64 {
+                    int8_rounded(&a)
+                } else {
+                    a.clone()
+                };
+                let a_dev = upload(&kernels, &a);
+                let residual = activations(m, n, 91);
+                let expected = magnetar_provider_cpu::add(
+                    &magnetar_provider_cpu::matmul(&seen, &dense, false, false).unwrap(),
+                    &residual,
+                )
+                .unwrap();
+                let actual = kernels
+                    .matmul_residual(&a_dev, &weight, &upload(&kernels, &residual), false, false)
+                    .unwrap();
+                assert_close_relative(&download(&kernels, &actual), &expected);
+                let expected = magnetar_provider_cpu::mul(
+                    &magnetar_provider_cpu::silu(
+                        &magnetar_provider_cpu::matmul(&seen, &dense, false, false).unwrap(),
+                    ),
+                    &magnetar_provider_cpu::matmul(&seen, &up.dequantize(), false, false).unwrap(),
+                )
+                .unwrap();
+                let actual = kernels
+                    .gated_matmul(&a_dev, &weight, &up_weight, false, false)
+                    .unwrap();
+                assert_close_relative(&download(&kernels, &actual), &expected);
+            }
+        }
+    }
+    kernels.set_int8_activations(false);
+}
+
+/// Packed `Q2_K` and `Q3_K` weights: downloading or expanding gives back
+/// exactly the Runtime's dequantization; with int8 activations their
+/// decode matmul (with a residual addend) and gated matmul match the
+/// Reference CPU on the rounded activations; without, and for longer
+/// matmuls, they match it on the f32 activations.
+#[test]
+fn low_bit_packed_matmuls_match_reference_cpu() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let (k, n) = (1024_u64, 97_u64);
+    for format in [PackedWeightFormat::Q2K, PackedWeightFormat::Q3K] {
+        let packed = packed_low_bit(format, n, k, 51);
+        let up = packed_low_bit(format, n, k, 52);
+        let dense = packed.dequantize();
+        let weight = kernels.upload_packed_weight(&packed).unwrap();
+        let up_weight = kernels.upload_packed_weight(&up).unwrap();
+        assert_eq!(weight.shape, vec![k, n]);
+        assert_eq!(download(&kernels, &weight).data, dense.data, "{format:?}");
+        assert_eq!(
+            download(&kernels, &kernels.expand(&weight).unwrap()).data,
+            dense.data
+        );
+        for int8 in [true, false] {
+            kernels.set_int8_activations(int8);
+            for m in [1_u64, 3, 9, 65] {
+                let a = activations(m, k, m as u32 + 80);
+                let seen = if int8 && m <= 64 {
+                    int8_rounded(&a)
+                } else {
+                    a.clone()
+                };
+                let a_dev = upload(&kernels, &a);
+                let residual = activations(m, n, 81);
+                let expected = magnetar_provider_cpu::add(
+                    &magnetar_provider_cpu::matmul(&seen, &dense, false, false).unwrap(),
+                    &residual,
+                )
+                .unwrap();
+                let actual = kernels
+                    .matmul_residual(&a_dev, &weight, &upload(&kernels, &residual), false, false)
+                    .unwrap();
+                assert_close_relative(&download(&kernels, &actual), &expected);
+                let expected = magnetar_provider_cpu::mul(
+                    &magnetar_provider_cpu::silu(
+                        &magnetar_provider_cpu::matmul(&seen, &dense, false, false).unwrap(),
+                    ),
+                    &magnetar_provider_cpu::matmul(&seen, &up.dequantize(), false, false).unwrap(),
+                )
+                .unwrap();
+                let actual = kernels
+                    .gated_matmul(&a_dev, &weight, &up_weight, false, false)
+                    .unwrap();
+                assert_close_relative(&download(&kernels, &actual), &expected);
+            }
+        }
+    }
+    kernels.set_int8_activations(false);
+}
+
+/// `a` as the int8-activation Kernels see it: each 32-value block rounded
+/// to `d * round(x / d)`, `d = max |x| / 127`.
+fn int8_rounded(a: &HostTensor) -> HostTensor {
+    let mut data = a.data.clone();
+    for block in data.chunks_mut(32) {
+        let amax = block.iter().fold(0.0_f32, |max, x| max.max(x.abs()));
+        let d = amax / 127.0;
+        for x in block {
+            *x = if amax == 0.0 {
+                0.0
+            } else {
+                (*x / d).round_ties_even() * d
+            };
+        }
+    }
+    HostTensor::new(a.shape.clone(), data).unwrap()
+}
+
+/// With int8 activations on, the packed `Q8_0`, `Q4_K` and `Q6_K` decode
+/// matmuls (with a residual addend) and gated matmuls compute the Reference
+/// CPU's result on the rounded activations, and longer matmuls are
+/// unaffected.
+#[test]
+fn int8_activation_matmuls_match_reference_cpu_on_rounded_activations() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    kernels.set_int8_activations(true);
+    let (k, n) = (1024_u64, 97_u64);
+    let weights = [
+        packed_q8(n, k, true, 41),
+        packed_q4k(n, k, true, 42),
+        packed_q6k(n, k, true, 43),
+    ];
+    let ups = [packed_q8(n, k, true, 44), packed_q4k(n, k, true, 45)];
+    for (packed, up) in weights.iter().zip(ups.iter().map(Some).chain([None])) {
+        let dense = packed.dequantize();
+        let weight = kernels.upload_packed_weight(packed).unwrap();
+        for m in [1_u64, 3, 9, 65] {
+            let a = activations(m, k, m as u32 + 60);
+            let rounded = if m <= 64 { int8_rounded(&a) } else { a.clone() };
+            let a_dev = upload(&kernels, &a);
+            let residual = activations(m, n, 61);
+            let expected = magnetar_provider_cpu::add(
+                &magnetar_provider_cpu::matmul(&rounded, &dense, false, false).unwrap(),
+                &residual,
+            )
+            .unwrap();
+            let actual = kernels
+                .matmul_residual(&a_dev, &weight, &upload(&kernels, &residual), false, false)
+                .unwrap();
+            assert_close_relative(&download(&kernels, &actual), &expected);
+            if let Some(up) = up
+                && m <= 64
+            {
+                let up_weight = kernels.upload_packed_weight(up).unwrap();
+                let expected = magnetar_provider_cpu::mul(
+                    &magnetar_provider_cpu::silu(
+                        &magnetar_provider_cpu::matmul(&rounded, &dense, false, false).unwrap(),
+                    ),
+                    &magnetar_provider_cpu::matmul(&rounded, &up.dequantize(), false, false)
+                        .unwrap(),
+                )
+                .unwrap();
+                let actual = kernels
+                    .gated_matmul(&a_dev, &weight, &up_weight, false, false)
+                    .unwrap();
+                assert_close_relative(&download(&kernels, &actual), &expected);
+            }
+        }
+    }
+}
+
+/// `gated-matmul` against packed gate and up weights, and an embedding
+/// lookup from a packed (untransposed) table, match the Reference CPU on
+/// the dequantized weights.
+#[test]
+fn q8_packed_gated_matmul_and_embedding_match_reference_cpu() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let (k, n) = (128_u64, 64_u64);
+    let gate = packed_q8(n, k, true, 11);
+    let up = packed_q8(n, k, true, 12);
+    for m in [1_u64, 70] {
+        let a = activations(m, k, 5);
+        let expected = magnetar_provider_cpu::mul(
+            &magnetar_provider_cpu::silu(
+                &magnetar_provider_cpu::matmul(&a, &gate.dequantize(), false, false).unwrap(),
+            ),
+            &magnetar_provider_cpu::matmul(&a, &up.dequantize(), false, false).unwrap(),
+        )
+        .unwrap();
+        let actual = kernels
+            .gated_matmul(
+                &upload(&kernels, &a),
+                &kernels.upload_packed_weight(&gate).unwrap(),
+                &kernels.upload_packed_weight(&up).unwrap(),
+                false,
+                false,
+            )
+            .unwrap();
+        assert_close_scaled(&download(&kernels, &actual), &expected, k as f32);
+    }
+
+    // A [vocab = 6, hidden = 64] table, rows read packed.
+    let table = packed_q8(6, 64, false, 13);
+    let ids = HostTensor::new([4], vec![5.0, 0.0, 3.0, 5.0]).unwrap();
+    let expected = magnetar_provider_cpu::embedding_lookup(&table.dequantize(), &ids).unwrap();
+    let actual = kernels
+        .embedding_lookup(
+            &kernels.upload_packed_weight(&table).unwrap(),
+            &upload(&kernels, &ids),
+        )
+        .unwrap();
+    assert_eq!(download(&kernels, &actual).data, expected.data);
+}
+
+/// The real Qwen2.5-0.5B shapes (`execute-direct-quantized-weights`): a
+/// packed `[151936, 896]` embedding table read row by row, and the tied
+/// lm_head as the same bytes in transposed storage (`[896, 151936]`
+/// logically) through the decode matmul, checked against the dequantized
+/// values on sampled rows and columns.
+#[test]
+fn q8_packed_weights_at_real_checkpoint_sizes() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let (vocab, hidden) = (151_936_u64, 896_u64);
+    let blocks = (vocab * hidden / 32) as usize;
+    let mut bytes = Vec::with_capacity(blocks * 34);
+    for block in 0..blocks {
+        // d = 2^-7 * (1 + (block % 7) / 8), exactly an f16.
+        let d_bits: u16 = (8 << 10) | (((block % 7) as u16) << 7);
+        bytes.extend(d_bits.to_le_bytes());
+        bytes.extend((0..32).map(|i| (((block * 31 + i * 7) % 255) as i32 - 127) as i8 as u8));
+    }
+    let value = |row: u64, col: u64| {
+        let index = (row * hidden + col) as usize;
+        let block = index / 32;
+        let d = (1.0 + (block % 7) as f32 / 8.0) / 128.0;
+        let q = ((block * 31 + (index % 32) * 7) % 255) as i32 - 127;
+        d * q as f32
+    };
+    let table = PackedWeight::new(
+        PackedWeightFormat::Q8_0,
+        vocab,
+        hidden,
+        false,
+        bytes.clone(),
+    )
+    .unwrap();
+    let lm_head = PackedWeight::new(PackedWeightFormat::Q8_0, vocab, hidden, true, bytes).unwrap();
+
+    let table_dev = kernels.upload_packed_weight(&table).unwrap();
+    let ids = [0_u64, 1, 77_777, vocab - 1, 4242];
+    let ids_tensor = HostTensor::new(
+        [ids.len() as u64],
+        ids.iter().map(|&id| id as f32).collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let rows = download(
+        &kernels,
+        &kernels
+            .embedding_lookup(&table_dev, &upload(&kernels, &ids_tensor))
+            .unwrap(),
+    );
+    for (r, &id) in ids.iter().enumerate() {
+        for col in 0..hidden {
+            assert_eq!(
+                rows.data[r * hidden as usize + col as usize],
+                value(id, col)
+            );
+        }
+    }
+
+    let lm_head_dev = kernels.upload_packed_weight(&lm_head).unwrap();
+    let a = activations(5, hidden, 3);
+    let logits = download(
+        &kernels,
+        &kernels
+            .matmul(&upload(&kernels, &a), &lm_head_dev, false, false)
+            .unwrap(),
+    );
+    assert_eq!(logits.shape, vec![5, vocab]);
+    for r in 0..5_u64 {
+        for col in [0_u64, 1, 31, 32, 99_999, vocab - 1] {
+            let expected: f32 = (0..hidden)
+                .map(|k| a.data[(r * hidden + k) as usize] * value(col, k))
+                .sum();
+            let actual = logits.data[(r * vocab + col) as usize];
+            assert!(
+                (actual - expected).abs() <= 1e-3,
+                "[{r}, {col}]: {actual} vs {expected}"
+            );
+        }
+    }
+}
+
+/// A decode step over packed weights (`execute-direct-quantized-weights`)
+/// captures into a CUDA graph -- the packed gated matmul allocates no
+/// intermediate -- and its replay matches the uncaptured step. A capture
+/// failed after a device buffer was dropped while capturing leaves the
+/// stream usable: the driver error that free recorded does not outlive the
+/// aborted capture.
+#[test]
+fn q8_packed_decode_step_captures_and_a_failed_capture_leaves_the_stream_usable() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let (k, n) = (128_u64, 64_u64);
+    let gate = kernels
+        .upload_packed_weight(&packed_q8(n, k, true, 21))
+        .unwrap();
+    let up = kernels
+        .upload_packed_weight(&packed_q8(n, k, true, 22))
+        .unwrap();
+    let table = kernels
+        .upload_packed_weight(&packed_q8(6, k, false, 23))
+        .unwrap();
+    let ids = upload(&kernels, &HostTensor::new([1], vec![4.0]).unwrap());
+    // Outputs are allocated before and offered, as the executor does:
+    // nothing allocates or frees while capturing.
+    let outputs = || {
+        let alloc = |len| kernels.stream().alloc_zeros::<f32>(len).unwrap();
+        (alloc(k as usize), alloc(n as usize))
+    };
+    let step = |(hidden_out, gated_out)| {
+        let offered = kernels.offer_output(Some(hidden_out));
+        let hidden = kernels.embedding_lookup(&table, &ids)?;
+        drop(offered);
+        let offered = kernels.offer_output(Some(gated_out));
+        let out = kernels.gated_matmul(&hidden, &gate, &up, false, false)?;
+        drop(offered);
+        Ok::<_, crate::error::CudaError>((hidden, out))
+    };
+    let (_, eager) = step(outputs()).unwrap();
+    let expected = download(&kernels, &eager);
+
+    let buffers = outputs();
+    kernels.begin_capture(Default::default()).unwrap();
+    let (_hidden, captured) = step(buffers).unwrap();
+    let mut graph = kernels.end_capture().unwrap();
+    kernels.launch_captured(&mut graph, 0).unwrap();
+    assert_eq!(download(&kernels, &captured).data, expected.data);
+
+    let dropped = upload(&kernels, &activations(1, k, 7));
+    kernels.begin_capture(Default::default()).unwrap();
+    drop(dropped);
+    assert!(
+        kernels.upload(&activations(1, k, 8)).is_err(),
+        "a host upload cannot be captured"
+    );
+    kernels.abort_capture();
+    let (_, again) = step(outputs()).unwrap();
+    assert_eq!(download(&kernels, &again).data, expected.data);
+}
+
+/// `execute-and-cache-moe-experts` F02: the CUDA `moe-experts` against the
+/// Reference CPU for f32 and packed `Q8_0` experts, for a decode-sized
+/// step (persistent scratch) and a prefill-sized one (temporaries); a
+/// decode-sized step captures and replays exactly.
+#[test]
+fn moe_experts_match_reference_cpu_for_f32_and_packed_experts() {
+    use magnetar_runtime::reference_cpu::{MoeRouting, moe_experts};
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let (hidden, inter, experts, top_k) = (64_u64, 32_u64, 5_u64, 2_u64);
+    let routing = MoeRouting {
+        experts,
+        top_k,
+        normalize: false,
+    };
+    // Stored as each expert's rows: gate/up [E*I, H], down [E*H, I].
+    let gate = packed_q8(experts * inter, hidden, true, 31);
+    let up = packed_q8(experts * inter, hidden, true, 32);
+    let down = packed_q8(experts * hidden, inter, true, 33);
+    let (gate_f32, up_f32, down_f32) = (gate.dequantize(), up.dequantize(), down.dequantize());
+    for tokens in [1_u64, 70] {
+        let h = activations(tokens, hidden, 34);
+        let logits = activations(tokens, experts, 35);
+        for normalize in [false, true] {
+            let routing = MoeRouting {
+                normalize,
+                ..routing
+            };
+            let expected =
+                moe_experts(&h, &logits, [&gate_f32, &up_f32, &down_f32], routing).unwrap();
+            let f32_experts = [&gate_f32, &up_f32, &down_f32].map(|w| upload(&kernels, w));
+            let actual = kernels
+                .moe_experts(
+                    &upload(&kernels, &h),
+                    &upload(&kernels, &logits),
+                    [&f32_experts[0], &f32_experts[1], &f32_experts[2]],
+                    routing,
+                    (0, experts),
+                )
+                .unwrap();
+            assert_close_relative(&download(&kernels, &actual), &expected);
+            let packed_experts =
+                [&gate, &up, &down].map(|w| kernels.upload_packed_weight(w).unwrap());
+            let actual = kernels
+                .moe_experts(
+                    &upload(&kernels, &h),
+                    &upload(&kernels, &logits),
+                    [&packed_experts[0], &packed_experts[1], &packed_experts[2]],
+                    routing,
+                    (0, experts),
+                )
+                .unwrap();
+            assert_close_relative(&download(&kernels, &actual), &expected);
+        }
+    }
+
+    // A decode step captures (its output offered ahead) and replays.
+    let packed_experts = [&gate, &up, &down].map(|w| kernels.upload_packed_weight(w).unwrap());
+    let h = upload(&kernels, &activations(1, hidden, 36));
+    let logits = upload(&kernels, &activations(1, experts, 37));
+    let step = |out| {
+        let offered = kernels.offer_output(Some(out));
+        let result = kernels.moe_experts(
+            &h,
+            &logits,
+            [&packed_experts[0], &packed_experts[1], &packed_experts[2]],
+            routing,
+            (0, experts),
+        );
+        drop(offered);
+        result
+    };
+    let alloc = || {
+        kernels
+            .stream()
+            .alloc_zeros::<f32>(hidden as usize)
+            .unwrap()
+    };
+    let eager = download(&kernels, &step(alloc()).unwrap());
+    let out = alloc();
+    kernels.begin_capture(Default::default()).unwrap();
+    let captured = step(out).unwrap();
+    let mut graph = kernels.end_capture().unwrap();
+    kernels.launch_captured(&mut graph, 0).unwrap();
+    assert_eq!(download(&kernels, &captured).data, eager.data);
+}
+
+/// Tensor parallelism splits a `moe-experts` layer's experts whole across
+/// GPUs: each share, f32 or packed `Q8_0`, matches the Reference CPU's
+/// share (routing over every expert, summing only those held), and the
+/// shares add up to the whole layer.
+#[test]
+fn moe_expert_shares_match_reference_cpu_and_add_up() {
+    use magnetar_runtime::packed_weight::{PackedWeight, PackedWeightFormat};
+    use magnetar_runtime::reference_cpu::{MoeRouting, moe_experts, moe_experts_local};
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let (hidden, inter, experts, top_k, tokens) = (64_u64, 32_u64, 5_u64, 3_u64, 4_u64);
+    let routing = MoeRouting {
+        experts,
+        top_k,
+        normalize: true,
+    };
+    let gate = packed_q8(experts * inter, hidden, true, 51);
+    let up = packed_q8(experts * inter, hidden, true, 52);
+    let down = packed_q8(experts * hidden, inter, true, 53);
+    // Stored rows of experts [first, first + count).
+    let rows = |weight: &PackedWeight, per_expert: u64, first: u64, count: u64| {
+        let row_bytes = (weight.stored_cols() / 32 * 34) as usize;
+        let start = (first * per_expert) as usize * row_bytes;
+        let end = ((first + count) * per_expert) as usize * row_bytes;
+        PackedWeight::new(
+            PackedWeightFormat::Q8_0,
+            count * per_expert,
+            weight.stored_cols(),
+            true,
+            weight.bytes()[start..end].to_vec(),
+        )
+        .unwrap()
+    };
+    let h = activations(tokens, hidden, 54);
+    let logits = activations(tokens, experts, 55);
+    let whole = moe_experts(
+        &h,
+        &logits,
+        [&gate.dequantize(), &up.dequantize(), &down.dequantize()],
+        routing,
+    )
+    .unwrap();
+    let mut summed = vec![0.0_f32; whole.data.len()];
+    for (first, count) in [(0_u64, 2_u64), (2, 3)] {
+        let share = [
+            rows(&gate, inter, first, count),
+            rows(&up, inter, first, count),
+            rows(&down, hidden, first, count),
+        ];
+        let dense = share.each_ref().map(PackedWeight::dequantize);
+        let expected = moe_experts_local(
+            &h,
+            &logits,
+            [&dense[0], &dense[1], &dense[2]],
+            routing,
+            first,
+            count,
+        )
+        .unwrap();
+        let f32_share = dense.each_ref().map(|w| upload(&kernels, w));
+        let actual = kernels
+            .moe_experts(
+                &upload(&kernels, &h),
+                &upload(&kernels, &logits),
+                [&f32_share[0], &f32_share[1], &f32_share[2]],
+                routing,
+                (first, count),
+            )
+            .unwrap();
+        assert_close_relative(&download(&kernels, &actual), &expected);
+        let packed_share = share
+            .each_ref()
+            .map(|w| kernels.upload_packed_weight(w).unwrap());
+        let actual = download(
+            &kernels,
+            &kernels
+                .moe_experts(
+                    &upload(&kernels, &h),
+                    &upload(&kernels, &logits),
+                    [&packed_share[0], &packed_share[1], &packed_share[2]],
+                    routing,
+                    (first, count),
+                )
+                .unwrap(),
+        );
+        assert_close_relative(&actual, &expected);
+        for (slot, value) in summed.iter_mut().zip(&actual.data) {
+            *slot += value;
+        }
+    }
+    assert_close_relative(
+        &HostTensor::new(whole.shape.clone(), summed).unwrap(),
+        &whole,
+    );
+}
+
+/// `row-scale` and the `sigmoid` activation against the Reference CPU.
+#[test]
+fn row_scale_and_sigmoid_match_reference_cpu() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let x = activations(3, 40, 41);
+    let scale = activations(3, 1, 42);
+    let expected = magnetar_runtime::reference_cpu::row_scale(&x, &scale).unwrap();
+    let actual = kernels
+        .row_scale(&upload(&kernels, &x), &upload(&kernels, &scale))
+        .unwrap();
+    assert_close_scaled(&download(&kernels, &actual), &expected, 1.0);
+    let expected = magnetar_runtime::reference_cpu::sigmoid(&x);
+    let actual = kernels.sigmoid(&upload(&kernels, &x)).unwrap();
+    assert_close_scaled(&download(&kernels, &actual), &expected, 1.0);
+}
+
+/// `actual` within f32 summation error of `expected`, measured against the
+/// largest expected magnitude: an output is a difference of terms that
+/// large, so cancellation leaves an error of their size, not its own (a
+/// wrong expert or weight changes outputs by that whole magnitude).
+fn assert_close_relative(actual: &HostTensor, expected: &HostTensor) {
+    assert_eq!(actual.shape, expected.shape);
+    let scale = expected
+        .data
+        .iter()
+        .fold(1.0_f32, |max, e| max.max(e.abs()));
+    for (index, (a, e)) in actual.data.iter().zip(&expected.data).enumerate() {
+        assert!(
+            (a - e).abs() <= 1e-5 * scale,
+            "index {index}: {a} vs {e} (scale {scale})"
+        );
+    }
+}
+
+/// A tensor-parallel step captured as one graph across two GPUs: the
+/// second GPU joins the first's capture, runs a Kernel, and the first sums
+/// the second's buffer into its own by reading it directly; the second
+/// then copies the sum back. The graph, launched twice, gives the same
+/// result as the same work run eagerly. Skipped without two GPUs with
+/// peer access.
+#[test]
+fn a_step_captured_across_two_gpus_replays_its_reduction() {
+    let first = CudaProvider::for_device(0, "first");
+    let second = CudaProvider::for_device(1, "second");
+    let (Some(context0), Some(context1)) = (first.context(), second.context()) else {
+        eprintln!("skipping: fewer than two CUDA devices");
+        return;
+    };
+    let reachable = crate::peer::device_can_access_peer(&context0, &context1).unwrap_or(false)
+        && crate::peer::device_can_access_peer(&context1, &context0).unwrap_or(false);
+    if !reachable {
+        eprintln!("skipping: the two GPUs have no peer access");
+        return;
+    }
+    crate::peer::enable_peer_access(&context0, &context1).unwrap();
+    crate::peer::enable_peer_access(&context1, &context0).unwrap();
+    let host = CudaKernels::compile_and_load(&context0).unwrap();
+    let joined = CudaKernels::compile_and_load(&context1).unwrap();
+    for kernels in [&host, &joined] {
+        kernels.set_peer_access(true);
+        kernels.set_relaxed_capture(true);
+    }
+    let values = HostTensor::new([1, 64], (0..64).map(|v| v as f32).collect::<Vec<_>>()).unwrap();
+    let mut a = upload(&host, &values);
+    let mut b = upload(&joined, &values);
+    let c = upload(&joined, &values);
+    // b += c on the second GPU, a += b read from it by the first, then b = a
+    // copied back. Eagerly once, which also loads every Kernel: b = 2v,
+    // a = 3v, b = 3v.
+    let step = |a: &mut CudaDeviceBuffer, b: &mut CudaDeviceBuffer| {
+        joined.accumulate(b, &c).unwrap();
+        host.accumulate_from_peer(a, &joined, b).unwrap();
+        joined
+            .copy_from_peer(&host, &a.slice, &mut b.slice)
+            .unwrap();
+        host.follow(&joined).unwrap();
+    };
+    step(&mut a, &mut b);
+    assert_eq!(
+        download(&host, &a).data,
+        (0..64).map(|v| 3.0 * v as f32).collect::<Vec<_>>()
+    );
+    for kernels in [&host, &joined] {
+        kernels.prepare_capture().unwrap();
+    }
+    host.begin_capture(Default::default()).unwrap();
+    joined.join_capture(&host, Default::default()).unwrap();
+    assert!(
+        format!("{:?}", joined.stream().capture_status().unwrap()).contains("ACTIVE"),
+        "the second GPU's stream joined the capture"
+    );
+    step(&mut a, &mut b);
+    let mut joined_part = joined.leave_capture(&host).unwrap();
+    let mut graph = host.end_capture().unwrap();
+    joined
+        .write_joined_offset(&mut joined_part, 0, &host)
+        .unwrap();
+    host.launch_captured(&mut graph, 0).unwrap();
+    joined.follow(&host).unwrap();
+    // end_capture only instantiates: two launches after the eager run take
+    // a from 3v to 7v, then 15v.
+    joined
+        .write_joined_offset(&mut joined_part, 0, &host)
+        .unwrap();
+    host.launch_captured(&mut graph, 0).unwrap();
+    joined.follow(&host).unwrap();
+    assert_eq!(
+        download(&host, &a).data,
+        (0..64).map(|v| 15.0 * v as f32).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        download(&joined, &b).data,
+        (0..64).map(|v| 15.0 * v as f32).collect::<Vec<_>>()
+    );
 }
