@@ -450,6 +450,22 @@ impl CudaMultiExecutor {
                 .collect();
             (role, locals)
         };
+        // A partial output is summed across members, so a fused addend
+        // (residual, bias) would be added once per member. The Runtime
+        // never fuses one into a row-parallel matmul; refuse rather than
+        // compute `A·W + N·addend` if a graph ever does.
+        if role == OutputRole::Partial
+            && matches!(operator.id.name(), "matmul-residual" | "matmul-bias")
+        {
+            return Err(self.error(
+                ProviderExecutionPhase::Submit,
+                format!(
+                    "'{}' over a row-split weight would add its addend once per Device; \
+                     keep the add unfused for tensor parallelism",
+                    operator.id.name()
+                ),
+            ));
+        }
         self.open_member_captures()?;
         let mut first = None;
         let mut failed = None;

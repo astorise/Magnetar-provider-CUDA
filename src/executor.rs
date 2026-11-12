@@ -98,7 +98,10 @@ pub struct CudaExecutor {
     reduce_scratch: Mutex<BTreeMap<TensorResourceId, CudaDeviceBuffer>>,
     /// Each tensor-parallel reduction's page-locked stage, for GPUs without
     /// peer access.
-    reduce_stages: Mutex<BTreeMap<TensorResourceId, crate::kernels::PinnedStage>>,
+    /// Page-locked stages of reductions without peer access, one per
+    /// tensor and other GPU: a stage is never shared between two GPUs'
+    /// copies, so one GPU's write cannot overtake another's pending read.
+    reduce_stages: Mutex<BTreeMap<(TensorResourceId, DeviceId), crate::kernels::PinnedStage>>,
 }
 
 /// The device address and length (in floats) of a resource's buffer, as a
@@ -704,16 +707,7 @@ impl CudaExecutor {
         // host memory, this GPU copies it into a scratch buffer and adds it,
         // all queued copies a capture records.
         let mut stages = self.reduce_stages.lock().unwrap();
-        if !stages
-            .get(id)
-            .is_some_and(|stage| stage.len() == source.len())
-        {
-            stages.insert(
-                id.clone(),
-                crate::kernels::PinnedStage::new(&self.kernels, source.len())?,
-            );
-        }
-        let stage = &stages[id];
+        let stage = self.reduce_stage(&mut stages, id, peer.device_id(), source.len())?;
         peer.kernels.stage_out(&source.slice, stage)?;
         drop(peer_storage);
         self.kernels.follow(&peer.kernels)?;
@@ -734,6 +728,25 @@ impl CudaExecutor {
         self.kernels.accumulate(destination, partial)
     }
 
+    /// This GPU's page-locked stage for `id` exchanged with `other`, made
+    /// (or remade at a new size) on first use.
+    fn reduce_stage<'s>(
+        &self,
+        stages: &'s mut BTreeMap<(TensorResourceId, DeviceId), crate::kernels::PinnedStage>,
+        id: &TensorResourceId,
+        other: &DeviceId,
+        len: usize,
+    ) -> Result<&'s crate::kernels::PinnedStage, CudaError> {
+        let key = (id.clone(), other.clone());
+        if !stages.get(&key).is_some_and(|stage| stage.len() == len) {
+            stages.insert(
+                key.clone(),
+                crate::kernels::PinnedStage::new(&self.kernels, len)?,
+            );
+        }
+        Ok(&stages[&key])
+    }
+
     /// Copies `root`'s reduced `id` into this GPU's `id`, in place: the
     /// second half of a tensor-parallel reduction. With peer access, read
     /// directly; without, staged through `root`'s page-locked stage for
@@ -750,10 +763,6 @@ impl CudaExecutor {
         let Some(source) = root_storage.get(id) else {
             return Ok(false);
         };
-        let stages = root.reduce_stages.lock().unwrap();
-        let Some(stage) = stages.get(id) else {
-            return Ok(false);
-        };
         let mut storage = self.storage.lock().unwrap();
         let Some(destination) = storage.get_mut(id) else {
             return Ok(false);
@@ -761,6 +770,10 @@ impl CudaExecutor {
         if source.is_compact() || destination.is_compact() || source.len() != destination.len() {
             return Ok(false);
         }
+        // This GPU's own stage on `root`, made here when `root` reduced
+        // over peer access and so staged nothing from it.
+        let mut stages = root.reduce_stages.lock().unwrap();
+        let stage = root.reduce_stage(&mut stages, id, self.device_id(), source.len())?;
         root.kernels.stage_out(&source.slice, stage)?;
         self.kernels.follow(&root.kernels)?;
         self.kernels.stage_in(stage, &mut destination.slice)?;
