@@ -29,3 +29,9 @@ jobs:
     with:
       module-path: providers/cuda
       siblings: providers/cpu
+      # Real hardware: the Provider's tests, hardware-gated ones included,
+      # on this repository's self-hosted GPU runner. Runs for pushes to main
+      # and for pull requests from branches of this repository, never for a
+      # pull request from a fork; fails when no GPU is visible.
+      gpu: true
+      gpu-runner: arc-gpu-magnetar-provider-cuda
