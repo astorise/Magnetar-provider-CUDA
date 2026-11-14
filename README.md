@@ -105,15 +105,16 @@ Magnetar's post-baseline optimized-Provider roadmap, respectively.
 
 ## Relationship to magnetar-runtime
 
-This crate depends only on `magnetar-runtime`'s public Provider/Device/
-Kernel/Tensor/Memory contracts (`providers/cuda -> magnetar-runtime`, never
-the reverse); `magnetar-runtime` compiles and tests cleanly without this
+This crate depends only on the Provider/Device/Kernel/Tensor/Memory contracts
+of the Magnetar layer crates (`magnetar-provider-api`, `magnetar-kernel`,
+`magnetar-graph` and `magnetar-core`), never the reverse. `magnetar-runtime`
+is a dev-dependency only, for the real `Runtime` and the conformance suite. `magnetar-runtime` compiles and tests cleanly without this
 crate present. It is pinned into the main
 [Magnetar](https://github.com/astorise/Magnetar) repository as a git
 submodule at `providers/cuda`.
 
 Like [`providers/cpu`](https://github.com/astorise/Magnetar-provider-CPU),
-`HostTensor` is imported from `magnetar_runtime` rather than redefined here,
+`HostTensor` is imported from `magnetar_provider_api` rather than redefined here,
 for the same reason documented in that crate's README: `ProviderExecutionApi`
 is still typed directly against it as a provisional transport ahead of a
 fully Resource-based rewrite.

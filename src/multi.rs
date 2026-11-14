@@ -4,7 +4,7 @@
 //!
 //! The Runtime sees one Provider exposing every member GPU as a Device. It
 //! places the Model Instance's decoder layers across them
-//! ([`magnetar_runtime::layer_placement::LayerPlacement`]) and hands the plan
+//! ([`magnetar_provider_api::layer_placement::LayerPlacement`]) and hands the plan
 //! over through [`ProviderExecutionApi::apply_layer_placement`] before any
 //! weight is written. This Provider then:
 //!
@@ -28,29 +28,32 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use cudarc::driver::CudaContext;
-use magnetar_runtime::HostTensor;
-use magnetar_runtime::affinity::{ProviderBinding, ProviderHealth};
-use magnetar_runtime::compute::TensorResourceId;
-use magnetar_runtime::device::{Device, DeviceDescriptor, DeviceId};
-use magnetar_runtime::kernel::{
-    KernelAdvertisement, KernelInvocation, KernelObservation, KernelResult,
+use magnetar_core::ProviderError;
+use magnetar_core::TensorResourceId;
+use magnetar_core::operator::OperatorSpec;
+use magnetar_core::{ProviderBinding, ProviderHealth};
+use magnetar_core::{ProviderExecutionError, ProviderExecutionErrorCode, ProviderExecutionPhase};
+use magnetar_core::{device::Device, device::DeviceDescriptor, device::DeviceId};
+use magnetar_graph::{
+    memory::MemoryAllocationClass, memory::MemoryAllocationId, memory::MemoryAllocationOwner,
+    memory::MemoryError, memory::MemoryManager,
 };
-use magnetar_runtime::layer_placement::LayerPlacement;
-use magnetar_runtime::memory::{
-    MemoryAllocationClass, MemoryAllocationId, MemoryAllocationOwner, MemoryError, MemoryManager,
+use magnetar_kernel::{
+    kernel::KernelAdvertisement, kernel::KernelInvocation, kernel::KernelObservation,
+    kernel::KernelResult,
 };
-use magnetar_runtime::operator::OperatorSpec;
-use magnetar_runtime::packed_weight::{PackedWeight, PackedWeightWrite};
-use magnetar_runtime::provider::{
-    Provider, ProviderError, ProviderExecutionApi, ProviderMetadata, ProviderRegistry,
-    StepCaptureId, StepCaptureRequest, StepReplayError, TensorValue, TensorValueAdmissionError,
+use magnetar_provider_api::HostTensor;
+use magnetar_provider_api::layer_placement::LayerPlacement;
+use magnetar_provider_api::tensor_parallel::TensorParallelPlan;
+use magnetar_provider_api::{
+    Provider, ProviderExecutionApi, ProviderMetadata, ProviderRegistry, StepCaptureId,
+    StepCaptureRequest, StepReplayError, TensorValue, TensorValueAdmissionError,
 };
-use magnetar_runtime::scheduler::{
-    ProviderCancellationOutcome, ProviderExecutionError, ProviderExecutionErrorCode,
-    ProviderExecutionHandle, ProviderExecutionId, ProviderExecutionPhase, ProviderExecutionRequest,
-    ProviderExecutionResult, ProviderExecutionStatus,
+use magnetar_provider_api::{
+    ProviderCancellationOutcome, ProviderExecutionHandle, ProviderExecutionId,
+    ProviderExecutionRequest, ProviderExecutionResult, ProviderExecutionStatus,
 };
-use magnetar_runtime::tensor_parallel::TensorParallelPlan;
+use magnetar_provider_api::{packed_weight::PackedWeight, packed_weight::PackedWeightWrite};
 
 use crate::advertisements::cuda_kernel_advertisements;
 use crate::executor::CudaExecutor;
@@ -476,7 +479,7 @@ impl ProviderExecutionApi for CudaMultiExecutor {
         let member_handle =
             self.members[member].submit_kernel(advertisement, operator, invocation, memory)?;
         let result = self.members[member].complete_kernel(&member_handle)?;
-        if result.status == magnetar_runtime::kernel::KernelResultStatus::Succeeded {
+        if result.status == magnetar_kernel::kernel::KernelResultStatus::Succeeded {
             for resource in &result.updated_resources {
                 self.record_produced(&resource.id, member, Some(memory));
             }

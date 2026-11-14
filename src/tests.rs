@@ -7,9 +7,9 @@
 
 use crate::error::{CudaError, CudaErrorCode};
 use crate::provider::{CUDA_PROVIDER_NAME, CudaProvider};
-use magnetar_runtime::affinity::ProviderHealth;
-use magnetar_runtime::kernel::{KernelError, KernelErrorCode};
-use magnetar_runtime::provider::Provider;
+use magnetar_core::ProviderHealth;
+use magnetar_kernel::{kernel::KernelError, kernel::KernelErrorCode};
+use magnetar_provider_api::Provider;
 
 #[test]
 fn out_of_device_memory_maps_to_dedicated_kernel_error_category() {

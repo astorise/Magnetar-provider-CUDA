@@ -24,33 +24,36 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use magnetar_runtime::affinity::{DeviceBinding, ProviderBinding};
-use magnetar_runtime::compute::{
-    ComputeDType, DTypeDescriptor, TensorDescriptor, TensorResourceId,
+use magnetar_core::device::DeviceId;
+use magnetar_core::{ComputeDType, DTypeDescriptor, TensorDescriptor, TensorResourceId};
+use magnetar_core::{DeviceBinding, ProviderBinding};
+use magnetar_core::{
+    ProviderExecutionError, ProviderExecutionErrorCode, ProviderExecutionPhase,
+    ScheduledOperationId,
 };
-use magnetar_runtime::device::DeviceId;
-use magnetar_runtime::kernel::{
-    KernelAdvertisement, KernelError, KernelInvocation, KernelObservation, KernelObservationKind,
-    KernelResult, KernelResultStatus,
+use magnetar_core::{
+    operator::OperatorAttributeValue, operator::OperatorSpec, operator::RopeBandedFrequencyScaling,
 };
-use magnetar_runtime::memory::{
-    MemoryAllocationClass, MemoryAllocationId, MemoryAllocationOwner, MemoryAllocationRequest,
-    MemoryError, MemoryManager, MemoryPlacement, TensorResidency,
+use magnetar_graph::{
+    memory::MemoryAllocationClass, memory::MemoryAllocationId, memory::MemoryAllocationOwner,
+    memory::MemoryAllocationRequest, memory::MemoryError, memory::MemoryManager,
+    memory::MemoryPlacement, memory::TensorResidency,
 };
-use magnetar_runtime::operator::{
-    OperatorAttributeValue, OperatorSpec, RopeBandedFrequencyScaling,
+use magnetar_kernel::{
+    kernel::KernelAdvertisement, kernel::KernelError, kernel::KernelInvocation,
+    kernel::KernelObservation, kernel::KernelObservationKind, kernel::KernelResult,
+    kernel::KernelResultStatus,
 };
-use magnetar_runtime::packed_weight::{PackedWeight, PackedWeightWrite};
-use magnetar_runtime::provider::{
+use magnetar_provider_api::{ExecutionPlanId, HostTensor};
+use magnetar_provider_api::{
+    ProviderCancellationOutcome, ProviderExecutionHandle, ProviderExecutionId,
+    ProviderExecutionRequest, ProviderExecutionResult, ProviderExecutionStatus, SchedulingState,
+};
+use magnetar_provider_api::{
     ProviderExecutionApi, StepCaptureId, StepCaptureRequest, StepReplayError, TensorValue,
     TensorValueAdmissionError,
 };
-use magnetar_runtime::scheduler::{
-    ProviderCancellationOutcome, ProviderExecutionError, ProviderExecutionErrorCode,
-    ProviderExecutionHandle, ProviderExecutionId, ProviderExecutionPhase, ProviderExecutionRequest,
-    ProviderExecutionResult, ProviderExecutionStatus, ScheduledOperationId, SchedulingState,
-};
-use magnetar_runtime::{ExecutionPlanId, HostTensor};
+use magnetar_provider_api::{packed_weight::PackedWeight, packed_weight::PackedWeightWrite};
 
 use crate::error::{CudaError, CudaErrorCode};
 use crate::kernels::{CapturedStep, CudaDeviceBuffer, CudaHalfDType, CudaKernels, CudaRopePairing};
@@ -1063,7 +1066,7 @@ impl CudaExecutor {
         invocation: &KernelInvocation,
         index: usize,
         buffer: CudaDeviceBuffer,
-    ) -> Result<magnetar_runtime::compute::TensorResourceDescriptor, KernelError> {
+    ) -> Result<magnetar_core::TensorResourceDescriptor, KernelError> {
         let resource =
             invocation
                 .outputs
@@ -1586,7 +1589,7 @@ impl CudaExecutor {
                                 attribute: name.into(),
                             })
                     };
-                    let routing = magnetar_runtime::reference_cpu::MoeRouting {
+                    let routing = magnetar_provider_api::MoeRouting {
                         experts: integer("experts")?,
                         top_k: integer("top_k")?,
                         normalize: Self::attribute_bool(
@@ -1595,7 +1598,7 @@ impl CudaExecutor {
                             false,
                         ),
                     };
-                    let local = magnetar_runtime::reference_cpu::moe_local_experts(
+                    let local = magnetar_provider_api::moe_local_experts(
                         &invocation.attributes,
                         routing.experts,
                     );
@@ -2204,7 +2207,7 @@ impl ProviderExecutionApi for CudaExecutor {
 mod tests {
     use super::*;
     use crate::provider::CudaProvider;
-    use magnetar_runtime::memory::MemoryManagerConfig;
+    use magnetar_graph::memory::MemoryManagerConfig;
 
     #[test]
     fn matmul_kernels_reject_any_accumulation_dtype_but_f32() {
@@ -2274,9 +2277,7 @@ mod tests {
     fn active_allocation_count(memory: &MemoryManager) -> usize {
         memory
             .allocations()
-            .filter(|allocation| {
-                allocation.state == magnetar_runtime::MemoryAllocationState::Active
-            })
+            .filter(|allocation| allocation.state == magnetar_graph::MemoryAllocationState::Active)
             .count()
     }
 

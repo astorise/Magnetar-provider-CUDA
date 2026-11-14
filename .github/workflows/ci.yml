@@ -5,7 +5,7 @@ name: CI
 # request and every push to main. The checks are defined once, in
 # Magnetar's reusable workflow; this file only names the module.
 #
-# The crate depends on `magnetar-runtime` through a relative path, so the
+# The crate depends on the Magnetar layer crates through relative paths, so the
 # reusable workflow builds it inside a Magnetar checkout: the Magnetar
 # branch named like this repository's branch when it exists, otherwise
 # Magnetar's main.

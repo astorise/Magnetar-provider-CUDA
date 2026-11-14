@@ -94,9 +94,9 @@ impl From<cudarc::nvrtc::CompileError> for CudaError {
 /// `From<ReferenceCpuError> for KernelError` mapping, so a `CudaError`
 /// surfaces through `run_invocation` the same way a `ReferenceCpuError`
 /// does for `providers/cpu`.
-impl From<CudaError> for magnetar_runtime::kernel::KernelError {
+impl From<CudaError> for magnetar_kernel::kernel::KernelError {
     fn from(error: CudaError) -> Self {
-        use magnetar_runtime::kernel::KernelError;
+        use magnetar_kernel::kernel::KernelError;
         match error.code {
             CudaErrorCode::DTypeUnsupported => KernelError::KernelDTypeUnsupported {
                 dtype: error.detail,
