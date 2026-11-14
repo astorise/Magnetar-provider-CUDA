@@ -23,9 +23,9 @@ use cudarc::driver::{
     LaunchConfig, PushKernelArg, sys,
 };
 use cudarc::nvrtc::compile_ptx;
-use magnetar_runtime::HostTensor;
-use magnetar_runtime::operator::RopeBandedFrequencyScaling;
-use magnetar_runtime::packed_weight::{PackedWeight, PackedWeightFormat};
+use magnetar_core::operator::RopeBandedFrequencyScaling;
+use magnetar_provider_api::HostTensor;
+use magnetar_provider_api::{packed_weight::PackedWeight, packed_weight::PackedWeightFormat};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -386,7 +386,7 @@ fn same_shape_buf(a: &CudaDeviceBuffer, b: &CudaDeviceBuffer) -> Result<(), Cuda
     Ok(())
 }
 
-fn host_error(error: magnetar_runtime::ReferenceCpuError) -> CudaError {
+fn host_error(error: magnetar_provider_api::ReferenceCpuError) -> CudaError {
     CudaError::new(CudaErrorCode::ShapeUnsupported, error.to_string())
 }
 
@@ -1499,7 +1499,7 @@ impl CudaKernels {
             } else {
                 quants.extend(block[..96].iter().map(|&byte| byte as i8));
                 quants.extend(
-                    magnetar_runtime::model_loading::q3_k_scales(&block[96..108])
+                    magnetar_provider_api::q3_k_scales(&block[96..108])
                         .iter()
                         .map(|&scale| scale - 32),
                 );
@@ -1545,7 +1545,7 @@ impl CudaKernels {
             if format == PackedWeightFormat::Iq4Nl {
                 quants.extend(block[2..18].iter().map(|&byte| byte as i8));
             } else {
-                subscales.extend(magnetar_runtime::model_loading::iq4_xs_scales(&block[2..8]));
+                subscales.extend(magnetar_provider_api::iq4_xs_scales(&block[2..8]));
                 quants.extend(block[8..136].iter().map(|&byte| byte as i8));
             }
         }
@@ -2184,7 +2184,7 @@ impl CudaKernels {
     const MOE_ROUTE_MAX_EXPERTS: u64 = 8 * 32;
 
     /// The `moe-experts` Operator (`execute-and-cache-moe-experts` F02):
-    /// `magnetar_runtime::reference_cpu::moe_experts`' semantics. Routing
+    /// `magnetar_provider_api::moe_experts`' semantics. Routing
     /// stays on the Device. Packed `Q8_0` experts (transposed storage,
     /// each expert a run of stored rows) are read packed; f32 experts
     /// directly; any other compact storage is expanded for this call.
@@ -2193,7 +2193,7 @@ impl CudaKernels {
         h: &CudaDeviceBuffer,
         logits: &CudaDeviceBuffer,
         [gate, up, down]: [&CudaDeviceBuffer; 3],
-        routing: magnetar_runtime::reference_cpu::MoeRouting,
+        routing: magnetar_provider_api::MoeRouting,
         (expert_first, local_experts): (u64, u64),
     ) -> Result<CudaDeviceBuffer, CudaError> {
         Self::require_f32(&[h, logits], "moe-experts' activations")?;

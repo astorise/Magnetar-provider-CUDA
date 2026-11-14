@@ -21,23 +21,26 @@
 
 use std::collections::BTreeMap;
 
-use magnetar_runtime::HostTensor;
-use magnetar_runtime::compute::TensorResourceId;
-use magnetar_runtime::kernel::{
-    KernelAdvertisement, KernelInvocation, KernelResource, KernelResultStatus,
+use magnetar_core::TensorResourceId;
+use magnetar_core::operator::OperatorAttributeValue;
+use magnetar_core::operator::OperatorSpec;
+use magnetar_core::{ProviderExecutionError, ProviderExecutionPhase};
+use magnetar_graph::memory::MemoryManager;
+use magnetar_kernel::{
+    kernel::KernelAdvertisement, kernel::KernelInvocation, kernel::KernelResource,
+    kernel::KernelResultStatus,
 };
-use magnetar_runtime::memory::MemoryManager;
-use magnetar_runtime::operator::OperatorAttributeValue;
-use magnetar_runtime::operator::OperatorSpec;
-use magnetar_runtime::packed_weight::{PackedWeight, PackedWeightFormat, PackedWeightWrite};
-use magnetar_runtime::provider::ProviderExecutionApi;
-use magnetar_runtime::reference_cpu::{MOE_EXPERT_COUNT_ATTRIBUTE, MOE_EXPERT_FIRST_ATTRIBUTE};
-use magnetar_runtime::scheduler::{
-    ProviderExecutionError, ProviderExecutionHandle, ProviderExecutionId, ProviderExecutionPhase,
+use magnetar_provider_api::HostTensor;
+use magnetar_provider_api::ProviderExecutionApi;
+use magnetar_provider_api::{MOE_EXPERT_COUNT_ATTRIBUTE, MOE_EXPERT_FIRST_ATTRIBUTE};
+use magnetar_provider_api::{ProviderExecutionHandle, ProviderExecutionId};
+use magnetar_provider_api::{
+    packed_weight::PackedWeight, packed_weight::PackedWeightFormat,
+    packed_weight::PackedWeightWrite,
 };
-use magnetar_runtime::tensor_parallel::{TensorParallelPlan, WeightShard};
+use magnetar_provider_api::{tensor_parallel::TensorParallelPlan, tensor_parallel::WeightShard};
 
-use magnetar_runtime::provider::StepReplayError;
+use magnetar_provider_api::StepReplayError;
 
 use super::{CapturedOp, CudaMultiExecutor, Recording};
 
@@ -734,7 +737,7 @@ impl CudaMultiExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magnetar_runtime::device::DeviceId;
+    use magnetar_core::device::DeviceId;
 
     fn tp(parts: usize) -> TensorParallel {
         let devices = (0..parts)

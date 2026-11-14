@@ -28,16 +28,20 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use magnetar_runtime::provider::{Provider, StepCaptureRequest, StepReplayError};
-use magnetar_runtime::{
-    ComputeDType, DTypeDescriptor, DeviceBinding, FallbackClass, HostTensor, KernelDispatchPlan,
-    KernelDispatchPlanId, KernelInvocationId, KernelMemoryClass, KernelResource,
-    KernelResultStatus, KernelSelectionRequest, LayoutDescriptor, MemoryAllocationOwner,
-    MemoryAllocationState, MemoryPlacement, OperatorAttributeValue, OperatorFamily, OperatorId,
-    ProviderBinding, ProviderExecutionApi, ResourceAffinity, Runtime, ShapeDescriptor,
-    TensorDescriptor, TensorResourceDescriptor, TensorResourceId, TensorValue,
-    initial_operator_catalog,
+use magnetar_core::{
+    ComputeDType, DTypeDescriptor, DeviceBinding, FallbackClass, KernelMemoryClass,
+    LayoutDescriptor, OperatorAttributeValue, OperatorFamily, OperatorId, ProviderBinding,
+    ResourceAffinity, ShapeDescriptor, TensorDescriptor, TensorResourceDescriptor,
+    TensorResourceId, initial_operator_catalog,
 };
+use magnetar_graph::{MemoryAllocationOwner, MemoryAllocationState, MemoryPlacement};
+use magnetar_kernel::{
+    KernelDispatchPlan, KernelDispatchPlanId, KernelInvocationId, KernelResource,
+    KernelResultStatus, KernelSelectionRequest,
+};
+use magnetar_provider_api::{HostTensor, ProviderExecutionApi, TensorValue};
+use magnetar_provider_api::{Provider, StepCaptureRequest, StepReplayError};
+use magnetar_runtime::Runtime;
 
 use crate::provider::{CUDA_PROVIDER_NAME, CudaProvider};
 
@@ -112,7 +116,7 @@ fn stage_weight(fixture: &mut ChainFixture, id: &TensorResourceId, tensor: HostT
             fixture.runtime.memory_mut(),
             id.clone(),
             TensorValue::Host(tensor),
-            magnetar_runtime::MemoryAllocationClass::Tensor,
+            magnetar_graph::MemoryAllocationClass::Tensor,
             MemoryAllocationOwner::Runtime,
         )
         .expect("staging a small weight Device-resident must succeed");
@@ -205,7 +209,7 @@ fn dispatch(
     .unwrap_or_else(|error| panic!("{step_name}: dispatch plan construction failed: {error:?}"));
     plan.invocation.attributes = attributes;
 
-    let mut dispatcher = magnetar_runtime::KernelDispatcher::new();
+    let mut dispatcher = magnetar_kernel::KernelDispatcher::new();
     dispatcher
         .revalidate(fixture.runtime.kernel_registry(), &mut plan)
         .unwrap_or_else(|error| panic!("{step_name}: revalidation failed: {error:?}"));

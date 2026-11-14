@@ -27,8 +27,9 @@ jobs:
     name: release-publication / dry-run publish
     runs-on: ubuntu-latest
     steps:
-      # The crate depends on `magnetar-runtime` through a relative path
-      # (`../../magnetar-runtime`), so it is only buildable inside a checkout of
+      # The crate depends on the Magnetar layer crates through relative paths
+      # (`../../magnetar-core`, `../../magnetar-graph`, `../../magnetar-kernel`,
+      # `../../magnetar-provider-api`, and `../../magnetar-runtime` for tests), so it is only buildable inside a checkout of
       # the parent repository with this repository placed at `providers/cuda`.
       - name: Checkout parent Magnetar repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -76,8 +77,9 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     environment: release
     steps:
-      # The crate depends on `magnetar-runtime` through a relative path
-      # (`../../magnetar-runtime`), so it is only buildable inside a checkout of
+      # The crate depends on the Magnetar layer crates through relative paths
+      # (`../../magnetar-core`, `../../magnetar-graph`, `../../magnetar-kernel`,
+      # `../../magnetar-provider-api`, and `../../magnetar-runtime` for tests), so it is only buildable inside a checkout of
       # the parent repository with this repository placed at `providers/cuda`.
       - name: Checkout parent Magnetar repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -110,10 +112,10 @@ jobs:
             exit 1
           fi
       # `cargo publish` resolves the dependencies below from crates.io.
-      # Publish them first (magnetar-runtime, then formats, then this crate).
+      # Publish them first (the Magnetar layer crates, then formats, then this crate).
       - name: Check upstream crates are published
         run: |
-          for crate in magnetar-runtime; do
+          for crate in magnetar-core magnetar-graph magnetar-kernel magnetar-provider-api; do
             if ! curl -fsS -A "Magnetar-provider-CUDA-release" "https://crates.io/api/v1/crates/$crate" > /dev/null; then
               echo "::error::$crate is not published on crates.io yet; publish it before magnetar-provider-cuda" >&2
               exit 1

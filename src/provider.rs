@@ -7,7 +7,7 @@
 //! no CUDA driver, no compatible GPU, or a driver/runtime version mismatch --
 //! it never fails Runtime initialization for the absence of hardware. When
 //! driver discovery fails, this Provider reports zero Devices and
-//! [`ProviderHealth::Unavailable`] instead of a [`magnetar_runtime::affinity::ProviderHealthState::Unhealthy`]/
+//! [`ProviderHealth::Unavailable`] instead of a [`magnetar_core::affinity::ProviderHealthState::Unhealthy`]/
 //! failing outright: this is expected, policy-relevant absence of hardware,
 //! not an internal fault (`cuda-provider`'s "Graceful Unavailability Without
 //! Compatible Hardware" requirement). This is also what keeps this crate's
@@ -36,12 +36,11 @@
 
 use cudarc::driver::sys::CUresult;
 use cudarc::driver::{CudaContext, DriverError};
-use magnetar_runtime::affinity::ProviderHealth;
-use magnetar_runtime::device::{Device, DeviceDescriptor};
-use magnetar_runtime::kernel::KernelAdvertisement;
-use magnetar_runtime::provider::{
-    Provider, ProviderError, ProviderExecutionApi, ProviderMetadata, ProviderRegistry,
-};
+use magnetar_core::ProviderError;
+use magnetar_core::ProviderHealth;
+use magnetar_core::{device::Device, device::DeviceDescriptor};
+use magnetar_kernel::kernel::KernelAdvertisement;
+use magnetar_provider_api::{Provider, ProviderExecutionApi, ProviderMetadata, ProviderRegistry};
 use std::sync::Arc;
 
 use crate::advertisements::cuda_kernel_advertisements;

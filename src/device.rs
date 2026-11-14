@@ -9,13 +9,14 @@
 
 use cudarc::driver::sys::CUdevice_attribute;
 use cudarc::driver::{CudaContext, DriverError};
-use magnetar_runtime::affinity::ProviderPressureLevel;
-use magnetar_runtime::compute::ComputeDType;
-use magnetar_runtime::device::{
-    DeviceDescriptor, DeviceExecutionLimits, DeviceId, DeviceMetadata, DeviceType,
+use magnetar_core::ComputeDType;
+use magnetar_core::ProviderPressureLevel;
+use magnetar_core::operator::TensorLayoutKind;
+use magnetar_core::{
+    device::DeviceDescriptor, device::DeviceExecutionLimits, device::DeviceId,
+    device::DeviceMetadata, device::DeviceType,
 };
-use magnetar_runtime::kernel::KernelMemoryClass;
-use magnetar_runtime::operator::TensorLayoutKind;
+use magnetar_kernel::kernel::KernelMemoryClass;
 use std::sync::Arc;
 
 /// Builds this Runtime's stable identifier for the CUDA device at `ordinal`.

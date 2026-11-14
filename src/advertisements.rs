@@ -14,16 +14,19 @@
 /// attribute (`append-kv-history-in-place`).
 pub const KEY_COUNT_FEATURE: &str = "key-count";
 
-use magnetar_runtime::affinity::{DeviceBinding, ProviderBinding};
-use magnetar_runtime::capability::CapabilityVersion;
-use magnetar_runtime::compute::ComputeDType;
-use magnetar_runtime::device::DeviceId;
-use magnetar_runtime::kernel::{
-    KernelAdvertisement, KernelCancellationSupport, KernelId, KernelImplementationFamily,
-    KernelMemoryClass, KernelOperatorVersionRange,
+use magnetar_core::ComputeDType;
+use magnetar_core::capability::CapabilityVersion;
+use magnetar_core::device::DeviceId;
+use magnetar_core::{DeviceBinding, ProviderBinding};
+use magnetar_core::{
+    operator::OperatorFamily, operator::OperatorId,
+    operator::ROPE_BANDED_FREQUENCY_SCALING_FEATURE, operator::TensorLayoutKind,
+    operator::TensorRole,
 };
-use magnetar_runtime::operator::{
-    OperatorFamily, OperatorId, ROPE_BANDED_FREQUENCY_SCALING_FEATURE, TensorLayoutKind, TensorRole,
+use magnetar_kernel::{
+    kernel::KernelAdvertisement, kernel::KernelCancellationSupport, kernel::KernelId,
+    kernel::KernelImplementationFamily, kernel::KernelMemoryClass,
+    kernel::KernelOperatorVersionRange,
 };
 
 pub const CUDA_KERNEL_FAMILY: KernelImplementationFamily = KernelImplementationFamily::Cuda;

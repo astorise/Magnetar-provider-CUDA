@@ -15,7 +15,10 @@ rust-version = "1.98"
 [dependencies]
 # `path` resolves inside a checkout of the parent Magnetar repository;
 # `version` is what `cargo publish` records for crates.io consumers.
-magnetar-runtime = { version = "1.0.0", path = "../../magnetar-runtime" }
+magnetar-core = { version = "1.0.0", path = "../../magnetar-core" }
+magnetar-graph = { version = "1.0.0", path = "../../magnetar-graph" }
+magnetar-kernel = { version = "1.0.0", path = "../../magnetar-kernel" }
+magnetar-provider-api = { version = "1.0.0", path = "../../magnetar-provider-api" }
 # `dynamic-loading` dlopens libcuda/libnvrtc at runtime instead of linking
 # against them at build time -- required so this crate keeps building and
 # testing on CI's GPU-less, CUDA-Toolkit-less `submodule-integration` runner
@@ -41,6 +44,9 @@ magnetar-runtime = { version = "1.0.0", path = "../../magnetar-runtime" }
 cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-13000"] }
 
 [dev-dependencies]
+# The conformance suite, the `Runtime` facade and the Reference CPU oracle live
+# in `magnetar-runtime`; tests need them, the Provider itself does not.
+magnetar-runtime = { version = "1.0.0", path = "../../magnetar-runtime" }
 # Used only by conformance tests, as the numerical oracle `provider-roadmap`
 # requires optimized Providers be checked against (`design.md`'s
 # "conformance scope" decision): compares `CudaKernels` output directly to

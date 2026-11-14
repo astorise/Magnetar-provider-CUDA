@@ -13,8 +13,8 @@
 //! [`CudaKernels::download`] -- the same two host/device crossing points
 //! `CudaExecutor` itself uses, not an implicit per-kernel round trip.
 
-use magnetar_runtime::HostTensor;
-use magnetar_runtime::packed_weight::{PackedWeight, PackedWeightFormat};
+use magnetar_provider_api::HostTensor;
+use magnetar_provider_api::{packed_weight::PackedWeight, packed_weight::PackedWeightFormat};
 
 use crate::half_precision;
 use crate::kernels::{CudaDeviceBuffer, CudaHalfDType, CudaKernels};
@@ -1494,7 +1494,7 @@ fn rope_banded_frequency_scaling_matches_reference_cpu() {
     let Some(kernels) = kernels_or_skip() else {
         return;
     };
-    let scaling = magnetar_runtime::operator::RopeBandedFrequencyScaling {
+    let scaling = magnetar_core::operator::RopeBandedFrequencyScaling {
         factor: 8.0,
         low_freq_factor: 1.0,
         high_freq_factor: 4.0,
@@ -1795,7 +1795,7 @@ fn decode_matmul_bandwidth() {
 #[test]
 #[ignore = "GPU timing diagnostic"]
 fn moe_decode_kernel_times() {
-    use magnetar_runtime::reference_cpu::MoeRouting;
+    use magnetar_provider_api::MoeRouting;
     let Some(kernels) = kernels_or_skip() else {
         return;
     };
@@ -2828,7 +2828,7 @@ fn q8_packed_decode_step_captures_and_a_failed_capture_leaves_the_stream_usable(
 /// decode-sized step captures and replays exactly.
 #[test]
 fn moe_experts_match_reference_cpu_for_f32_and_packed_experts() {
-    use magnetar_runtime::reference_cpu::{MoeRouting, moe_experts};
+    use magnetar_provider_api::{MoeRouting, moe_experts};
     let Some(kernels) = kernels_or_skip() else {
         return;
     };
@@ -2916,8 +2916,8 @@ fn moe_experts_match_reference_cpu_for_f32_and_packed_experts() {
 /// shares add up to the whole layer.
 #[test]
 fn moe_expert_shares_match_reference_cpu_and_add_up() {
-    use magnetar_runtime::packed_weight::{PackedWeight, PackedWeightFormat};
-    use magnetar_runtime::reference_cpu::{MoeRouting, moe_experts, moe_experts_local};
+    use magnetar_provider_api::{MoeRouting, moe_experts, moe_experts_local};
+    use magnetar_provider_api::{packed_weight::PackedWeight, packed_weight::PackedWeightFormat};
     let Some(kernels) = kernels_or_skip() else {
         return;
     };
@@ -3015,12 +3015,12 @@ fn row_scale_and_sigmoid_match_reference_cpu() {
     };
     let x = activations(3, 40, 41);
     let scale = activations(3, 1, 42);
-    let expected = magnetar_runtime::reference_cpu::row_scale(&x, &scale).unwrap();
+    let expected = magnetar_provider_api::row_scale(&x, &scale).unwrap();
     let actual = kernels
         .row_scale(&upload(&kernels, &x), &upload(&kernels, &scale))
         .unwrap();
     assert_close_scaled(&download(&kernels, &actual), &expected, 1.0);
-    let expected = magnetar_runtime::reference_cpu::sigmoid(&x);
+    let expected = magnetar_provider_api::sigmoid(&x);
     let actual = kernels.sigmoid(&upload(&kernels, &x)).unwrap();
     assert_close_scaled(&download(&kernels, &actual), &expected, 1.0);
 }

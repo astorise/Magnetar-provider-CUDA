@@ -31,9 +31,9 @@
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
+use magnetar_provider_api::HostTensor;
 use magnetar_provider_cuda::CudaProvider;
 use magnetar_provider_cuda::kernels::{CudaDeviceBuffer, CudaKernels};
-use magnetar_runtime::HostTensor;
 
 /// A representative intermediate-activation size (`[sequence_length,
 /// hidden_size]`-shaped, matching the E2E fixture's own dimensions) --

@@ -23,9 +23,9 @@
 
 use std::sync::Arc;
 
-use magnetar_runtime::conformance::{
-    ProviderConformanceConfig, ProviderConformanceProfile, ProviderConformanceSuite,
-    ProviderConformanceTarget,
+use magnetar_runtime::{
+    conformance::ProviderConformanceConfig, conformance::ProviderConformanceProfile,
+    conformance::ProviderConformanceSuite, conformance::ProviderConformanceTarget,
 };
 
 use crate::provider::CudaProvider;
