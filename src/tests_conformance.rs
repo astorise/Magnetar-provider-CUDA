@@ -1949,6 +1949,8 @@ fn moe_decode_kernel_times() {
         ("Q3_K", 4096, 4096),
         ("Q3_K", 4096, 14_336),
         ("Q3_K", 14_336, 4096),
+        ("Q5_K", 4096, 14_336),
+        ("Q5_K", 14_336, 4096),
         ("Q2_K", 4096, 4096),
         ("Q2_K", 4096, 14_336),
         ("Q2_K", 14_336, 4096),
@@ -1967,6 +1969,7 @@ fn moe_decode_kernel_times() {
             "Q8_0" => (packed_q8(n, k, true, 73), q8_bytes(k * n)),
             "Q4_K" => (packed_q4k(n, k, true, 73), k * n / 256 * 144),
             "Q6_K" => (packed_q6k(n, k, true, 73), k * n / 256 * 210),
+            "Q5_K" => (packed_q5k(n, k, 73), k * n / 256 * 176),
             "Q3_K" => (
                 packed_low_bit(PackedWeightFormat::Q3K, n, k, 73),
                 k * n / 256 * 110,
@@ -2208,6 +2211,87 @@ fn q4k_packed_matmul_matches_reference_cpu() {
             .unwrap();
         assert_close_relative(&download(&kernels, &actual), &expected);
     }
+}
+
+/// A deterministic packed `Q5_K` matrix, stored transposed: `Q4_K`'s
+/// header and scales, then random high-bit planes and nibbles.
+fn packed_q5k(stored_rows: u64, stored_cols: u64, seed: u32) -> PackedWeight {
+    let blocks = stored_rows * stored_cols / 256;
+    let mut bytes = Vec::with_capacity(blocks as usize * 176);
+    let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state
+    };
+    for _ in 0..blocks {
+        for _ in 0..2 {
+            // f16 between about 2^-11 and 2^-7.
+            let exponent = 4 + (next() % 5) as u16;
+            let bits = (exponent << 10) | (next() % 1024) as u16;
+            bytes.extend(bits.to_le_bytes());
+        }
+        bytes.extend((0..172).map(|_| (next() % 256) as u8));
+    }
+    PackedWeight::new(
+        PackedWeightFormat::Q5K,
+        stored_rows,
+        stored_cols,
+        true,
+        bytes,
+    )
+    .unwrap()
+}
+
+/// The packed `Q5_K` weight: downloading or expanding it gives back exactly
+/// the Runtime's dequantization, and its decode matmul with a residual
+/// addend matches the Reference CPU on the rounded activations with int8
+/// activations, and on the f32 ones without (and for longer matmuls).
+#[test]
+fn q5k_packed_matmul_matches_reference_cpu() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let (k, n) = (1024_u64, 97_u64); // odd: a warp with one column left
+    let packed = packed_q5k(n, k, 51);
+    let dense = packed.dequantize();
+    let weight = kernels.upload_packed_weight(&packed).unwrap();
+    assert!(weight.is_q8() && weight.is_compact());
+    assert_eq!(weight.shape, vec![k, n]);
+    assert_eq!(download(&kernels, &weight).data, dense.data);
+    assert_eq!(
+        download(&kernels, &kernels.expand(&weight).unwrap()).data,
+        dense.data
+    );
+    for int8 in [true, false] {
+        kernels.set_int8_activations(int8);
+        for m in [1_u64, 3, 9, 65] {
+            let a = activations(m, k, m as u32 + 50);
+            let seen = if int8 && m <= 64 {
+                int8_rounded(&a)
+            } else {
+                a.clone()
+            };
+            let residual = activations(m, n, 52);
+            let expected = magnetar_provider_cpu::add(
+                &magnetar_provider_cpu::matmul(&seen, &dense, false, false).unwrap(),
+                &residual,
+            )
+            .unwrap();
+            let actual = kernels
+                .matmul_residual(
+                    &upload(&kernels, &a),
+                    &weight,
+                    &upload(&kernels, &residual),
+                    false,
+                    false,
+                )
+                .unwrap();
+            assert_close_relative(&download(&kernels, &actual), &expected);
+        }
+    }
+    kernels.set_int8_activations(false);
 }
 
 /// A deterministic packed `Q6_K` matrix of `stored_rows` x `stored_cols`

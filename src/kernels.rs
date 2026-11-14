@@ -1424,8 +1424,12 @@ impl CudaKernels {
                 }),
             });
         }
-        if weight.format() == PackedWeightFormat::Q4K {
-            // Kept as stored: the Kernels decode the super-blocks.
+        if matches!(
+            weight.format(),
+            PackedWeightFormat::Q4K | PackedWeightFormat::Q5K
+        ) {
+            // Kept as stored: the Kernels decode the super-blocks (144 and
+            // 176 bytes, both multiples of 16).
             let bytes: Vec<i8> = weight.bytes().iter().map(|&byte| byte as i8).collect();
             let quants = self.stream.clone_htod(&bytes)?;
             let scales = self.stream.alloc_zeros::<f32>(1)?;
@@ -1438,7 +1442,7 @@ impl CudaKernels {
                 q8: Some(CudaQ8Weight {
                     quants,
                     scales,
-                    format: PackedWeightFormat::Q4K,
+                    format: weight.format(),
                     stored_rows: weight.stored_rows(),
                     stored_cols: weight.stored_cols(),
                     transposed: weight.transposed(),
@@ -1676,8 +1680,12 @@ impl CudaKernels {
                     .arg(&transposed);
                 unsafe { args.launch(LaunchConfig::for_num_elems(elements as u32)) }?;
             }
-            PackedWeightFormat::Q4K => {
-                let func = self.function("q4k_dequantize_kernel")?;
+            PackedWeightFormat::Q4K | PackedWeightFormat::Q5K => {
+                let func = self.function(if q8.format == PackedWeightFormat::Q5K {
+                    "q5k_dequantize_kernel"
+                } else {
+                    "q4k_dequantize_kernel"
+                })?;
                 let mut args = self.stream.launch_builder(&func);
                 args.arg(&q8.quants)
                     .arg(&mut out)
@@ -3326,8 +3334,9 @@ impl CudaKernels {
         })
     }
 
-    /// `q4k_matmul_rows_kernel`: `a` (`m` contiguous rows of `k`) times the
-    /// packed `Q4_K`, transposed-storage weight `q4k` (`[k, n]` logically).
+    /// `q4k_matmul_rows_kernel` (or its `Q5_K` twin): `a` (`m` contiguous
+    /// rows of `k`) times the packed `Q4_K` or `Q5_K`, transposed-storage
+    /// weight `q4k` (`[k, n]` logically).
     fn q4k_matmul_rows(
         &self,
         a: &CudaDeviceBuffer,
@@ -3345,10 +3354,12 @@ impl CudaKernels {
         };
         let int8 = self.quantize_activations(a, m, k)?;
         let int8 = int8.as_ref().and_then(|guard| guard.as_ref());
-        let func = self.function(if int8.is_some() {
-            "q4k_matmul_rows_int8_kernel"
-        } else {
-            "q4k_matmul_rows_kernel"
+        let q5k = q4k.format == PackedWeightFormat::Q5K;
+        let func = self.function(match (q5k, int8.is_some()) {
+            (false, true) => "q4k_matmul_rows_int8_kernel",
+            (false, false) => "q4k_matmul_rows_kernel",
+            (true, true) => "q5k_matmul_rows_int8_kernel",
+            (true, false) => "q5k_matmul_rows_kernel",
         })?;
         let mut args = self.stream.launch_builder(&func);
         match int8 {
@@ -3713,7 +3724,9 @@ impl CudaKernels {
             if q8.transposed && !transpose_a && !transpose_b && m <= Q8_MATMUL_MAX_ROWS {
                 return match q8.format {
                     PackedWeightFormat::Q8_0 => self.q8_matmul_rows(a, q8, m, k, n, addend),
-                    PackedWeightFormat::Q4K => self.q4k_matmul_rows(a, q8, m, k, n, addend),
+                    PackedWeightFormat::Q4K | PackedWeightFormat::Q5K => {
+                        self.q4k_matmul_rows(a, q8, m, k, n, addend)
+                    }
                     PackedWeightFormat::Q6K => self.q6k_matmul_rows(a, q8, m, k, n, addend),
                     PackedWeightFormat::Iq2Xxs
                     | PackedWeightFormat::Iq2Xs
