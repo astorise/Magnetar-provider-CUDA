@@ -209,7 +209,13 @@ extern "C" __global__ void q8_matmul_rows_kernel(
     unsigned long long n,
     const float* addend,
     int addend_mode
-) {
+,
+    // replay-bucketed-prefill: trailing padding rows a replayed prefill
+    // skips (null outside such a capture).
+    const unsigned long long* skipped_rows) {
+    if (skipped_rows) {
+        m -= *skipped_rows;
+    }
     unsigned long long col = (unsigned long long)blockIdx.x * Q8_MATMUL_WARPS + threadIdx.y;
     unsigned long long first_row = (unsigned long long)blockIdx.y * Q8_MATMUL_ROWS;
     if (col >= n || first_row >= m) {
@@ -270,7 +276,13 @@ extern "C" __global__ void q8_gated_matmul_rows_kernel(
     unsigned long long m,
     unsigned long long k,
     unsigned long long n
-) {
+,
+    // replay-bucketed-prefill: trailing padding rows a replayed prefill
+    // skips (null outside such a capture).
+    const unsigned long long* skipped_rows) {
+    if (skipped_rows) {
+        m -= *skipped_rows;
+    }
     unsigned long long col = (unsigned long long)blockIdx.x * Q8_MATMUL_WARPS + threadIdx.y;
     unsigned long long first_row = (unsigned long long)blockIdx.y * Q8_MATMUL_ROWS;
     if (col >= n || first_row >= m) {
@@ -2483,7 +2495,13 @@ extern "C" __global__ void q4k_matmul_rows_kernel(
     unsigned long long n,
     const float* addend,
     int addend_mode
-) {
+,
+    // replay-bucketed-prefill: trailing padding rows a replayed prefill
+    // skips (null outside such a capture).
+    const unsigned long long* skipped_rows) {
+    if (skipped_rows) {
+        m -= *skipped_rows;
+    }
     unsigned long long col0 =
         ((unsigned long long)blockIdx.x * Q8_MATMUL_WARPS + threadIdx.y) * Q4K_COLS;
     unsigned long long first_row = (unsigned long long)blockIdx.y * Q8_MATMUL_ROWS;
@@ -2630,7 +2648,13 @@ extern "C" __global__ void q4k_gated_matmul_rows_kernel(
     unsigned long long m,
     unsigned long long k,
     unsigned long long n
-) {
+,
+    // replay-bucketed-prefill: trailing padding rows a replayed prefill
+    // skips (null outside such a capture).
+    const unsigned long long* skipped_rows) {
+    if (skipped_rows) {
+        m -= *skipped_rows;
+    }
     unsigned long long col = (unsigned long long)blockIdx.x * Q8_MATMUL_WARPS + threadIdx.y;
     unsigned long long first_row = (unsigned long long)blockIdx.y * Q8_MATMUL_ROWS;
     if (col >= n || first_row >= m) {
@@ -2749,7 +2773,13 @@ extern "C" __global__ void q6k_matmul_rows_kernel(
     unsigned long long n,
     const float* addend,
     int addend_mode
-) {
+,
+    // replay-bucketed-prefill: trailing padding rows a replayed prefill
+    // skips (null outside such a capture).
+    const unsigned long long* skipped_rows) {
+    if (skipped_rows) {
+        m -= *skipped_rows;
+    }
     unsigned long long col0 =
         ((unsigned long long)blockIdx.x * Q8_MATMUL_WARPS + threadIdx.y) * Q6K_COLS;
     unsigned long long first_row = (unsigned long long)blockIdx.y * Q8_MATMUL_ROWS;
@@ -2923,7 +2953,13 @@ extern "C" __global__ void q8_matmul_rows_int8_kernel(
     unsigned long long n,
     const float* addend,
     int addend_mode
-) {
+,
+    // replay-bucketed-prefill: trailing padding rows a replayed prefill
+    // skips (null outside such a capture).
+    const unsigned long long* skipped_rows) {
+    if (skipped_rows) {
+        m -= *skipped_rows;
+    }
     unsigned long long col = (unsigned long long)blockIdx.x * Q8_MATMUL_WARPS + threadIdx.y;
     unsigned long long first_row = (unsigned long long)blockIdx.y * Q8_MATMUL_ROWS;
     if (col >= n || first_row >= m) {
@@ -2983,7 +3019,13 @@ extern "C" __global__ void q8_gated_matmul_rows_int8_kernel(
     unsigned long long m,
     unsigned long long k,
     unsigned long long n
-) {
+,
+    // replay-bucketed-prefill: trailing padding rows a replayed prefill
+    // skips (null outside such a capture).
+    const unsigned long long* skipped_rows) {
+    if (skipped_rows) {
+        m -= *skipped_rows;
+    }
     unsigned long long col = (unsigned long long)blockIdx.x * Q8_MATMUL_WARPS + threadIdx.y;
     unsigned long long first_row = (unsigned long long)blockIdx.y * Q8_MATMUL_ROWS;
     if (col >= n || first_row >= m) {
@@ -3080,7 +3122,13 @@ extern "C" __global__ void q4k_matmul_rows_int8_kernel(
     unsigned long long n,
     const float* addend,
     int addend_mode
-) {
+,
+    // replay-bucketed-prefill: trailing padding rows a replayed prefill
+    // skips (null outside such a capture).
+    const unsigned long long* skipped_rows) {
+    if (skipped_rows) {
+        m -= *skipped_rows;
+    }
     unsigned long long col0 =
         ((unsigned long long)blockIdx.x * Q8_MATMUL_WARPS + threadIdx.y) * Q4K_COLS;
     unsigned long long first_row = (unsigned long long)blockIdx.y * Q8_MATMUL_ROWS;
@@ -3161,7 +3209,13 @@ extern "C" __global__ void q4k_gated_matmul_rows_int8_kernel(
     unsigned long long m,
     unsigned long long k,
     unsigned long long n
-) {
+,
+    // replay-bucketed-prefill: trailing padding rows a replayed prefill
+    // skips (null outside such a capture).
+    const unsigned long long* skipped_rows) {
+    if (skipped_rows) {
+        m -= *skipped_rows;
+    }
     unsigned long long col = (unsigned long long)blockIdx.x * Q8_MATMUL_WARPS + threadIdx.y;
     unsigned long long first_row = (unsigned long long)blockIdx.y * Q8_MATMUL_ROWS;
     if (col >= n || first_row >= m) {
@@ -3230,7 +3284,13 @@ extern "C" __global__ void q6k_matmul_rows_int8_kernel(
     unsigned long long n,
     const float* addend,
     int addend_mode
-) {
+,
+    // replay-bucketed-prefill: trailing padding rows a replayed prefill
+    // skips (null outside such a capture).
+    const unsigned long long* skipped_rows) {
+    if (skipped_rows) {
+        m -= *skipped_rows;
+    }
     unsigned long long col0 =
         ((unsigned long long)blockIdx.x * Q8_MATMUL_WARPS + threadIdx.y) * Q6K_COLS;
     unsigned long long first_row = (unsigned long long)blockIdx.y * Q8_MATMUL_ROWS;
@@ -3479,7 +3539,13 @@ extern "C" __global__ void lowk_matmul_rows_int8_kernel(
     unsigned long long n,
     const float* addend,
     int addend_mode
-) {
+,
+    // replay-bucketed-prefill: trailing padding rows a replayed prefill
+    // skips (null outside such a capture).
+    const unsigned long long* skipped_rows) {
+    if (skipped_rows) {
+        m -= *skipped_rows;
+    }
     unsigned long long col0 =
         ((unsigned long long)blockIdx.x * Q8_MATMUL_WARPS + threadIdx.y) * LOWK_COLS;
     unsigned long long first_row = (unsigned long long)blockIdx.y * Q8_MATMUL_ROWS;
@@ -3559,7 +3625,13 @@ extern "C" __global__ void lowk_gated_matmul_rows_int8_kernel(
     unsigned long long m,
     unsigned long long k,
     unsigned long long n
-) {
+,
+    // replay-bucketed-prefill: trailing padding rows a replayed prefill
+    // skips (null outside such a capture).
+    const unsigned long long* skipped_rows) {
+    if (skipped_rows) {
+        m -= *skipped_rows;
+    }
     unsigned long long col = (unsigned long long)blockIdx.x * Q8_MATMUL_WARPS + threadIdx.y;
     unsigned long long first_row = (unsigned long long)blockIdx.y * Q8_MATMUL_ROWS;
     if (col >= n || first_row >= m) {
@@ -3712,7 +3784,13 @@ extern "C" __global__ void iq4_matmul_rows_int8_kernel(
     unsigned long long n,
     const float* addend,
     int addend_mode
-) {
+,
+    // replay-bucketed-prefill: trailing padding rows a replayed prefill
+    // skips (null outside such a capture).
+    const unsigned long long* skipped_rows) {
+    if (skipped_rows) {
+        m -= *skipped_rows;
+    }
     unsigned long long col = (unsigned long long)blockIdx.x * Q8_MATMUL_WARPS + threadIdx.y;
     unsigned long long first_row = (unsigned long long)blockIdx.y * Q8_MATMUL_ROWS;
     if (col >= n || first_row >= m) {
@@ -3775,7 +3853,13 @@ extern "C" __global__ void iq4_gated_matmul_rows_int8_kernel(
     unsigned long long m,
     unsigned long long k,
     unsigned long long n
-) {
+,
+    // replay-bucketed-prefill: trailing padding rows a replayed prefill
+    // skips (null outside such a capture).
+    const unsigned long long* skipped_rows) {
+    if (skipped_rows) {
+        m -= *skipped_rows;
+    }
     unsigned long long col = (unsigned long long)blockIdx.x * Q8_MATMUL_WARPS + threadIdx.y;
     unsigned long long first_row = (unsigned long long)blockIdx.y * Q8_MATMUL_ROWS;
     if (col >= n || first_row >= m) {
@@ -4687,7 +4771,13 @@ extern "C" __global__ void iq_matmul_rows_int8_kernel(
     unsigned long long n,
     const float* addend,
     int addend_mode
-) {
+,
+    // replay-bucketed-prefill: trailing padding rows a replayed prefill
+    // skips (null outside such a capture).
+    const unsigned long long* skipped_rows) {
+    if (skipped_rows) {
+        m -= *skipped_rows;
+    }
     __shared__ unsigned int grid[2048];
     iq_load_grid(format, grid);
     unsigned long long col0 =
@@ -4767,7 +4857,13 @@ extern "C" __global__ void iq_gated_matmul_rows_int8_kernel(
     unsigned long long m,
     unsigned long long k,
     unsigned long long n
-) {
+,
+    // replay-bucketed-prefill: trailing padding rows a replayed prefill
+    // skips (null outside such a capture).
+    const unsigned long long* skipped_rows) {
+    if (skipped_rows) {
+        m -= *skipped_rows;
+    }
     __shared__ unsigned int grid[2048];
     iq_load_grid(format, grid);
     unsigned long long col = (unsigned long long)blockIdx.x * Q8_MATMUL_WARPS + threadIdx.y;
@@ -4986,7 +5082,13 @@ extern "C" __global__ void q5k_matmul_rows_kernel(
     unsigned long long n,
     const float* addend,
     int addend_mode
-) {
+,
+    // replay-bucketed-prefill: trailing padding rows a replayed prefill
+    // skips (null outside such a capture).
+    const unsigned long long* skipped_rows) {
+    if (skipped_rows) {
+        m -= *skipped_rows;
+    }
     unsigned long long col0 =
         ((unsigned long long)blockIdx.x * Q8_MATMUL_WARPS + threadIdx.y) * Q4K_COLS;
     unsigned long long first_row = (unsigned long long)blockIdx.y * Q8_MATMUL_ROWS;
@@ -5038,7 +5140,13 @@ extern "C" __global__ void q5k_matmul_rows_int8_kernel(
     unsigned long long n,
     const float* addend,
     int addend_mode
-) {
+,
+    // replay-bucketed-prefill: trailing padding rows a replayed prefill
+    // skips (null outside such a capture).
+    const unsigned long long* skipped_rows) {
+    if (skipped_rows) {
+        m -= *skipped_rows;
+    }
     unsigned long long col0 =
         ((unsigned long long)blockIdx.x * Q8_MATMUL_WARPS + threadIdx.y) * Q4K_COLS;
     unsigned long long first_row = (unsigned long long)blockIdx.y * Q8_MATMUL_ROWS;

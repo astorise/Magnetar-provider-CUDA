@@ -313,6 +313,11 @@ impl CudaDeviceBuffer {
 /// `q8_matmul_rows_kernel` (decode steps and short prompts); a longer
 /// matmul dequantizes the weight to f32 for the duration of the call.
 const Q8_MATMUL_MAX_ROWS: u64 = 64;
+
+/// The capture attribute whose replay offset is how many trailing padding
+/// rows a replayed bucketed prefill skips in the packed row matmuls
+/// (`replay-bucketed-prefill`): their outputs are never read.
+pub const PADDING_ROWS_ATTRIBUTE: &str = "padding_rows";
 /// Output columns per warp of `q4k_matmul_rows_kernel` (`Q4K_COLS`) and
 /// `q6k_matmul_rows_kernel` (`Q6K_COLS`).
 const Q4K_MATMUL_COLS: u64 = 2;
@@ -1171,6 +1176,18 @@ impl CudaKernels {
             }
             _ => 0,
         }
+    }
+
+    /// While capturing a bucketed prefill (`replay-bucketed-prefill`), the
+    /// device address of how many of an `m`-row launch's trailing rows a
+    /// replay skips, after recording that at most `m - 1` may be. Zero (no
+    /// row skipped) otherwise, and for a one-row launch: a prefill's LM
+    /// head reads the one gathered logits row, which no replay skips.
+    fn padding_rows(&self, m: u64) -> u64 {
+        if m <= 1 {
+            return 0;
+        }
+        self.advancing_offset(PADDING_ROWS_ATTRIBUTE, m - 1)
     }
 
     fn is_capturing(&self) -> bool {
@@ -2978,6 +2995,7 @@ impl CudaKernels {
             if let Some(scratch) = int8.as_ref().and_then(|guard| guard.as_ref()) {
                 let mut out_dev = self.alloc_output((m * b_cols) as usize)?;
                 let func = self.function("iq_gated_matmul_rows_int8_kernel")?;
+                let skipped_rows = self.padding_rows(m);
                 let mut args = self.stream.launch_builder(&func);
                 args.arg(&format)
                     .arg(&scratch.values)
@@ -2990,6 +3008,7 @@ impl CudaKernels {
                     .arg(&m)
                     .arg(&k)
                     .arg(&b_cols);
+                args.arg(&skipped_rows);
                 let config = LaunchConfig {
                     grid_dim: (
                         b_cols.div_ceil(u64::from(Q8_MATMUL_WARPS)) as u32,
@@ -3029,6 +3048,7 @@ impl CudaKernels {
                 let gate_sub = gate_iq.quants.slice(iq4_subscale_offset(gate_iq)..);
                 let up_sub = up_iq.quants.slice(iq4_subscale_offset(up_iq)..);
                 let func = self.function("iq4_gated_matmul_rows_int8_kernel")?;
+                let skipped_rows = self.padding_rows(m);
                 let mut args = self.stream.launch_builder(&func);
                 args.arg(&format)
                     .arg(&scratch.values)
@@ -3043,6 +3063,7 @@ impl CudaKernels {
                     .arg(&m)
                     .arg(&k)
                     .arg(&b_cols);
+                args.arg(&skipped_rows);
                 let config = LaunchConfig {
                     grid_dim: (
                         b_cols.div_ceil(u64::from(Q8_MATMUL_WARPS)) as u32,
@@ -3080,6 +3101,7 @@ impl CudaKernels {
                 let mut out_dev = self.alloc_output((m * b_cols) as usize)?;
                 let format = low_bit_format(gate_low.format);
                 let func = self.function("lowk_gated_matmul_rows_int8_kernel")?;
+                let skipped_rows = self.padding_rows(m);
                 let mut args = self.stream.launch_builder(&func);
                 args.arg(&format)
                     .arg(&scratch.values)
@@ -3092,6 +3114,7 @@ impl CudaKernels {
                     .arg(&m)
                     .arg(&k)
                     .arg(&b_cols);
+                args.arg(&skipped_rows);
                 let config = LaunchConfig {
                     grid_dim: (
                         b_cols.div_ceil(u64::from(Q8_MATMUL_WARPS)) as u32,
@@ -3129,6 +3152,7 @@ impl CudaKernels {
             } else {
                 "q4k_gated_matmul_rows_kernel"
             })?;
+            let skipped_rows = self.padding_rows(m);
             let mut args = self.stream.launch_builder(&func);
             match int8 {
                 Some(scratch) => args.arg(&scratch.values).arg(&scratch.scales),
@@ -3140,6 +3164,7 @@ impl CudaKernels {
                 .arg(&m)
                 .arg(&k)
                 .arg(&b_cols);
+            args.arg(&skipped_rows);
             let config = LaunchConfig {
                 grid_dim: (
                     b_cols.div_ceil(u64::from(Q8_MATMUL_WARPS)) as u32,
@@ -3303,6 +3328,7 @@ impl CudaKernels {
         } else {
             "q8_matmul_rows_kernel"
         })?;
+        let skipped_rows = self.padding_rows(m);
         let mut args = self.stream.launch_builder(&func);
         match int8 {
             Some(scratch) => args.arg(&scratch.values).arg(&scratch.scales),
@@ -3316,6 +3342,7 @@ impl CudaKernels {
             .arg(&n)
             .arg(&addend_buffer.slice)
             .arg(&addend_mode);
+        args.arg(&skipped_rows);
         let config = LaunchConfig {
             grid_dim: (
                 n.div_ceil(u64::from(Q8_MATMUL_WARPS)) as u32,
@@ -3361,6 +3388,7 @@ impl CudaKernels {
             (true, true) => "q5k_matmul_rows_int8_kernel",
             (true, false) => "q5k_matmul_rows_kernel",
         })?;
+        let skipped_rows = self.padding_rows(m);
         let mut args = self.stream.launch_builder(&func);
         match int8 {
             Some(scratch) => args.arg(&scratch.values).arg(&scratch.scales),
@@ -3373,6 +3401,7 @@ impl CudaKernels {
             .arg(&n)
             .arg(&addend_buffer.slice)
             .arg(&addend_mode);
+        args.arg(&skipped_rows);
         let config = LaunchConfig {
             grid_dim: (
                 n.div_ceil(u64::from(Q8_MATMUL_WARPS) * Q4K_MATMUL_COLS) as u32,
@@ -3414,6 +3443,7 @@ impl CudaKernels {
         };
         let format = iq_format(weight.format).expect("an IQ2/IQ3 format");
         let func = self.function("iq_matmul_rows_int8_kernel")?;
+        let skipped_rows = self.padding_rows(m);
         let mut args = self.stream.launch_builder(&func);
         args.arg(&format)
             .arg(&scratch.values)
@@ -3426,6 +3456,7 @@ impl CudaKernels {
             .arg(&n)
             .arg(&addend_buffer.slice)
             .arg(&addend_mode);
+        args.arg(&skipped_rows);
         let config = LaunchConfig {
             grid_dim: (
                 n.div_ceil(u64::from(Q8_MATMUL_WARPS) * IQ_MATMUL_COLS) as u32,
@@ -3468,6 +3499,7 @@ impl CudaKernels {
         let format = iq4_format(weight.format);
         let subscales = weight.quants.slice(iq4_subscale_offset(weight)..);
         let func = self.function("iq4_matmul_rows_int8_kernel")?;
+        let skipped_rows = self.padding_rows(m);
         let mut args = self.stream.launch_builder(&func);
         args.arg(&format)
             .arg(&scratch.values)
@@ -3481,6 +3513,7 @@ impl CudaKernels {
             .arg(&n)
             .arg(&addend_buffer.slice)
             .arg(&addend_mode);
+        args.arg(&skipped_rows);
         let config = LaunchConfig {
             grid_dim: (
                 n.div_ceil(u64::from(Q8_MATMUL_WARPS)) as u32,
@@ -3522,6 +3555,7 @@ impl CudaKernels {
         };
         let format = low_bit_format(weight.format);
         let func = self.function("lowk_matmul_rows_int8_kernel")?;
+        let skipped_rows = self.padding_rows(m);
         let mut args = self.stream.launch_builder(&func);
         args.arg(&format)
             .arg(&scratch.values)
@@ -3534,6 +3568,7 @@ impl CudaKernels {
             .arg(&n)
             .arg(&addend_buffer.slice)
             .arg(&addend_mode);
+        args.arg(&skipped_rows);
         let config = LaunchConfig {
             grid_dim: (
                 n.div_ceil(u64::from(Q8_MATMUL_WARPS) * LOW_BIT_MATMUL_COLS) as u32,
@@ -3576,6 +3611,7 @@ impl CudaKernels {
         } else {
             "q6k_matmul_rows_kernel"
         })?;
+        let skipped_rows = self.padding_rows(m);
         let mut args = self.stream.launch_builder(&func);
         match int8 {
             Some(scratch) => args.arg(&scratch.values).arg(&scratch.scales),
@@ -3589,6 +3625,7 @@ impl CudaKernels {
             .arg(&n)
             .arg(&addend_buffer.slice)
             .arg(&addend_mode);
+        args.arg(&skipped_rows);
         let config = LaunchConfig {
             grid_dim: (
                 n.div_ceil(u64::from(Q8_MATMUL_WARPS) * Q6K_MATMUL_COLS) as u32,
@@ -3626,6 +3663,7 @@ impl CudaKernels {
         } else {
             "q8_gated_matmul_rows_kernel"
         })?;
+        let skipped_rows = self.padding_rows(m);
         let mut args = self.stream.launch_builder(&func);
         match int8 {
             Some(scratch) => args.arg(&scratch.values).arg(&scratch.scales),
@@ -3639,6 +3677,7 @@ impl CudaKernels {
             .arg(&m)
             .arg(&k)
             .arg(&n);
+        args.arg(&skipped_rows);
         let config = LaunchConfig {
             grid_dim: (
                 n.div_ceil(u64::from(Q8_MATMUL_WARPS)) as u32,
@@ -4049,16 +4088,20 @@ impl CudaKernels {
             );
         }
 
+        // Several query rows have no replay offset: a captured one (a
+        // bucketed prefill, `replay-bucketed-prefill`) replays only at the
+        // key count it was captured with.
+        if key_count.is_some() {
+            self.advancing_offset("key_count", 0);
+        }
         // Several query rows, 64- or 128-dimension heads, on a Device with
         // Tensor Cores: `attention_tcp_kernel` / `attention_tcp128_kernel`
-        // on K and V split once, when their rows align. Otherwise (and
-        // while capturing) the tiled Kernel compiled for the head
-        // dimension.
+        // on K and V split once, when their rows align. Otherwise the tiled
+        // Kernel compiled for the head dimension.
         let kv_len = kv_seq_len * kv_model_dim;
         if seq_len >= 16
             && kv_model_dim % TCP_ALIGN == 0
             && kv_len > 0
-            && !self.is_capturing()
             && let Some((name, shared_bytes)) = tensor_core_prefill_attention(head_dimension)
             && let Some(func) = self.tensor_function(name)
             && func
@@ -4120,7 +4163,7 @@ impl CudaKernels {
             128 => Some("attention_tiled_32_kernel"),
             _ => None,
         };
-        if let Some(tiled) = tiled.filter(|_| seq_len > 1 && !self.is_capturing()) {
+        if let Some(tiled) = tiled.filter(|_| seq_len > 1) {
             let overflow = || {
                 CudaError::new(
                     CudaErrorCode::ShapeUnsupported,

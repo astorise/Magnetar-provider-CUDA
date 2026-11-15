@@ -3124,3 +3124,108 @@ fn a_step_captured_across_two_gpus_replays_its_reduction() {
         (0..64).map(|v| 15.0 * v as f32).collect::<Vec<_>>()
     );
 }
+
+/// `replay-bucketed-prefill`: a packed row matmul captured with the
+/// `padding_rows` attribute skips a replay's trailing padding rows. Its
+/// real rows match an uncaptured matmul exactly, its skipped rows keep
+/// what they held, and the capture allows at most `m - 1` skipped rows.
+/// With f32 and with int8 activations.
+#[test]
+fn a_captured_packed_matmul_skips_a_replays_padding_rows() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let (m, k, n) = (8_u64, 512_u64, 256_u64);
+    let weight = kernels
+        .upload_packed_weight(&packed_q4k(n, k, true, 81))
+        .unwrap();
+    for int8 in [false, true] {
+        kernels.set_int8_activations(int8);
+        let first = activations(m, k, 82);
+        let second = activations(m, k, 83);
+        let expected = |values: &HostTensor| {
+            let a = upload(&kernels, values);
+            download(
+                &kernels,
+                &kernels.matmul(&a, &weight, false, false).unwrap(),
+            )
+        };
+        let (expected_first, expected_second) = (expected(&first), expected(&second));
+        let mut a = upload(&kernels, &first);
+        let out = kernels
+            .stream()
+            .alloc_zeros::<f32>((m * n) as usize)
+            .unwrap();
+        let offered = kernels.offer_output(Some(out));
+        kernels
+            .begin_capture(std::collections::BTreeSet::from([
+                crate::kernels::PADDING_ROWS_ATTRIBUTE.to_string(),
+            ]))
+            .unwrap();
+        let captured = kernels.matmul(&a, &weight, false, false).unwrap();
+        drop(offered);
+        let mut graph = kernels.end_capture().unwrap();
+        assert_eq!(graph.max_offset, m - 1, "int8 {int8}");
+        kernels.launch_captured(&mut graph, 0).unwrap();
+        assert_eq!(
+            download(&kernels, &captured).data,
+            expected_first.data,
+            "int8 {int8}"
+        );
+
+        // Three padding rows: the five real rows are the second input's,
+        // the last three still the first's.
+        let skipped = 3;
+        kernels
+            .stream()
+            .memcpy_htod(&second.data, &mut a.slice)
+            .unwrap();
+        kernels.launch_captured(&mut graph, skipped).unwrap();
+        let replayed = download(&kernels, &captured).data;
+        let real = ((m - skipped) * n) as usize;
+        assert_eq!(
+            replayed[..real],
+            expected_second.data[..real],
+            "int8 {int8}"
+        );
+        assert_eq!(replayed[real..], expected_first.data[real..], "int8 {int8}");
+
+        // A one-row launch in the same capture skips nothing and leaves
+        // the bound to the many-row ones.
+        let row = upload(&kernels, &activations(1, k, 84));
+        let expected_row = download(
+            &kernels,
+            &kernels.matmul(&row, &weight, false, false).unwrap(),
+        );
+        let rows_out = kernels
+            .stream()
+            .alloc_zeros::<f32>((m * n) as usize)
+            .unwrap();
+        let row_out = kernels.stream().alloc_zeros::<f32>(n as usize).unwrap();
+        kernels
+            .begin_capture(std::collections::BTreeSet::from([
+                crate::kernels::PADDING_ROWS_ATTRIBUTE.to_string(),
+            ]))
+            .unwrap();
+        let offered = kernels.offer_output(Some(rows_out));
+        let captured_rows = kernels.matmul(&a, &weight, false, false).unwrap();
+        drop(offered);
+        let offered = kernels.offer_output(Some(row_out));
+        let captured_row = kernels.matmul(&row, &weight, false, false).unwrap();
+        drop(offered);
+        let mut graph = kernels.end_capture().unwrap();
+        assert_eq!(graph.max_offset, m - 1, "int8 {int8}");
+        kernels.launch_captured(&mut graph, skipped).unwrap();
+        assert_eq!(
+            download(&kernels, &captured_row).data,
+            expected_row.data,
+            "int8 {int8}"
+        );
+        let replayed = download(&kernels, &captured_rows).data;
+        assert_eq!(
+            replayed[..real],
+            expected_second.data[..real],
+            "int8 {int8}"
+        );
+    }
+}
