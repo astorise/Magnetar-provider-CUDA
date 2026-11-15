@@ -1181,9 +1181,13 @@ impl CudaKernels {
     /// While capturing a bucketed prefill (`replay-bucketed-prefill`), the
     /// device address of how many of an `m`-row launch's trailing rows a
     /// replay skips, after recording that at most `m - 1` may be. Zero (no
-    /// row skipped) otherwise.
+    /// row skipped) otherwise, and for a one-row launch: a prefill's LM
+    /// head reads the one gathered logits row, which no replay skips.
     fn padding_rows(&self, m: u64) -> u64 {
-        self.advancing_offset(PADDING_ROWS_ATTRIBUTE, m.saturating_sub(1))
+        if m <= 1 {
+            return 0;
+        }
+        self.advancing_offset(PADDING_ROWS_ATTRIBUTE, m - 1)
     }
 
     fn is_capturing(&self) -> bool {

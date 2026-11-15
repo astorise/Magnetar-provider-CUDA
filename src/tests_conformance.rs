@@ -3189,5 +3189,43 @@ fn a_captured_packed_matmul_skips_a_replays_padding_rows() {
             "int8 {int8}"
         );
         assert_eq!(replayed[real..], expected_first.data[real..], "int8 {int8}");
+
+        // A one-row launch in the same capture skips nothing and leaves
+        // the bound to the many-row ones.
+        let row = upload(&kernels, &activations(1, k, 84));
+        let expected_row = download(
+            &kernels,
+            &kernels.matmul(&row, &weight, false, false).unwrap(),
+        );
+        let rows_out = kernels
+            .stream()
+            .alloc_zeros::<f32>((m * n) as usize)
+            .unwrap();
+        let row_out = kernels.stream().alloc_zeros::<f32>(n as usize).unwrap();
+        kernels
+            .begin_capture(std::collections::BTreeSet::from([
+                crate::kernels::PADDING_ROWS_ATTRIBUTE.to_string(),
+            ]))
+            .unwrap();
+        let offered = kernels.offer_output(Some(rows_out));
+        let captured_rows = kernels.matmul(&a, &weight, false, false).unwrap();
+        drop(offered);
+        let offered = kernels.offer_output(Some(row_out));
+        let captured_row = kernels.matmul(&row, &weight, false, false).unwrap();
+        drop(offered);
+        let mut graph = kernels.end_capture().unwrap();
+        assert_eq!(graph.max_offset, m - 1, "int8 {int8}");
+        kernels.launch_captured(&mut graph, skipped).unwrap();
+        assert_eq!(
+            download(&kernels, &captured_row).data,
+            expected_row.data,
+            "int8 {int8}"
+        );
+        let replayed = download(&kernels, &captured_rows).data;
+        assert_eq!(
+            replayed[..real],
+            expected_second.data[..real],
+            "int8 {int8}"
+        );
     }
 }
