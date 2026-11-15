@@ -169,6 +169,12 @@ fn dispatch(
         fixture.affinity.clone(),
     );
     for (id, tensor_descriptor) in &inputs {
+        // Selection matches each input's dtype, as the engine's
+        // `merge_graph_edge_requirements` does: without it an `f32` `mul`
+        // ties with `mul-half`, whose stable key sorts first.
+        if let DTypeDescriptor::Portable(dtype) = &tensor_descriptor.dtype {
+            request.dtype_requirements.insert(*dtype);
+        }
         request = request.with_input(KernelResource::new(
             TensorResourceDescriptor::new(
                 id.clone(),
