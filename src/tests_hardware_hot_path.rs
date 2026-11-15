@@ -157,6 +157,7 @@ fn dispatch(
         "rmsnorm" => OperatorFamily::Normalization,
         "rope" => OperatorFamily::PositionEncoding,
         "add" | "mul" => OperatorFamily::Tensor,
+        "attention" => OperatorFamily::Attention,
         other => panic!("{step_name}: no OperatorFamily mapping for '{other}'"),
     };
     let operator = OperatorId::magnetar(operator_name, 1, family);
@@ -717,6 +718,107 @@ fn a_captured_step_replays_with_an_advanced_position_on_real_hardware() {
     assert!(fixture.executor.end_step_capture().is_err());
     // The stream is usable again.
     assert_eq!(step(&mut fixture, 3), first_at_3);
+}
+
+/// `replay-bucketed-prefill`: a captured multi-row (prefill) attention
+/// over the first `key_count` rows of a larger store replays with new
+/// queries exactly like an uncaptured dispatch, for each head width with a
+/// Tensor Core path (and its tiled fallback below 16 rows). It has no
+/// replay offset, so a replay at any other offset is refused.
+#[test]
+fn a_captured_prefill_attention_replays_at_its_captured_key_count_on_real_hardware() {
+    let Some(mut fixture) = chain_fixture_or_skip() else {
+        return;
+    };
+    for (rows, head_dimension) in [(16_u64, 64_u64), (32, 128), (8, 64)] {
+        let width = 2 * head_dimension;
+        let capacity = 4 * rows;
+        let prefix = format!("prefill-attention.{rows}.{head_dimension}");
+        let q = TensorResourceId::new(format!("{prefix}.q"));
+        let k = TensorResourceId::new(format!("{prefix}.k"));
+        let v = TensorResourceId::new(format!("{prefix}.v"));
+        let out = TensorResourceId::new(format!("{prefix}.out"));
+        let values = |count: u64, seed: u64| {
+            (0..count)
+                .map(|index| (((index * 37 + seed * 11) % 97) as f32 - 48.0) / 64.0)
+                .collect::<Vec<f32>>()
+        };
+        let first = HostTensor::new([rows, width], values(rows * width, 1)).unwrap();
+        let second = HostTensor::new([rows, width], values(rows * width, 2)).unwrap();
+        stage_weight(
+            &mut fixture,
+            &k,
+            HostTensor::new([capacity, width], values(capacity * width, 3)).unwrap(),
+        );
+        stage_weight(
+            &mut fixture,
+            &v,
+            HostTensor::new([capacity, width], values(capacity * width, 4)).unwrap(),
+        );
+        let attention = |fixture: &mut ChainFixture| {
+            dispatch(
+                fixture,
+                "prefill-attention",
+                "attention",
+                vec![
+                    (q.clone(), descriptor(rows, width)),
+                    (k.clone(), descriptor(capacity, width)),
+                    (v.clone(), descriptor(capacity, width)),
+                ],
+                out.clone(),
+                descriptor(rows, width),
+                BTreeMap::from([
+                    ("head_count".to_string(), OperatorAttributeValue::Integer(2)),
+                    (
+                        "head_dimension".to_string(),
+                        OperatorAttributeValue::Integer(head_dimension as i64),
+                    ),
+                    ("causal".to_string(), OperatorAttributeValue::Boolean(true)),
+                    (
+                        "key_count".to_string(),
+                        OperatorAttributeValue::Integer(rows as i64),
+                    ),
+                ]),
+            );
+        };
+        stage_weight(&mut fixture, &q, second.clone());
+        attention(&mut fixture);
+        let expected_second = fixture.executor.read_tensor(&out).unwrap().data;
+        stage_weight(&mut fixture, &q, first.clone());
+        attention(&mut fixture);
+        let expected_first = fixture.executor.read_tensor(&out).unwrap().data;
+        assert_ne!(expected_first, expected_second);
+
+        let request = StepCaptureRequest {
+            advancing_attributes: vec!["key_count".into()],
+        };
+        fixture.executor.begin_step_capture(&request).unwrap();
+        attention(&mut fixture);
+        let capture = fixture
+            .executor
+            .end_step_capture()
+            .unwrap_or_else(|error| panic!("{rows} rows of {head_dimension}: {error:?}"));
+        assert_eq!(
+            fixture.executor.read_tensor(&out).unwrap().data,
+            expected_first
+        );
+        fixture
+            .executor
+            .replay_step(&capture, 0, vec![(q.clone(), second.clone())])
+            .unwrap();
+        assert_eq!(
+            fixture.executor.read_tensor(&out).unwrap().data,
+            expected_second,
+            "{rows} rows of {head_dimension}"
+        );
+        assert!(matches!(
+            fixture
+                .executor
+                .replay_step(&capture, 1, vec![(q.clone(), first.clone())]),
+            Err(StepReplayError::Invalidated { .. })
+        ));
+        fixture.executor.release_step_capture(&capture);
+    }
 }
 
 /// The captured dispatches of [`a_captured_step_replays_with_an_advanced_position_on_real_hardware`]:

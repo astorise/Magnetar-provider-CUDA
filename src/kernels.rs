@@ -4049,16 +4049,20 @@ impl CudaKernels {
             );
         }
 
+        // Several query rows have no replay offset: a captured one (a
+        // bucketed prefill, `replay-bucketed-prefill`) replays only at the
+        // key count it was captured with.
+        if key_count.is_some() {
+            self.advancing_offset("key_count", 0);
+        }
         // Several query rows, 64- or 128-dimension heads, on a Device with
         // Tensor Cores: `attention_tcp_kernel` / `attention_tcp128_kernel`
-        // on K and V split once, when their rows align. Otherwise (and
-        // while capturing) the tiled Kernel compiled for the head
-        // dimension.
+        // on K and V split once, when their rows align. Otherwise the tiled
+        // Kernel compiled for the head dimension.
         let kv_len = kv_seq_len * kv_model_dim;
         if seq_len >= 16
             && kv_model_dim % TCP_ALIGN == 0
             && kv_len > 0
-            && !self.is_capturing()
             && let Some((name, shared_bytes)) = tensor_core_prefill_attention(head_dimension)
             && let Some(func) = self.tensor_function(name)
             && func
@@ -4120,7 +4124,7 @@ impl CudaKernels {
             128 => Some("attention_tiled_32_kernel"),
             _ => None,
         };
-        if let Some(tiled) = tiled.filter(|_| seq_len > 1 && !self.is_capturing()) {
+        if let Some(tiled) = tiled.filter(|_| seq_len > 1) {
             let overflow = || {
                 CudaError::new(
                     CudaErrorCode::ShapeUnsupported,
