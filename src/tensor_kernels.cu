@@ -570,7 +570,8 @@ __device__ __forceinline__ void attention_tcp_body(
     unsigned long long kv_model_dim,
     int causal,
     long long window_size,
-    unsigned long long query_position_offset
+    unsigned long long query_position_offset,
+    float score_scale
 ) {
     // Dynamic shared memory: K hi, K lo, V hi, V lo stages of
     // 2 * TCAP_KEYS rows of D + 8 halves each. Q is staged in the two K
@@ -592,8 +593,9 @@ __device__ __forceinline__ void attention_tcp_body(
     unsigned long long group_size = head_count / kv_head_count;
     unsigned long long q_offset = head * D;
     unsigned long long kv_offset = (head / group_size) * D;
-    // 1/sqrt(D), folded into Q (exact for 64 dimensions).
-    const float scale = 1.0f / sqrtf((float)D);
+    // The factor on QK^T, folded into Q: `score_scale` when the node sets
+    // one (`attention.scale`), else 1/sqrt(D) (exact for 64 dimensions).
+    const float scale = score_scale > 0.0f ? score_scale : 1.0f / sqrtf((float)D);
 
     for (unsigned int e = tid; e < TCA_QUERIES * D; e += 128) {
         unsigned int r = e / D;
@@ -803,11 +805,12 @@ __device__ __forceinline__ void attention_tcp_body(
     unsigned long long seq_len, unsigned long long kv_seq_len,                   \
     unsigned long long head_count, unsigned long long kv_head_count,             \
     unsigned long long q_model_dim, unsigned long long kv_model_dim, int causal, \
-    long long window_size, unsigned long long query_position_offset
+    long long window_size, unsigned long long query_position_offset,             \
+    float score_scale
 #define ATTENTION_TCP_PASS                                                        \
     q, k_hi, k_lo, v_hi, v_lo, out, seq_len, kv_seq_len, head_count,             \
     kv_head_count, q_model_dim, kv_model_dim, causal, window_size,               \
-    query_position_offset
+    query_position_offset, score_scale
 
 // 64-dimension heads: 36 KB of dynamic shared memory per block.
 extern "C" __global__ void attention_tcp_kernel(ATTENTION_TCP_ARGS) {

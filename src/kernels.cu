@@ -78,6 +78,44 @@ extern "C" __global__ void silu_kernel(const float* x, float* out, unsigned long
     }
 }
 
+// The tanh approximation of GELU, in the Reference CPU's order of
+// operations (`gelu`, `operator_semantics::gelu_tanh`).
+__device__ __forceinline__ float gelu_tanh(float x) {
+    const float sqrt_2_over_pi = 0.7978846f;
+    return 0.5f * x * (1.0f + tanhf(sqrt_2_over_pi * (x + 0.044715f * x * x * x)));
+}
+
+extern "C" __global__ void gelu_tanh_kernel(const float* x, float* out, unsigned long long n) {
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = gelu_tanh(x[i]);
+    }
+}
+
+// `activation` with `kind = "scale"` (and a scaled `embedding`): x * factor.
+extern "C" __global__ void scale_kernel(const float* x, float* out, float factor, unsigned long long n) {
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = x[i] * factor;
+    }
+}
+
+// `activation` with `kind = "softcap"`: cap * tanh(x / cap).
+extern "C" __global__ void softcap_kernel(const float* x, float* out, float cap, unsigned long long n) {
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = cap * tanhf(x[i] / cap);
+    }
+}
+
+// `mul` by a `[1]` operand, read on the Device: out[i] = a[i] * b[0].
+extern "C" __global__ void mul_scalar_kernel(const float* a, const float* b, float* out, unsigned long long n) {
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = a[i] * b[0];
+    }
+}
+
 // One thread per output row. `ids` are validated device-side (in-range,
 // non-negative integers) rather than pre-checked on the host: `table` and
 // `ids` may both already be device-resident outputs of a prior Kernel
@@ -354,7 +392,10 @@ extern "C" __global__ void moe_route_kernel(
     unsigned long long top_k,
     int normalize,
     unsigned long long expert_first,
-    unsigned long long expert_count
+    unsigned long long expert_count,
+    // `[experts]`: each chosen expert's weight is multiplied by its entry,
+    // after the renormalization (`moe-experts`' sixth input); null for none.
+    const float* per_expert_scale
 ) {
     // One warp per token row: lane l owns experts l, l + 32, ... (at most
     // MOE_ROUTE_EXPERTS_PER_LANE of them).
@@ -426,6 +467,14 @@ extern "C" __global__ void moe_route_kernel(
             weights[t * top_k + k] /= chosen_total;
         }
     }
+    if (per_expert_scale && lane == 0) {
+        for (unsigned long long k = 0; k < top_k; k++) {
+            int local = indices[t * top_k + k];
+            if (local >= 0) {
+                weights[t * top_k + k] *= per_expert_scale[expert_first + (unsigned long long)local];
+            }
+        }
+    }
 }
 
 // act[tk, j] = silu(h[t] . gate_e[:, j]) * (h[t] . up_e[:, j]) for the
@@ -443,7 +492,9 @@ extern "C" __global__ void moe_q8_gated_kernel(
     float* act,
     unsigned long long top_k,
     unsigned long long hidden,
-    unsigned long long inter
+    unsigned long long inter,
+    // 1: the gate takes GELU (tanh) instead of SiLU (`moe-experts.activation`).
+    int gelu
 ) {
     unsigned long long j = (unsigned long long)blockIdx.x * Q8_MATMUL_WARPS + threadIdx.y;
     unsigned long long tk = blockIdx.y;
@@ -475,7 +526,7 @@ extern "C" __global__ void moe_q8_gated_kernel(
         u += __shfl_xor_sync(0xffffffffu, u, offset);
     }
     if (threadIdx.x == 0) {
-        act[tk * inter + j] = g * (1.0f / (1.0f + expf(-g))) * u;
+        act[tk * inter + j] = (gelu ? gelu_tanh(g) : g * (1.0f / (1.0f + expf(-g)))) * u;
     }
 }
 
@@ -562,7 +613,8 @@ extern "C" __global__ void moe_f32_gated_kernel(
     unsigned long long top_k,
     unsigned long long hidden,
     unsigned long long inter,
-    unsigned long long experts
+    unsigned long long experts,
+    int gelu
 ) {
     unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= pairs * inter) {
@@ -582,7 +634,7 @@ extern "C" __global__ void moe_f32_gated_kernel(
         g += x[i] * gate[i * stride + column];
         u += x[i] * up[i * stride + column];
     }
-    act[index] = g * (1.0f / (1.0f + expf(-g))) * u;
+    act[index] = (gelu ? gelu_tanh(g) : g * (1.0f / (1.0f + expf(-g)))) * u;
 }
 
 extern "C" __global__ void moe_f32_down_kernel(
@@ -675,7 +727,8 @@ extern "C" __global__ void rmsnorm_kernel(
         return;
     }
     const float* in_row = input + row * cols;
-    const float* w_row = weight + row * weight_row_stride;
+    // A null `weight` is a scale-less RMSNorm (scale 1).
+    const float* w_row = weight ? weight + row * weight_row_stride : nullptr;
     float sum = 0.0f;
     for (unsigned long long i = threadIdx.x; i < cols; i += RMSNORM_THREADS) {
         sum += in_row[i] * in_row[i];
@@ -691,7 +744,7 @@ extern "C" __global__ void rmsnorm_kernel(
     float scale = 1.0f / sqrtf(partial[0] / (float)cols + epsilon);
     float* out_row = out + row * cols;
     for (unsigned long long i = threadIdx.x; i < cols; i += RMSNORM_THREADS) {
-        out_row[i] = in_row[i] * scale * w_row[i];
+        out_row[i] = w_row ? in_row[i] * scale * w_row[i] : in_row[i] * scale;
     }
 }
 
@@ -723,7 +776,10 @@ extern "C" __global__ void rope_kernel(
     float banded_factor,
     float low_freq_factor,
     float high_freq_factor,
-    float original_context_length
+    float original_context_length,
+    // Partial rotation (`partial_rotary_factor`): pairs from this one on
+    // keep frequency zero, so they pass through unchanged.
+    unsigned long long rotated_pairs
 ) {
     unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     unsigned long long per_row = head_count * half;
@@ -753,7 +809,7 @@ extern "C" __global__ void rope_kernel(
             frequency = (1.0f - smooth) * frequency / banded_factor + smooth * frequency;
         }
     }
-    float angle = position * frequency;
+    float angle = pair < rotated_pairs ? position * frequency : 0.0f;
     float s = sinf(angle);
     float c = cosf(angle);
     unsigned long long col_base = row * cols + head * head_width;
@@ -1421,7 +1477,8 @@ extern "C" __global__ void attention_kernel(
     unsigned long long kv_model_dim,
     int causal,
     long long window_size, // -1 means "no window"
-    unsigned long long query_position_offset
+    unsigned long long query_position_offset,
+    float score_scale
 ) {
     unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     unsigned long long total = head_count * seq_len;
@@ -1434,7 +1491,9 @@ extern "C" __global__ void attention_kernel(
     unsigned long long kv_head = head / group_size;
     unsigned long long q_offset = head * head_dimension;
     unsigned long long kv_offset = kv_head * head_dimension;
-    float scale = 1.0f / sqrtf((float)head_dimension);
+    // The factor on QK^T: `score_scale` when the node sets one
+    // (`attention.scale`), else 1/sqrt(head_dimension).
+    float scale = score_scale > 0.0f ? score_scale : 1.0f / sqrtf((float)head_dimension);
 
     unsigned long long query_position = query_position_offset + query_index;
     unsigned long long key_upper = causal ? (query_position + 1) : kv_seq_len;
@@ -1514,7 +1573,8 @@ extern "C" __global__ void attention_block_kernel(
     unsigned long long query_position_offset,
     // A captured step's replay offset, added to the key count and the
     // query position; null outside a capture.
-    const unsigned long long* step_offset
+    const unsigned long long* step_offset,
+    float score_scale
 ) {
     extern __shared__ float shared[];
     if (step_offset) {
@@ -1535,7 +1595,9 @@ extern "C" __global__ void attention_block_kernel(
     unsigned long long kv_head = head / group_size;
     unsigned long long q_offset = head * head_dimension;
     unsigned long long kv_offset = kv_head * head_dimension;
-    float scale = 1.0f / sqrtf((float)head_dimension);
+    // The factor on QK^T: `score_scale` when the node sets one
+    // (`attention.scale`), else 1/sqrt(head_dimension).
+    float scale = score_scale > 0.0f ? score_scale : 1.0f / sqrtf((float)head_dimension);
 
     unsigned long long query_position = query_position_offset + query_index;
     unsigned long long key_upper = causal ? (query_position + 1) : kv_seq_len;
@@ -1642,7 +1704,8 @@ __device__ __forceinline__ void attention_tiled(
     int causal,
     long long window_size,
     unsigned long long query_position_offset,
-    unsigned int key_tile
+    unsigned int key_tile,
+    float score_scale
 ) {
     extern __shared__ float tiles[];
     const unsigned int head_dimension = 4 * PART;
@@ -1657,7 +1720,9 @@ __device__ __forceinline__ void attention_tiled(
     unsigned long long group_size = head_count / kv_head_count;
     unsigned long long q_offset = head * head_dimension;
     unsigned long long kv_offset = (head / group_size) * head_dimension;
-    float scale = 1.0f / sqrtf((float)head_dimension);
+    // The factor on QK^T: `score_scale` when the node sets one
+    // (`attention.scale`), else 1/sqrt(head_dimension).
+    float scale = score_scale > 0.0f ? score_scale : 1.0f / sqrtf((float)head_dimension);
 
     unsigned long long last_query = tile_first + ATTENTION_TILE_QUERIES - 1;
     if (last_query >= seq_len) {
@@ -1774,10 +1839,11 @@ extern "C" __global__ void attention_tiled_##PART##_kernel(                     
     unsigned long long head_count, unsigned long long kv_head_count,              \
     unsigned long long q_model_dim, unsigned long long kv_model_dim,              \
     int causal, long long window_size,                                            \
-    unsigned long long query_position_offset, unsigned int key_tile) {            \
+    unsigned long long query_position_offset, unsigned int key_tile,             \
+    float score_scale) {                                                          \
     attention_tiled<PART>(q, k, v, out, seq_len, kv_seq_len, head_count,          \
         kv_head_count, q_model_dim, kv_model_dim, causal, window_size,            \
-        query_position_offset, key_tile);                                         \
+        query_position_offset, key_tile, score_scale);                            \
 }
 ATTENTION_TILED_KERNEL(1)
 ATTENTION_TILED_KERNEL(2)
@@ -1814,7 +1880,8 @@ extern "C" __global__ void attention_split_kernel(
     long long window_size, // -1 means "no window"
     unsigned long long query_position_offset,
     unsigned long long chunks,
-    const unsigned long long* step_offset
+    const unsigned long long* step_offset,
+    float score_scale
 ) {
     __shared__ float scores[ATTENTION_CHUNK_KEYS];
     __shared__ float reduce[ATTENTION_SPLIT_THREADS];
@@ -1830,7 +1897,9 @@ extern "C" __global__ void attention_split_kernel(
     unsigned int warp = tid >> 5;
     unsigned long long group_size = head_count / kv_head_count;
     unsigned long long kv_offset = (head / group_size) * head_dimension;
-    float scale = 1.0f / sqrtf((float)head_dimension);
+    // The factor on QK^T: `score_scale` when the node sets one
+    // (`attention.scale`), else 1/sqrt(head_dimension).
+    float scale = score_scale > 0.0f ? score_scale : 1.0f / sqrtf((float)head_dimension);
 
     unsigned long long query_position = query_position_offset;
     unsigned long long key_upper = causal ? (query_position + 1) : kv_seq_len;
@@ -1957,7 +2026,8 @@ __device__ __forceinline__ void attention_split_gqa_body(
     long long window_size, // -1 means "no window"
     unsigned long long query_position_offset,
     unsigned long long chunks,
-    const unsigned long long* step_offset
+    const unsigned long long* step_offset,
+    float score_scale
 ) {
     // K rows padded to D + 1 floats: a warp scoring 32 consecutive keys
     // reads 32 distinct banks.
@@ -1978,8 +2048,10 @@ __device__ __forceinline__ void attention_split_gqa_body(
     unsigned int group = (unsigned int)(head_count / kv_head_count);
     unsigned long long first_head = kv_head * group;
     unsigned long long kv_offset = kv_head * D;
-    // 1/sqrt(D), correctly rounded (exact for 64 dimensions).
-    const float scale = 1.0f / sqrtf((float)D);
+    // The factor on QK^T: `score_scale` when the node sets one
+    // (`attention.scale`), else 1/sqrt(D).
+    // 1/sqrt(D) is correctly rounded (exact for 64 dimensions).
+    const float scale = score_scale > 0.0f ? score_scale : 1.0f / sqrtf((float)D);
 
     unsigned long long query_position = query_position_offset;
     unsigned long long key_upper = causal ? (query_position + 1) : kv_seq_len;
@@ -2098,10 +2170,11 @@ __device__ __forceinline__ void attention_split_gqa_body(
     unsigned long long kv_seq_len, unsigned long long head_count,                \
     unsigned long long kv_head_count, unsigned long long kv_model_dim,           \
     int causal, long long window_size, unsigned long long query_position_offset, \
-    unsigned long long chunks, const unsigned long long* step_offset
+    unsigned long long chunks, const unsigned long long* step_offset,            \
+    float score_scale
 #define ATTENTION_GQA_PASS                                                        \
     q, k, v, partial, kv_seq_len, head_count, kv_head_count, kv_model_dim,       \
-    causal, window_size, query_position_offset, chunks, step_offset
+    causal, window_size, query_position_offset, chunks, step_offset, score_scale
 
 // 64-dimension heads, 64-key chunks (about 37 KB of shared memory).
 extern "C" __global__ void attention_split_gqa_kernel(ATTENTION_GQA_ARGS) {

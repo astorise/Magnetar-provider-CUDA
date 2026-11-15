@@ -19,9 +19,11 @@ use magnetar_core::capability::CapabilityVersion;
 use magnetar_core::device::DeviceId;
 use magnetar_core::{DeviceBinding, ProviderBinding};
 use magnetar_core::{
-    operator::OperatorFamily, operator::OperatorId,
-    operator::ROPE_BANDED_FREQUENCY_SCALING_FEATURE, operator::TensorLayoutKind,
-    operator::TensorRole,
+    operator::ATTENTION_SCALE_FEATURE, operator::EMBEDDING_SCALE_FEATURE,
+    operator::MOE_EXPERTS_ACTIVATION_FEATURE, operator::MOE_PER_EXPERT_SCALE_FEATURE,
+    operator::OperatorFamily, operator::OperatorId, operator::RMSNORM_PER_HEAD_FEATURE,
+    operator::RMSNORM_WITHOUT_WEIGHT_FEATURE, operator::ROPE_BANDED_FREQUENCY_SCALING_FEATURE,
+    operator::ROPE_PARTIAL_ROTARY_FEATURE, operator::TensorLayoutKind, operator::TensorRole,
 };
 use magnetar_kernel::{
     kernel::KernelAdvertisement, kernel::KernelCancellationSupport, kernel::KernelId,
@@ -79,6 +81,23 @@ fn baseline_advertisement(
 /// hardware-verified since Phase 2, but previously reachable only by
 /// calling those methods directly -- selectable through the Runtime's
 /// actual Kernel Registry/dispatch contract for the first time).
+/// [`baseline_advertisement`] declaring `features`: the optional operator
+/// forms its Kernel honours (`required_kernel_features`).
+fn advertisement_with_features(
+    name: &str,
+    family: OperatorFamily,
+    device_id: &DeviceId,
+    provider_name: &str,
+    features: &[&str],
+) -> KernelAdvertisement {
+    let mut advertisement = baseline_advertisement(name, family, device_id, provider_name);
+    advertisement
+        .id
+        .features
+        .extend(features.iter().map(|feature| feature.to_string()));
+    advertisement
+}
+
 fn half_precision_advertisement(
     base_name: &str,
     family: OperatorFamily,
@@ -145,11 +164,13 @@ pub fn cuda_kernel_advertisements(
             device_id,
             provider_name,
         ),
-        baseline_advertisement(
+        // Honours `activation` and the sixth input, `per_expert_scale`.
+        advertisement_with_features(
             "moe-experts",
             OperatorFamily::LinearAlgebra,
             device_id,
             provider_name,
+            &[MOE_EXPERTS_ACTIVATION_FEATURE, MOE_PER_EXPERT_SCALE_FEATURE],
         ),
         baseline_advertisement(
             "row-scale",
@@ -163,42 +184,42 @@ pub fn cuda_kernel_advertisements(
             device_id,
             provider_name,
         ),
-        baseline_advertisement(
+        // Honours `scale`.
+        advertisement_with_features(
             "embedding",
             OperatorFamily::Tensor,
             device_id,
             provider_name,
+            &[EMBEDDING_SCALE_FEATURE],
         ),
-        baseline_advertisement(
+        // Honours per-head normalization and a missing weight.
+        advertisement_with_features(
             "rmsnorm",
             OperatorFamily::Normalization,
             device_id,
             provider_name,
+            &[RMSNORM_PER_HEAD_FEATURE, RMSNORM_WITHOUT_WEIGHT_FEATURE],
         ),
-        {
-            // Honours the banded frequency-scaling attributes.
-            let mut rope = baseline_advertisement(
-                "rope",
-                OperatorFamily::PositionEncoding,
-                device_id,
-                provider_name,
-            );
-            rope.id
-                .features
-                .insert(ROPE_BANDED_FREQUENCY_SCALING_FEATURE.to_string());
-            rope
-        },
-        {
-            // Honours `key_count` (`append-kv-history-in-place`).
-            let mut attention = baseline_advertisement(
-                "attention",
-                OperatorFamily::Attention,
-                device_id,
-                provider_name,
-            );
-            attention.id.features.insert(KEY_COUNT_FEATURE.to_string());
-            attention
-        },
+        // Honours the banded frequency-scaling attributes and partial
+        // rotation.
+        advertisement_with_features(
+            "rope",
+            OperatorFamily::PositionEncoding,
+            device_id,
+            provider_name,
+            &[
+                ROPE_BANDED_FREQUENCY_SCALING_FEATURE,
+                ROPE_PARTIAL_ROTARY_FEATURE,
+            ],
+        ),
+        // Honours `key_count` (`append-kv-history-in-place`) and `scale`.
+        advertisement_with_features(
+            "attention",
+            OperatorFamily::Attention,
+            device_id,
+            provider_name,
+            &[KEY_COUNT_FEATURE, ATTENTION_SCALE_FEATURE],
+        ),
         baseline_advertisement(
             "softmax",
             OperatorFamily::Activation,
@@ -206,6 +227,8 @@ pub fn cuda_kernel_advertisements(
             provider_name,
         ),
         baseline_advertisement("silu", OperatorFamily::Activation, device_id, provider_name),
+        // The tanh approximation.
+        baseline_advertisement("gelu", OperatorFamily::Activation, device_id, provider_name),
         baseline_advertisement("add", OperatorFamily::Tensor, device_id, provider_name),
         baseline_advertisement("mul", OperatorFamily::Tensor, device_id, provider_name),
         baseline_advertisement("concat", OperatorFamily::Tensor, device_id, provider_name),

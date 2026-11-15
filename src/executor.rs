@@ -56,7 +56,9 @@ use magnetar_provider_api::{
 use magnetar_provider_api::{packed_weight::PackedWeight, packed_weight::PackedWeightWrite};
 
 use crate::error::{CudaError, CudaErrorCode};
-use crate::kernels::{CapturedStep, CudaDeviceBuffer, CudaHalfDType, CudaKernels, CudaRopePairing};
+use crate::kernels::{
+    CapturedStep, CudaDeviceBuffer, CudaHalfDType, CudaKernels, CudaMoeOptions, CudaRopePairing,
+};
 
 /// Reads which half-precision format an `add-half`/`mul-half` invocation
 /// was selected for from its own declared input dtype -- the Kernel
@@ -1092,6 +1094,20 @@ impl CudaExecutor {
         }
     }
 
+    /// A float attribute when present; any other value type is refused.
+    fn attribute_float_opt(
+        attributes: &BTreeMap<String, OperatorAttributeValue>,
+        key: &str,
+    ) -> Result<Option<f32>, KernelError> {
+        match attributes.get(key) {
+            None => Ok(None),
+            Some(OperatorAttributeValue::Float(value)) => Ok(Some(*value as f32)),
+            Some(other) => Err(KernelError::KernelAttributeUnsupported {
+                attribute: format!("{key} {other:?} must be a float"),
+            }),
+        }
+    }
+
     fn attribute_integer(
         attributes: &BTreeMap<String, OperatorAttributeValue>,
         key: &str,
@@ -1414,16 +1430,62 @@ impl CudaExecutor {
                 "embedding" => {
                     let table = get(0)?;
                     let ids = get(1)?;
-                    self.kernels
+                    let mut rows = self
+                        .kernels
                         .embedding_lookup(table, ids)
-                        .map_err(KernelError::from)?
+                        .map_err(KernelError::from)?;
+                    // `scale`: the gathered rows multiplied by it, in place.
+                    if let Some(factor) =
+                        Self::attribute_float_opt(&invocation.attributes, "scale")?
+                    {
+                        self.kernels
+                            .scale_in_place(&mut rows, factor)
+                            .map_err(KernelError::from)?;
+                    }
+                    rows
                 }
                 "rmsnorm" => {
                     let input = get(0)?;
-                    let weight = get(1)?;
+                    // One input: a scale-less RMSNorm.
+                    let weight = match invocation.inputs.len() {
+                        1 => None,
+                        _ => Some(get(1)?),
+                    };
+                    if let Some(OperatorAttributeValue::Boolean(with_scale)) =
+                        invocation.attributes.get("with_scale")
+                        && *with_scale != weight.is_some()
+                    {
+                        return Err(KernelError::KernelAttributeUnsupported {
+                            attribute: format!(
+                                "rmsnorm with_scale {with_scale} contradicts its {} input(s)",
+                                invocation.inputs.len()
+                            ),
+                        });
+                    }
+                    let head = |name: &str| match invocation.attributes.get(name) {
+                        None => Ok(None),
+                        Some(OperatorAttributeValue::Integer(value)) if *value > 0 => {
+                            Ok(Some(*value as u64))
+                        }
+                        Some(other) => Err(KernelError::KernelAttributeUnsupported {
+                            attribute: format!(
+                                "rmsnorm {name} {other:?} must be a positive integer"
+                            ),
+                        }),
+                    };
+                    let heads = match (head("head_count")?, head("head_dimension")?) {
+                        (Some(count), Some(dimension)) => Some((count, dimension)),
+                        (None, None) => None,
+                        _ => {
+                            return Err(KernelError::KernelAttributeUnsupported {
+                                attribute: "rmsnorm head_count and head_dimension go together"
+                                    .into(),
+                            });
+                        }
+                    };
                     let epsilon = Self::attribute_float(&invocation.attributes, "epsilon", 1e-6);
                     self.kernels
-                        .rmsnorm(input, weight, epsilon)
+                        .rmsnorm_with(input, weight, epsilon, heads)
                         .map_err(KernelError::from)?
                 }
                 "rope" => {
@@ -1488,8 +1550,25 @@ impl CudaExecutor {
                             .map_err(|attribute| KernelError::KernelAttributeUnsupported {
                                 attribute,
                             })?;
+                    // `partial_rotary_factor`: only the first
+                    // floor(factor * dimension / 2) pairs rotate.
+                    let rotated_pairs = match invocation.attributes.get("partial_rotary_factor") {
+                        None => None,
+                        Some(OperatorAttributeValue::Float(factor))
+                            if *factor > 0.0 && *factor <= 1.0 =>
+                        {
+                            Some((*factor * dimension as f64 / 2.0).floor() as u64)
+                        }
+                        Some(other) => {
+                            return Err(KernelError::KernelAttributeUnsupported {
+                                attribute: format!(
+                                    "partial_rotary_factor {other:?} must be a float in (0, 1]"
+                                ),
+                            });
+                        }
+                    };
                     self.kernels
-                        .rope_with_frequency_scaling(
+                        .rope_partial(
                             input,
                             base,
                             scale,
@@ -1498,6 +1577,7 @@ impl CudaExecutor {
                             head_count,
                             pairing,
                             frequency_scaling.as_ref(),
+                            rotated_pairs,
                         )
                         .map_err(KernelError::from)?
                 }
@@ -1542,8 +1622,9 @@ impl CudaExecutor {
                         }
                     }
                     let key_count = Self::attribute_integer(&invocation.attributes, "key_count");
+                    let scale = Self::attribute_float_opt(&invocation.attributes, "scale")?;
                     self.kernels
-                        .attention_bounded(
+                        .attention_scaled(
                             q,
                             k,
                             v,
@@ -1553,6 +1634,7 @@ impl CudaExecutor {
                             window_size,
                             causal,
                             key_count,
+                            scale,
                         )
                         .map_err(KernelError::from)?
                 }
@@ -1563,12 +1645,44 @@ impl CudaExecutor {
                         .map_err(KernelError::from)?
                 }
                 "silu" => self.kernels.silu(get(0)?).map_err(KernelError::from)?,
+                // The tanh approximation, the only one implemented.
+                "gelu" => match invocation.attributes.get("approximate") {
+                    None => self.kernels.gelu_tanh(get(0)?).map_err(KernelError::from)?,
+                    Some(OperatorAttributeValue::String(value)) if value == "tanh" => {
+                        self.kernels.gelu_tanh(get(0)?).map_err(KernelError::from)?
+                    }
+                    Some(other) => {
+                        return Err(KernelError::KernelAttributeUnsupported {
+                            attribute: format!("gelu approximate {other:?} is not implemented"),
+                        });
+                    }
+                },
                 "activation" => match invocation.attributes.get("kind") {
                     Some(OperatorAttributeValue::String(kind)) if kind == "sigmoid" => {
                         self.kernels.sigmoid(get(0)?).map_err(KernelError::from)?
                     }
                     Some(OperatorAttributeValue::String(kind)) if kind == "silu" => {
                         self.kernels.silu(get(0)?).map_err(KernelError::from)?
+                    }
+                    // `cap * tanh(x / cap)`.
+                    Some(OperatorAttributeValue::String(kind)) if kind == "softcap" => {
+                        let cap = Self::attribute_float_opt(&invocation.attributes, "cap")?
+                            .ok_or_else(|| KernelError::KernelAttributeUnsupported {
+                                attribute: "softcap needs a cap".into(),
+                            })?;
+                        self.kernels
+                            .softcap(get(0)?, cap)
+                            .map_err(KernelError::from)?
+                    }
+                    // `x * factor`.
+                    Some(OperatorAttributeValue::String(kind)) if kind == "scale" => {
+                        let factor = Self::attribute_float_opt(&invocation.attributes, "factor")?
+                            .ok_or_else(|| KernelError::KernelAttributeUnsupported {
+                            attribute: "scale needs a factor".into(),
+                        })?;
+                        self.kernels
+                            .scale(get(0)?, factor)
+                            .map_err(KernelError::from)?
                     }
                     other => {
                         return Err(KernelError::KernelAttributeUnsupported {
@@ -1602,13 +1716,33 @@ impl CudaExecutor {
                         &invocation.attributes,
                         routing.experts,
                     );
+                    let gelu_tanh = match invocation.attributes.get("activation") {
+                        None => false,
+                        Some(OperatorAttributeValue::String(value)) if value == "silu" => false,
+                        Some(OperatorAttributeValue::String(value)) if value == "gelu_tanh" => true,
+                        Some(other) => {
+                            return Err(KernelError::KernelAttributeUnsupported {
+                                attribute: format!(
+                                    "moe-experts activation {other:?} is not implemented"
+                                ),
+                            });
+                        }
+                    };
+                    let per_expert_scale = match invocation.inputs.len() {
+                        6 => Some(get(5)?),
+                        _ => None,
+                    };
                     self.kernels
-                        .moe_experts(
+                        .moe_experts_with(
                             get(0)?,
                             get(1)?,
                             [get(2)?, get(3)?, get(4)?],
                             routing,
                             local,
+                            CudaMoeOptions {
+                                gelu_tanh,
+                                per_expert_scale,
+                            },
                         )
                         .map_err(KernelError::from)?
                 }
@@ -1620,7 +1754,12 @@ impl CudaExecutor {
                 "mul" => {
                     let a = get(0)?;
                     let b = get(1)?;
-                    self.kernels.mul(a, b).map_err(KernelError::from)?
+                    // A `[1]` second operand multiplies every element.
+                    if b.shape.as_slice() == [1] && a.shape != b.shape {
+                        self.kernels.mul_scalar(a, b).map_err(KernelError::from)?
+                    } else {
+                        self.kernels.mul(a, b).map_err(KernelError::from)?
+                    }
                 }
                 "concat" => {
                     let a = get(0)?;

@@ -2161,6 +2161,120 @@ impl CudaKernels {
         })
     }
 
+    /// One f32 element-wise Kernel over `input`, with `extra` scalar
+    /// arguments before the element count.
+    fn elementwise(
+        &self,
+        input: &CudaDeviceBuffer,
+        kernel: &'static str,
+        extra: Option<f32>,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        Self::require_f32(&[input], kernel)?;
+        let n = input.slice.len() as u64;
+        let mut out_dev = self.alloc_output(input.slice.len())?;
+        let func = self.function(kernel)?;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(&input.slice).arg(&mut out_dev);
+        if let Some(extra) = &extra {
+            args.arg(extra);
+        }
+        args.arg(&n);
+        unsafe { args.launch(LaunchConfig::for_num_elems(n as u32)) }?;
+        Ok(CudaDeviceBuffer {
+            slice: out_dev,
+            shape: input.shape.clone(),
+            bf16: None,
+            q8: None,
+        })
+    }
+
+    /// GELU, tanh approximation (`gelu`, `approximate = "tanh"`).
+    pub fn gelu_tanh(&self, input: &CudaDeviceBuffer) -> Result<CudaDeviceBuffer, CudaError> {
+        self.elementwise(input, "gelu_tanh_kernel", None)
+    }
+
+    /// `x * factor` (`activation` `kind = "scale"`, a scaled `embedding`).
+    pub fn scale(
+        &self,
+        input: &CudaDeviceBuffer,
+        factor: f32,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        if !factor.is_finite() {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!("scale factor {factor} must be finite"),
+            ));
+        }
+        self.elementwise(input, "scale_kernel", Some(factor))
+    }
+
+    /// [`Self::scale`] in place: `buffer` keeps its allocation, so a step
+    /// capture that scales a Kernel's own output (a scaled `embedding`)
+    /// references no intermediate it then frees.
+    pub fn scale_in_place(
+        &self,
+        buffer: &mut CudaDeviceBuffer,
+        factor: f32,
+    ) -> Result<(), CudaError> {
+        Self::require_f32(&[buffer], "scale")?;
+        if !factor.is_finite() {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!("scale factor {factor} must be finite"),
+            ));
+        }
+        let n = buffer.slice.len() as u64;
+        let input = self.address(buffer);
+        let func = self.function("scale_kernel")?;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(&input).arg(&mut buffer.slice).arg(&factor).arg(&n);
+        unsafe { args.launch(LaunchConfig::for_num_elems(n as u32)) }?;
+        Ok(())
+    }
+
+    /// `cap * tanh(x / cap)` (`activation` `kind = "softcap"`).
+    pub fn softcap(
+        &self,
+        input: &CudaDeviceBuffer,
+        cap: f32,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        if !cap.is_finite() || cap <= 0.0 {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!("softcap cap {cap} must be finite and positive"),
+            ));
+        }
+        self.elementwise(input, "softcap_kernel", Some(cap))
+    }
+
+    /// `a * b[0]`, `b` a `[1]` operand read on the Device (`mul`'s scalar
+    /// broadcast).
+    pub fn mul_scalar(
+        &self,
+        a: &CudaDeviceBuffer,
+        b: &CudaDeviceBuffer,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        Self::require_f32(&[a, b], "mul")?;
+        if b.shape.as_slice() != [1] {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!("a scalar mul operand has shape [1], got {:?}", b.shape),
+            ));
+        }
+        let n = a.slice.len() as u64;
+        let mut out_dev = self.alloc_output(a.slice.len())?;
+        let func = self.function("mul_scalar_kernel")?;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(&a.slice).arg(&b.slice).arg(&mut out_dev).arg(&n);
+        unsafe { args.launch(LaunchConfig::for_num_elems(n as u32)) }?;
+        Ok(CudaDeviceBuffer {
+            slice: out_dev,
+            shape: a.shape.clone(),
+            bf16: None,
+            q8: None,
+        })
+    }
+
     /// `out[t, :] = x[t, :] * scale[t]`, `scale` of `[T, 1]` or `[T]`.
     pub fn row_scale(
         &self,
@@ -2209,9 +2323,30 @@ impl CudaKernels {
         &self,
         h: &CudaDeviceBuffer,
         logits: &CudaDeviceBuffer,
+        weights: [&CudaDeviceBuffer; 3],
+        routing: magnetar_provider_api::MoeRouting,
+        local: (u64, u64),
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        self.moe_experts_with(
+            h,
+            logits,
+            weights,
+            routing,
+            local,
+            CudaMoeOptions::default(),
+        )
+    }
+
+    /// [`Self::moe_experts`] with its optional forms (`moe-experts`'
+    /// `activation` and sixth input, `per_expert_scale`).
+    pub fn moe_experts_with(
+        &self,
+        h: &CudaDeviceBuffer,
+        logits: &CudaDeviceBuffer,
         [gate, up, down]: [&CudaDeviceBuffer; 3],
         routing: magnetar_provider_api::MoeRouting,
         (expert_first, local_experts): (u64, u64),
+        options: CudaMoeOptions<'_>,
     ) -> Result<CudaDeviceBuffer, CudaError> {
         Self::require_f32(&[h, logits], "moe-experts' activations")?;
         let shape_error = |reason: String| CudaError::new(CudaErrorCode::ShapeUnsupported, reason);
@@ -2250,6 +2385,20 @@ impl CudaKernels {
         }
         let inter = gate_cols / local_experts;
         let pairs = tokens * top_k;
+        let per_expert_scale = match options.per_expert_scale {
+            None => 0u64,
+            Some(scale) => {
+                Self::require_f32(&[scale], "moe-experts' per_expert_scale")?;
+                if scale.slice.len() as u64 != experts {
+                    return Err(shape_error(format!(
+                        "moe-experts' per_expert_scale has {} values for {experts} experts",
+                        scale.slice.len()
+                    )));
+                }
+                self.address(scale)
+            }
+        };
+        let gelu = i32::from(options.gelu_tanh);
 
         let mut scratch_slot = self.moe_scratch.lock().unwrap();
         let mut temporary = None;
@@ -2292,7 +2441,8 @@ impl CudaKernels {
             .arg(&top_k)
             .arg(&normalize)
             .arg(&expert_first)
-            .arg(&local_experts);
+            .arg(&local_experts)
+            .arg(&per_expert_scale);
         // One warp per token, four tokens per block.
         let route_config = LaunchConfig {
             grid_dim: (tokens.div_ceil(4) as u32, 1, 1),
@@ -2329,7 +2479,8 @@ impl CudaKernels {
                 .arg(&mut scratch.act)
                 .arg(&top_k)
                 .arg(&hidden)
-                .arg(&inter);
+                .arg(&inter)
+                .arg(&gelu);
             unsafe { args.launch(warps_grid(inter, pairs)) }?;
         } else {
             let (mut gate_f32, mut up_f32) = (None, None);
@@ -2346,7 +2497,8 @@ impl CudaKernels {
                 .arg(&top_k)
                 .arg(&hidden)
                 .arg(&inter)
-                .arg(&local_experts);
+                .arg(&local_experts)
+                .arg(&gelu);
             unsafe { args.launch(LaunchConfig::for_num_elems((pairs * inter) as u32)) }?;
         }
 
@@ -2551,13 +2703,45 @@ impl CudaKernels {
         weight: &CudaDeviceBuffer,
         epsilon: f32,
     ) -> Result<CudaDeviceBuffer, CudaError> {
-        Self::require_f32(&[input, weight], "rmsnorm")?;
-        let cols = *input.shape.last().ok_or_else(|| {
+        self.rmsnorm_with(input, Some(weight), epsilon, None)
+    }
+
+    /// [`Self::rmsnorm`] with its optional forms: no weight (scale 1), and
+    /// per-head normalization (`heads = (head_count, head_dimension)`):
+    /// each row's `head_count` blocks normalized alone, with one
+    /// `[head_dimension]` weight. Rows are contiguous, so the heads are the
+    /// rows of a `[rows * head_count, head_dimension]` view.
+    pub fn rmsnorm_with(
+        &self,
+        input: &CudaDeviceBuffer,
+        weight: Option<&CudaDeviceBuffer>,
+        epsilon: f32,
+        heads: Option<(u64, u64)>,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        Self::require_f32(&[input], "rmsnorm")?;
+        if let Some(weight) = weight {
+            Self::require_f32(&[weight], "rmsnorm")?;
+        }
+        let row_width = *input.shape.last().ok_or_else(|| {
             CudaError::new(
                 CudaErrorCode::ShapeUnsupported,
                 "RMSNorm expects at least one dimension",
             )
         })?;
+        let cols = match heads {
+            None => row_width,
+            Some((count, dimension)) => {
+                if count == 0 || dimension == 0 || count.checked_mul(dimension) != Some(row_width) {
+                    return Err(CudaError::new(
+                        CudaErrorCode::ShapeUnsupported,
+                        format!(
+                            "RMSNorm's {count} heads of {dimension} do not tile rows of {row_width}"
+                        ),
+                    ));
+                }
+                dimension
+            }
+        };
         if cols == 0 || !input.slice.len().is_multiple_of(cols as usize) {
             return Err(CudaError::new(
                 CudaErrorCode::ShapeUnsupported,
@@ -2568,18 +2752,24 @@ impl CudaKernels {
             ));
         }
         let rows = (input.slice.len() / cols as usize) as u64;
-        let weight_row_stride = if weight.shape == [cols] || weight.shape == [1, cols] {
-            0u64
-        } else if weight.shape == input.shape || weight.shape == [rows, cols] {
-            cols
-        } else {
-            return Err(CudaError::new(
-                CudaErrorCode::ShapeUnsupported,
-                format!(
-                    "RMSNorm weight shape must be [{cols}], [1, {cols}], input shape {:?}, or [{rows}, {cols}], got {:?}",
-                    input.shape, weight.shape
-                ),
-            ));
+        let weight_row_stride = match weight {
+            None => 0u64,
+            Some(weight) if weight.shape == [cols] || weight.shape == [1, cols] => 0u64,
+            Some(weight)
+                if heads.is_none()
+                    && (weight.shape == input.shape || weight.shape == [rows, cols]) =>
+            {
+                cols
+            }
+            Some(weight) => {
+                return Err(CudaError::new(
+                    CudaErrorCode::ShapeUnsupported,
+                    format!(
+                        "RMSNorm weight shape must be [{cols}], [1, {cols}], input shape {:?}, or [{rows}, {cols}], got {:?}",
+                        input.shape, weight.shape
+                    ),
+                ));
+            }
         };
         if epsilon <= 0.0 {
             return Err(CudaError::new(
@@ -2588,10 +2778,12 @@ impl CudaKernels {
             ));
         }
         let mut out_dev = self.alloc_output(input.slice.len())?;
+        // A null weight is a scale-less RMSNorm.
+        let weight_address = weight.map_or(0u64, |weight| self.address(weight));
         let func = self.function("rmsnorm_kernel")?;
         let mut args = self.stream.launch_builder(&func);
         args.arg(&input.slice)
-            .arg(&weight.slice)
+            .arg(&weight_address)
             .arg(&mut out_dev)
             .arg(&rows)
             .arg(&cols)
@@ -2680,6 +2872,36 @@ impl CudaKernels {
         pairing: CudaRopePairing,
         frequency_scaling: Option<&RopeBandedFrequencyScaling>,
     ) -> Result<CudaDeviceBuffer, CudaError> {
+        self.rope_partial(
+            input,
+            base,
+            scale,
+            dimension,
+            position_offset,
+            head_count,
+            pairing,
+            frequency_scaling,
+            None,
+        )
+    }
+
+    /// [`Self::rope_with_frequency_scaling`] rotating only the first
+    /// `rotated_pairs` pairs of each head's `dimension / 2`
+    /// (`rope.partial_rotary_factor`): the others keep frequency zero and
+    /// pass through. The frequencies still divide by the whole `dimension`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_partial(
+        &self,
+        input: &CudaDeviceBuffer,
+        base: f32,
+        scale: f32,
+        dimension: u64,
+        position_offset: u64,
+        head_count: u64,
+        pairing: CudaRopePairing,
+        frequency_scaling: Option<&RopeBandedFrequencyScaling>,
+        rotated_pairs: Option<u64>,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
         Self::require_f32(&[input], "rope")?;
         if let Some(scaling) = frequency_scaling {
             scaling
@@ -2727,6 +2949,7 @@ impl CudaKernels {
             ));
         }
         let half = dimension / 2;
+        let rotated_pairs = rotated_pairs.unwrap_or(half).min(half);
         let half_split: u32 = match pairing {
             CudaRopePairing::Interleaved => 0,
             CudaRopePairing::HalfSplit => 1,
@@ -2760,7 +2983,8 @@ impl CudaKernels {
             .arg(&banded_factor)
             .arg(&low_freq_factor)
             .arg(&high_freq_factor)
-            .arg(&original_context_length);
+            .arg(&original_context_length)
+            .arg(&rotated_pairs);
         unsafe { args.launch(LaunchConfig::for_num_elems(work_items)) }?;
         Ok(CudaDeviceBuffer {
             slice: out_dev,
@@ -3995,8 +4219,49 @@ impl CudaKernels {
         causal: bool,
         key_count: Option<u64>,
     ) -> Result<CudaDeviceBuffer, CudaError> {
+        self.attention_scaled(
+            q,
+            k,
+            v,
+            head_count,
+            head_dimension,
+            kv_head_count,
+            window_size,
+            causal,
+            key_count,
+            None,
+        )
+    }
+
+    /// [`Self::attention_bounded`] with the factor on `QK^T` the node sets
+    /// (`attention.scale`); `None` keeps `1/sqrt(head_dimension)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_scaled(
+        &self,
+        q: &CudaDeviceBuffer,
+        k: &CudaDeviceBuffer,
+        v: &CudaDeviceBuffer,
+        head_count: u64,
+        head_dimension: u64,
+        kv_head_count: Option<u64>,
+        window_size: Option<u64>,
+        causal: bool,
+        key_count: Option<u64>,
+        scale: Option<f32>,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
         Self::require_f32(&[q, k, v], "attention")?;
         same_shape_buf(k, v)?;
+        // `0` makes every Kernel use 1/sqrt(head_dimension).
+        let score_scale = match scale {
+            None => 0.0_f32,
+            Some(scale) if scale.is_finite() && scale > 0.0 => scale,
+            Some(scale) => {
+                return Err(CudaError::new(
+                    CudaErrorCode::ShapeUnsupported,
+                    format!("attention scale {scale} must be finite and positive"),
+                ));
+            }
+        };
         let kv_head_count = kv_head_count.unwrap_or(head_count);
         if head_count == 0 || head_dimension == 0 || kv_head_count == 0 {
             return Err(CudaError::new(
@@ -4085,6 +4350,7 @@ impl CudaKernels {
                 causal_flag,
                 window_arg,
                 step_offset,
+                score_scale,
             );
         }
 
@@ -4135,7 +4401,8 @@ impl CudaKernels {
                 .arg(&kv_model_dim)
                 .arg(&causal_flag)
                 .arg(&window_arg)
-                .arg(&query_position_offset);
+                .arg(&query_position_offset)
+                .arg(&score_scale);
             let config = LaunchConfig {
                 grid_dim: (
                     u32::try_from(seq_len.div_ceil(TCA_QUERIES)).map_err(|_| overflow())?,
@@ -4187,7 +4454,8 @@ impl CudaKernels {
                 .arg(&causal_flag)
                 .arg(&window_arg)
                 .arg(&query_position_offset)
-                .arg(&key_tile);
+                .arg(&key_tile)
+                .arg(&score_scale);
             let config = LaunchConfig {
                 grid_dim: (
                     u32::try_from(seq_len.div_ceil(ATTENTION_TILE_QUERIES))
@@ -4249,7 +4517,8 @@ impl CudaKernels {
                 .arg(&causal_flag)
                 .arg(&window_arg)
                 .arg(&query_position_offset)
-                .arg(&step_offset);
+                .arg(&step_offset)
+                .arg(&score_scale);
             let config = LaunchConfig {
                 grid_dim: (blocks, 1, 1),
                 block_dim: (ATTENTION_THREADS, 1, 1),
@@ -4283,7 +4552,8 @@ impl CudaKernels {
             .arg(&kv_model_dim)
             .arg(&causal_flag)
             .arg(&window_arg)
-            .arg(&query_position_offset);
+            .arg(&query_position_offset)
+            .arg(&score_scale);
         unsafe { args.launch(LaunchConfig::for_num_elems((head_count * seq_len) as u32)) }?;
         Ok(CudaDeviceBuffer {
             slice: out_dev,
@@ -4311,6 +4581,7 @@ impl CudaKernels {
         causal_flag: i32,
         window_arg: i64,
         step_offset: u64,
+        score_scale: f32,
     ) -> Result<CudaDeviceBuffer, CudaError> {
         let [
             kv_seq_len,
@@ -4370,7 +4641,8 @@ impl CudaKernels {
                 .arg(&window_arg)
                 .arg(&query_position_offset)
                 .arg(&chunks)
-                .arg(&step_offset);
+                .arg(&step_offset)
+                .arg(&score_scale);
             let config = LaunchConfig {
                 grid_dim: (
                     u32::try_from(chunks).map_err(|_| overflow())?,
@@ -4398,7 +4670,8 @@ impl CudaKernels {
                 .arg(&window_arg)
                 .arg(&query_position_offset)
                 .arg(&chunks)
-                .arg(&step_offset);
+                .arg(&step_offset)
+                .arg(&score_scale);
             let config = LaunchConfig {
                 grid_dim: (
                     u32::try_from(chunks).map_err(|_| overflow())?,
@@ -4467,6 +4740,16 @@ fn rows_cols_buf(buffer: &CudaDeviceBuffer) -> Result<(u64, u64), CudaError> {
 /// than relying on a test against real hardware to ever notice. A free
 /// function (not inlined in `CudaKernels::rope`) so it can be unit-tested
 /// directly, without a real CUDA context/device.
+/// `moe-experts`' optional forms.
+#[derive(Clone, Copy, Default)]
+pub struct CudaMoeOptions<'a> {
+    /// The experts' gate takes GELU (tanh) instead of SiLU.
+    pub gelu_tanh: bool,
+    /// `[experts]`: each chosen expert's routing weight is multiplied by
+    /// its entry, after the renormalization.
+    pub per_expert_scale: Option<&'a CudaDeviceBuffer>,
+}
+
 /// Which elements of a RoPE head block form each rotated pair, from the
 /// portable `rope` Operator's `rotation_pairing` attribute
 /// (`fix-rope-rotation-pairing`).
