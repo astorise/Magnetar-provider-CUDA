@@ -822,7 +822,17 @@ extern "C" __global__ void rope_kernel(
     float original_context_length,
     // Partial rotation (`partial_rotary_factor`): pairs from this one on
     // keep frequency zero, so they pass through unchanged.
-    unsigned long long rotated_pairs
+    unsigned long long rotated_pairs,
+    // YaRN (`frequency_scaling = "yarn"`); `yarn_factor == 0` leaves the
+    // frequencies unscaled. `yarn_low` and `yarn_high` are the correction
+    // range `RopeYarnFrequencyScaling::correction_range` computes, and the
+    // blend is the f32 operations of its `scale_frequency`. `amplitude`
+    // multiplies the rotated pairs' cos and sin (`attention_factor`, 1
+    // otherwise).
+    float yarn_factor,
+    float yarn_low,
+    float yarn_high,
+    float amplitude
 ) {
     unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     unsigned long long per_row = head_count * half;
@@ -852,9 +862,17 @@ extern "C" __global__ void rope_kernel(
             frequency = (1.0f - smooth) * frequency / banded_factor + smooth * frequency;
         }
     }
+    if (yarn_factor > 0.0f) {
+        float high = yarn_low == yarn_high ? yarn_high + 0.001f : yarn_high;
+        float ramp = ((float)pair - yarn_low) / (high - yarn_low);
+        ramp = fminf(fmaxf(ramp, 0.0f), 1.0f);
+        float interpolated = frequency / yarn_factor;
+        frequency = interpolated * ramp + frequency * (1.0f - ramp);
+    }
     float angle = pair < rotated_pairs ? position * frequency : 0.0f;
-    float s = sinf(angle);
-    float c = cosf(angle);
+    float pair_amplitude = pair < rotated_pairs ? amplitude : 1.0f;
+    float s = sinf(angle) * pair_amplitude;
+    float c = cosf(angle) * pair_amplitude;
     unsigned long long col_base = row * cols + head * head_width;
     unsigned long long first = half_split ? col_base + pair : col_base + 2 * pair;
     unsigned long long second = half_split ? col_base + pair + half : col_base + 2 * pair + 1;
@@ -1521,7 +1539,11 @@ extern "C" __global__ void attention_kernel(
     int causal,
     long long window_size, // -1 means "no window"
     unsigned long long query_position_offset,
-    float score_scale
+    float score_scale,
+    // Each head's V and output width (`attention.value_head_dimension`,
+    // `head_dimension` otherwise) and the V row width.
+    unsigned long long value_dimension,
+    unsigned long long v_model_dim
 ) {
     unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     unsigned long long total = head_count * seq_len;
@@ -1572,8 +1594,8 @@ extern "C" __global__ void attention_kernel(
         sum += expf(dot * scale - max_value);
     }
 
-    float* out_row = out + query_index * q_model_dim + q_offset;
-    for (unsigned long long d = 0; d < head_dimension; d++) {
+    float* out_row = out + (query_index * head_count + head) * value_dimension;
+    for (unsigned long long d = 0; d < value_dimension; d++) {
         out_row[d] = 0.0f;
     }
     for (unsigned long long key_index = key_lower; key_index < key_upper; key_index++) {
@@ -1583,8 +1605,8 @@ extern "C" __global__ void attention_kernel(
             dot += q_row[d] * k_row[d];
         }
         float weight = expf(dot * scale - max_value) / sum;
-        const float* v_row = v + key_index * kv_model_dim + kv_offset;
-        for (unsigned long long d = 0; d < head_dimension; d++) {
+        const float* v_row = v + key_index * v_model_dim + kv_head * value_dimension;
+        for (unsigned long long d = 0; d < value_dimension; d++) {
             out_row[d] += weight * v_row[d];
         }
     }
@@ -1617,7 +1639,10 @@ extern "C" __global__ void attention_block_kernel(
     // A captured step's replay offset, added to the key count and the
     // query position; null outside a capture.
     const unsigned long long* step_offset,
-    float score_scale
+    float score_scale,
+    // As `attention_kernel`.
+    unsigned long long value_dimension,
+    unsigned long long v_model_dim
 ) {
     extern __shared__ float shared[];
     if (step_offset) {
@@ -1708,11 +1733,12 @@ extern "C" __global__ void attention_block_kernel(
 
     // No key admitted (an empty window) leaves every output zero, as
     // `attention_kernel`.
-    float* out_row = out + query_index * q_model_dim + q_offset;
-    for (unsigned long long d = tid; d < head_dimension; d += ATTENTION_THREADS) {
+    float* out_row = out + (query_index * head_count + head) * value_dimension;
+    unsigned long long v_offset = kv_head * value_dimension;
+    for (unsigned long long d = tid; d < value_dimension; d += ATTENTION_THREADS) {
         float acc = 0.0f;
         for (unsigned long long j = 0; j < key_count; j++) {
-            acc += scores[j] * v[(key_lower + j) * kv_model_dim + kv_offset + d];
+            acc += scores[j] * v[(key_lower + j) * v_model_dim + v_offset + d];
         }
         out_row[d] = acc;
     }
@@ -1924,7 +1950,11 @@ extern "C" __global__ void attention_split_kernel(
     unsigned long long query_position_offset,
     unsigned long long chunks,
     const unsigned long long* step_offset,
-    float score_scale
+    float score_scale,
+    // Each head's V width (its partial holds `value_dimension + 2` floats)
+    // and the V row width, as `attention_kernel`.
+    unsigned long long value_dimension,
+    unsigned long long v_model_dim
 ) {
     __shared__ float scores[ATTENTION_CHUNK_KEYS];
     __shared__ float reduce[ATTENTION_SPLIT_THREADS];
@@ -1960,14 +1990,14 @@ extern "C" __global__ void attention_split_kernel(
     if (last > key_upper) {
         last = key_upper;
     }
-    float* out = partial + (head * chunks + chunk) * (head_dimension + 2);
+    float* out = partial + (head * chunks + chunk) * (value_dimension + 2);
     if (first >= last) {
-        for (unsigned long long d = tid; d < head_dimension; d += ATTENTION_SPLIT_THREADS) {
+        for (unsigned long long d = tid; d < value_dimension; d += ATTENTION_SPLIT_THREADS) {
             out[d] = 0.0f;
         }
         if (tid == 0) {
-            out[head_dimension] = neg_inf();
-            out[head_dimension + 1] = 0.0f;
+            out[value_dimension] = neg_inf();
+            out[value_dimension + 1] = 0.0f;
         }
         return;
     }
@@ -2032,16 +2062,17 @@ extern "C" __global__ void attention_split_kernel(
     }
     __syncthreads();
 
-    for (unsigned long long d = tid; d < head_dimension; d += ATTENTION_SPLIT_THREADS) {
+    unsigned long long v_offset = (head / group_size) * value_dimension;
+    for (unsigned long long d = tid; d < value_dimension; d += ATTENTION_SPLIT_THREADS) {
         float acc = 0.0f;
         for (unsigned long long j = 0; j < count; j++) {
-            acc += scores[j] * v[(first + j) * kv_model_dim + kv_offset + d];
+            acc += scores[j] * v[(first + j) * v_model_dim + v_offset + d];
         }
         out[d] = acc;
     }
     if (tid == 0) {
-        out[head_dimension] = max_value;
-        out[head_dimension + 1] = sum;
+        out[value_dimension] = max_value;
+        out[value_dimension + 1] = sum;
     }
 }
 
@@ -5335,4 +5366,33 @@ extern "C" __global__ void q5k_matmul_rows_int8_kernel(
         }
     }
     q5k_store(acc, out, first_row, col0, rows, cols, n, addend, addend_mode);
+}
+
+// Head-wise concatenation (`concat` with `axis = "heads"`,
+// `express-latent-attention-forms`): each output row holds `heads` heads,
+// head `h` being the first input's head `h` (`a_width` values) followed by
+// the second input's head `h`, or its only head when `b_heads == 1`
+// (`b_width` values). One thread per output element.
+extern "C" __global__ void concat_heads_kernel(
+    const float* a,
+    const float* b,
+    float* out,
+    unsigned long long rows,
+    unsigned long long heads,
+    unsigned long long a_width,
+    unsigned long long b_width,
+    unsigned long long b_heads
+) {
+    unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long width = a_width + b_width;
+    if (idx >= rows * heads * width) {
+        return;
+    }
+    unsigned long long row = idx / (heads * width);
+    unsigned long long rem = idx % (heads * width);
+    unsigned long long head = rem / width;
+    unsigned long long j = rem % width;
+    out[idx] = j < a_width
+        ? a[(row * heads + head) * a_width + j]
+        : b[(row * b_heads + (b_heads == 1 ? 0 : head)) * b_width + (j - a_width)];
 }

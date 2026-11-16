@@ -19,11 +19,13 @@ use magnetar_core::capability::CapabilityVersion;
 use magnetar_core::device::DeviceId;
 use magnetar_core::{DeviceBinding, ProviderBinding};
 use magnetar_core::{
-    operator::ATTENTION_SCALE_FEATURE, operator::EMBEDDING_SCALE_FEATURE,
+    operator::ATTENTION_SCALE_FEATURE, operator::ATTENTION_VALUE_HEAD_DIMENSION_FEATURE,
+    operator::CONCAT_HEADS_FEATURE, operator::EMBEDDING_SCALE_FEATURE,
     operator::MOE_EXPERTS_ACTIVATION_FEATURE, operator::MOE_PER_EXPERT_SCALE_FEATURE,
     operator::OperatorFamily, operator::OperatorId, operator::RMSNORM_PER_HEAD_FEATURE,
     operator::RMSNORM_WITHOUT_WEIGHT_FEATURE, operator::ROPE_BANDED_FREQUENCY_SCALING_FEATURE,
-    operator::ROPE_PARTIAL_ROTARY_FEATURE, operator::TensorLayoutKind, operator::TensorRole,
+    operator::ROPE_PARTIAL_ROTARY_FEATURE, operator::ROPE_YARN_FREQUENCY_SCALING_FEATURE,
+    operator::TensorLayoutKind, operator::TensorRole,
 };
 use magnetar_kernel::{
     kernel::KernelAdvertisement, kernel::KernelCancellationSupport, kernel::KernelId,
@@ -200,8 +202,8 @@ pub fn cuda_kernel_advertisements(
             provider_name,
             &[RMSNORM_PER_HEAD_FEATURE, RMSNORM_WITHOUT_WEIGHT_FEATURE],
         ),
-        // Honours the banded frequency-scaling attributes and partial
-        // rotation.
+        // Honours the banded and YaRN frequency-scaling attributes and
+        // partial rotation.
         advertisement_with_features(
             "rope",
             OperatorFamily::PositionEncoding,
@@ -210,15 +212,21 @@ pub fn cuda_kernel_advertisements(
             &[
                 ROPE_BANDED_FREQUENCY_SCALING_FEATURE,
                 ROPE_PARTIAL_ROTARY_FEATURE,
+                ROPE_YARN_FREQUENCY_SCALING_FEATURE,
             ],
         ),
-        // Honours `key_count` (`append-kv-history-in-place`) and `scale`.
+        // Honours `key_count` (`append-kv-history-in-place`), `scale` and
+        // `value_head_dimension`.
         advertisement_with_features(
             "attention",
             OperatorFamily::Attention,
             device_id,
             provider_name,
-            &[KEY_COUNT_FEATURE, ATTENTION_SCALE_FEATURE],
+            &[
+                KEY_COUNT_FEATURE,
+                ATTENTION_SCALE_FEATURE,
+                ATTENTION_VALUE_HEAD_DIMENSION_FEATURE,
+            ],
         ),
         baseline_advertisement(
             "softmax",
@@ -231,7 +239,14 @@ pub fn cuda_kernel_advertisements(
         baseline_advertisement("gelu", OperatorFamily::Activation, device_id, provider_name),
         baseline_advertisement("add", OperatorFamily::Tensor, device_id, provider_name),
         baseline_advertisement("mul", OperatorFamily::Tensor, device_id, provider_name),
-        baseline_advertisement("concat", OperatorFamily::Tensor, device_id, provider_name),
+        // Joins rows, or heads (`axis = "heads"`).
+        advertisement_with_features(
+            "concat",
+            OperatorFamily::Tensor,
+            device_id,
+            provider_name,
+            &[CONCAT_HEADS_FEATURE],
+        ),
         baseline_advertisement("kv-write", OperatorFamily::Tensor, device_id, provider_name),
         baseline_advertisement(
             "residual-add",

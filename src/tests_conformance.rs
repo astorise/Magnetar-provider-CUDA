@@ -3656,3 +3656,252 @@ fn moe_experts_with_gelu_and_per_expert_scale_match_reference_cpu() {
         }
     }
 }
+
+/// YaRN (`express-latent-attention-forms`): DeepSeek-V2-Lite's rotated
+/// width and scaling, with an `attention_factor` on `cos` and `sin`, whole
+/// and partial rotation, both pairings.
+#[test]
+fn yarn_rope_matches_reference_cpu() {
+    use crate::kernels::CudaRopePairing;
+    use magnetar_core::operator::RopeYarnFrequencyScaling;
+    use magnetar_runtime::RopePairing;
+    use magnetar_runtime::reference_cpu::{RopeFrequencies, rope_scaled};
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let scaling = RopeYarnFrequencyScaling {
+        factor: 40.0,
+        original_context_length: 4096,
+        beta_fast: 32.0,
+        beta_slow: 1.0,
+        attention_factor: 1.25,
+        truncate: true,
+    };
+    let input = activations(5, 2 * 64, 91);
+    let device = upload(&kernels, &input);
+    for (pairing, cuda_pairing) in [
+        (RopePairing::HalfSplit, CudaRopePairing::HalfSplit),
+        (RopePairing::Interleaved, CudaRopePairing::Interleaved),
+    ] {
+        for position_offset in [0_u64, 300] {
+            for factor in [None, Some(0.5_f32)] {
+                let expected = rope_scaled(
+                    &input,
+                    10_000.0,
+                    1.0,
+                    64,
+                    position_offset,
+                    2,
+                    pairing,
+                    RopeFrequencies::Yarn(&scaling),
+                    factor,
+                )
+                .unwrap();
+                let rotated = factor.map(|factor| (factor as f64 * 64.0 / 2.0).floor() as u64);
+                let actual = kernels
+                    .rope_scaled(
+                        &device,
+                        10_000.0,
+                        1.0,
+                        64,
+                        position_offset,
+                        2,
+                        cuda_pairing,
+                        None,
+                        Some(&scaling),
+                        rotated,
+                    )
+                    .unwrap();
+                assert_close(&download(&kernels, &actual), &expected);
+            }
+        }
+    }
+    // Banded and YaRN together are refused.
+    let banded = magnetar_core::operator::RopeBandedFrequencyScaling {
+        factor: 8.0,
+        low_freq_factor: 1.0,
+        high_freq_factor: 4.0,
+        original_context_length: 8192,
+    };
+    assert!(
+        kernels
+            .rope_scaled(
+                &device,
+                10_000.0,
+                1.0,
+                64,
+                0,
+                2,
+                CudaRopePairing::HalfSplit,
+                Some(&banded),
+                Some(&scaling),
+                None,
+            )
+            .is_err()
+    );
+}
+
+/// Attention with V rows narrower than Q and K (`value_head_dimension`,
+/// `express-latent-attention-forms`) in the Kernels that serve it: split-key
+/// decode (one chunk and several), the block Kernel and the one-thread
+/// Kernel (a history too long for the block Kernel's shared memory); equal
+/// widths unchanged.
+#[test]
+fn attention_with_a_value_width_matches_reference_cpu() {
+    use magnetar_runtime::reference_cpu::attention_with_value_width;
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    // (query rows, key rows, heads, kv heads, head dimension, value
+    // dimension, window).
+    let shapes = [
+        (1_u64, 40_u64, 4_u64, 4_u64, 192_u64, 128_u64, None),
+        (1, 300, 2, 2, 192, 128, None),
+        (1, 300, 4, 2, 24, 16, Some(64_u64)),
+        (7, 7, 2, 2, 192, 128, None),
+        (24, 24, 4, 1, 12, 20, Some(8)),
+        (3, 13_000, 1, 1, 16, 8, None),
+        (6, 9, 2, 2, 64, 64, None),
+    ];
+    for (seq, kv_seq, heads, kv_heads, dim, value_dim, window) in shapes {
+        let q = activations(seq, heads * dim, 92);
+        let k = activations(kv_seq, kv_heads * dim, 93);
+        let v = activations(kv_seq, kv_heads * value_dim, 94);
+        let (dq, dk, dv) = (
+            upload(&kernels, &q),
+            upload(&kernels, &k),
+            upload(&kernels, &v),
+        );
+        for scale in [None, Some(0.05_f32)] {
+            let expected = attention_with_value_width(
+                &q,
+                &k,
+                &v,
+                heads,
+                dim,
+                value_dim,
+                Some(kv_heads),
+                window,
+                true,
+                scale,
+            )
+            .unwrap();
+            let actual = kernels
+                .attention_valued(
+                    &dq,
+                    &dk,
+                    &dv,
+                    heads,
+                    dim,
+                    Some(value_dim),
+                    Some(kv_heads),
+                    window,
+                    true,
+                    None,
+                    scale,
+                )
+                .unwrap();
+            let actual = download(&kernels, &actual);
+            assert_eq!(actual.shape, expected.shape);
+            for (index, (a, e)) in actual.data.iter().zip(&expected.data).enumerate() {
+                assert!(
+                    (a - e).abs() <= 2e-3,
+                    "shape {:?}, scale {scale:?}, element {index}: cuda={a} reference={e}",
+                    (seq, kv_seq, heads, kv_heads, dim, value_dim, window)
+                );
+            }
+        }
+    }
+    // A decode step over the first rows of a larger store (`key_count`).
+    let (heads, dim, value_dim, rows, keys) = (2_u64, 192_u64, 128_u64, 256_u64, 150_u64);
+    let q = activations(1, heads * dim, 95);
+    let k = activations(rows, heads * dim, 96);
+    let v = activations(rows, heads * value_dim, 97);
+    let first = |tensor: &HostTensor, width: u64| {
+        HostTensor::new(
+            [keys, width],
+            tensor.data[..(keys * width) as usize].to_vec(),
+        )
+        .unwrap()
+    };
+    let expected = attention_with_value_width(
+        &q,
+        &first(&k, heads * dim),
+        &first(&v, heads * value_dim),
+        heads,
+        dim,
+        value_dim,
+        None,
+        None,
+        true,
+        None,
+    )
+    .unwrap();
+    let actual = kernels
+        .attention_valued(
+            &upload(&kernels, &q),
+            &upload(&kernels, &k),
+            &upload(&kernels, &v),
+            heads,
+            dim,
+            Some(value_dim),
+            None,
+            None,
+            true,
+            Some(keys),
+            None,
+        )
+        .unwrap();
+    let actual = download(&kernels, &actual);
+    assert_eq!(actual.shape, expected.shape);
+    for (a, e) in actual.data.iter().zip(&expected.data) {
+        assert!((a - e).abs() <= 2e-3, "key_count: cuda={a} reference={e}");
+    }
+    // V rows of the wrong width are refused.
+    let q = upload(&kernels, &activations(1, 2 * 16, 98));
+    let k = upload(&kernels, &activations(4, 2 * 16, 99));
+    let v = upload(&kernels, &activations(4, 2 * 12, 100));
+    assert!(
+        kernels
+            .attention_valued(&q, &k, &v, 2, 16, Some(8), None, None, true, None, None)
+            .is_err()
+    );
+}
+
+/// Head-wise `concat` (`axis = "heads"`), per head and with the second
+/// input's one head given to every head; mismatched shapes refused.
+#[test]
+fn concat_heads_matches_reference_cpu() {
+    use magnetar_provider_api::operator_semantics::concat_heads;
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    for (heads, a_width, second_heads, b_width) in [(4_u64, 6_u64, 4_u64, 2_u64), (16, 128, 1, 64)]
+    {
+        let a = activations(5, heads * a_width, 101);
+        let b = activations(5, second_heads * b_width, 102);
+        let expected = concat_heads(&a, &b, heads, second_heads).unwrap();
+        let actual = kernels
+            .concat_heads(
+                &upload(&kernels, &a),
+                &upload(&kernels, &b),
+                heads,
+                second_heads,
+            )
+            .unwrap();
+        let actual = download(&kernels, &actual);
+        assert_eq!(actual.shape, expected.shape);
+        assert_eq!(actual.data, expected.data, "{heads} heads");
+    }
+    let a = upload(&kernels, &activations(5, 12, 103));
+    assert!(
+        kernels
+            .concat_heads(&a, &upload(&kernels, &activations(4, 3, 104)), 4, 1)
+            .is_err()
+    );
+    assert!(
+        kernels
+            .concat_heads(&a, &upload(&kernels, &activations(5, 6, 105)), 4, 2)
+            .is_err()
+    );
+}
