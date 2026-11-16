@@ -179,6 +179,45 @@ extern "C" __global__ void embedding_lookup_kernel(
 // quants in stored row-major order, one f32 scale per 32 consecutive
 // quants (a row is a whole number of blocks).
 
+// The stored element a dequantization thread reads. Without `row_ids`,
+// thread `idx` reads stored element `idx`. With them (an embedding lookup
+// of a table stored untransposed), thread `idx` reads column
+// `idx % stored_cols` of the stored row id `idx / stored_cols` names, so
+// only the looked-up rows are dequantized; an id that is negative, not an
+// integer or not below `stored_rows` sets `invalid_id_flag` and its output
+// row is left unwritten (as `embedding_lookup_kernel`).
+__device__ __forceinline__ bool packed_element(
+    unsigned long long idx,
+    unsigned long long stored_rows,
+    unsigned long long stored_cols,
+    const float* row_ids,
+    unsigned long long id_count,
+    int* invalid_id_flag,
+    unsigned long long* r,
+    unsigned long long* c
+) {
+    if (!row_ids) {
+        if (idx >= stored_rows * stored_cols) {
+            return false;
+        }
+        *r = idx / stored_cols;
+        *c = idx % stored_cols;
+        return true;
+    }
+    if (idx >= id_count * stored_cols) {
+        return false;
+    }
+    float raw_id = row_ids[idx / stored_cols];
+    if (raw_id < 0.0f || raw_id != floorf(raw_id)
+        || (unsigned long long)raw_id >= stored_rows) {
+        atomicExch(invalid_id_flag, 1);
+        return false;
+    }
+    *r = (unsigned long long)raw_id;
+    *c = idx % stored_cols;
+    return true;
+}
+
 // One thread per stored value: the logical matrix as f32, the stored one
 // or (`transposed`) its transpose.
 extern "C" __global__ void q8_dequantize_kernel(
@@ -187,16 +226,20 @@ extern "C" __global__ void q8_dequantize_kernel(
     float* out,
     unsigned long long stored_rows,
     unsigned long long stored_cols,
-    unsigned int transposed
+    unsigned int transposed,
+    // An embedding lookup's ids, or null (`packed_element`).
+    const float* row_ids,
+    unsigned long long id_count,
+    int* invalid_id_flag
 ) {
     unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= stored_rows * stored_cols) {
+    unsigned long long r, c;
+    if (!packed_element(idx, stored_rows, stored_cols, row_ids, id_count, invalid_id_flag, &r, &c)) {
         return;
     }
-    float value = (float)quants[idx] * scales[idx >> 5];
+    unsigned long long stored = r * stored_cols + c;
+    float value = (float)quants[stored] * scales[stored >> 5];
     if (transposed) {
-        unsigned long long r = idx / stored_cols;
-        unsigned long long c = idx % stored_cols;
         out[c * stored_rows + r] = value;
     } else {
         out[idx] = value;
@@ -2519,14 +2562,17 @@ extern "C" __global__ void q4k_dequantize_kernel(
     float* out,
     unsigned long long stored_rows,
     unsigned long long stored_cols,
-    unsigned int transposed
+    unsigned int transposed,
+    // An embedding lookup's ids, or null (`packed_element`).
+    const float* row_ids,
+    unsigned long long id_count,
+    int* invalid_id_flag
 ) {
     unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= stored_rows * stored_cols) {
+    unsigned long long r, c;
+    if (!packed_element(idx, stored_rows, stored_cols, row_ids, id_count, invalid_id_flag, &r, &c)) {
         return;
     }
-    unsigned long long r = idx / stored_cols;
-    unsigned long long c = idx % stored_cols;
     const unsigned char* block = blocks
         + (r * (stored_cols / Q4K_BLOCK_VALUES) + c / Q4K_BLOCK_VALUES) * Q4K_BLOCK_BYTES;
     unsigned int w = (unsigned int)(c % Q4K_BLOCK_VALUES);
@@ -2798,14 +2844,17 @@ extern "C" __global__ void q6k_dequantize_kernel(
     float* out,
     unsigned long long stored_rows,
     unsigned long long stored_cols,
-    unsigned int transposed
+    unsigned int transposed,
+    // An embedding lookup's ids, or null (`packed_element`).
+    const float* row_ids,
+    unsigned long long id_count,
+    int* invalid_id_flag
 ) {
     unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= stored_rows * stored_cols) {
+    unsigned long long r, c;
+    if (!packed_element(idx, stored_rows, stored_cols, row_ids, id_count, invalid_id_flag, &r, &c)) {
         return;
     }
-    unsigned long long r = idx / stored_cols;
-    unsigned long long c = idx % stored_cols;
     unsigned long long super_block = r * (stored_cols / Q6K_BLOCK_VALUES) + c / Q6K_BLOCK_VALUES;
     const unsigned char* block = blocks + super_block * Q6K_BLOCK_BYTES;
     unsigned int w = (unsigned int)(c % Q6K_BLOCK_VALUES);
@@ -3503,14 +3552,17 @@ extern "C" __global__ void lowk_dequantize_kernel(
     float* out,
     unsigned long long stored_rows,
     unsigned long long stored_cols,
-    unsigned int transposed
+    unsigned int transposed,
+    // An embedding lookup's ids, or null (`packed_element`).
+    const float* row_ids,
+    unsigned long long id_count,
+    int* invalid_id_flag
 ) {
     unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= stored_rows * stored_cols) {
+    unsigned long long r, c;
+    if (!packed_element(idx, stored_rows, stored_cols, row_ids, id_count, invalid_id_flag, &r, &c)) {
         return;
     }
-    unsigned long long r = idx / stored_cols;
-    unsigned long long c = idx % stored_cols;
     unsigned long long super_block = r * (stored_cols / 256) + c / 256;
     const unsigned char* block = blocks + super_block * lowk_block_bytes(format);
     const float* ds = dscales + super_block * lowk_scale_floats(format);
@@ -3765,10 +3817,12 @@ extern "C" __global__ void lowk_gated_matmul_rows_int8_kernel(
 // 16 bytes are contiguous in stored order; `IQ4_NL` (format 0) keeps one
 // f32 scale per run, `IQ4_XS` (format 1) one f32 `d` per super-block of
 // eight runs and, after all runs' bytes, one signed byte per run: its
-// 6-bit sub-block scale minus 32.
+// 6-bit sub-block scale minus 32. `Q4_0` (format 2) is laid out like
+// `IQ4_NL`, its 4-bit quants standing for `q - 8` instead of table values.
 
 #define IQ4_NL_FORMAT 0
 #define IQ4_XS_FORMAT 1
+#define Q4_0_FORMAT 2
 
 __constant__ signed char IQ4_VALUES[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
@@ -3795,7 +3849,13 @@ __device__ __forceinline__ float iq4_run_scale(
     const signed char* subscales,
     unsigned long long run
 ) {
-    return format == IQ4_NL_FORMAT ? dscales[run] : dscales[run / 8] * (float)subscales[run];
+    return format == IQ4_XS_FORMAT ? dscales[run / 8] * (float)subscales[run] : dscales[run];
+}
+
+// Four values for the four nibbles in the low halves of `nibbles`' bytes:
+// `q - 8` per byte for `Q4_0`, else the IQ4 table's.
+__device__ __forceinline__ int iq4_values4(int format, unsigned int nibbles) {
+    return format == Q4_0_FORMAT ? (int)__vsub4(nibbles, 0x08080808u) : iq4_lookup4(nibbles);
 }
 
 // The logical matrix as f32, one thread per stored element.
@@ -3807,19 +3867,23 @@ extern "C" __global__ void iq4_dequantize_kernel(
     float* out,
     unsigned long long stored_rows,
     unsigned long long stored_cols,
-    unsigned int transposed
+    unsigned int transposed,
+    // An embedding lookup's ids, or null (`packed_element`).
+    const float* row_ids,
+    unsigned long long id_count,
+    int* invalid_id_flag
 ) {
     unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= stored_rows * stored_cols) {
+    unsigned long long r, c;
+    if (!packed_element(idx, stored_rows, stored_cols, row_ids, id_count, invalid_id_flag, &r, &c)) {
         return;
     }
-    unsigned long long r = idx / stored_cols;
-    unsigned long long c = idx % stored_cols;
-    unsigned long long run = idx / 32;
+    unsigned long long run = (r * stored_cols + c) / 32;
     unsigned int w = (unsigned int)(c % 32);
     unsigned char byte = qs[run * 16 + (w % 16)];
     unsigned int index = w < 16 ? (byte & 0xF) : (byte >> 4);
-    float value = iq4_run_scale(format, dscales, subscales, run) * (float)IQ4_VALUES[index];
+    float quant = format == Q4_0_FORMAT ? (float)((int)index - 8) : (float)IQ4_VALUES[index];
+    float value = iq4_run_scale(format, dscales, subscales, run) * quant;
     if (transposed) {
         out[c * stored_rows + r] = value;
     } else {
@@ -3828,21 +3892,21 @@ extern "C" __global__ void iq4_dequantize_kernel(
 }
 
 // One run's dot product with its 32 int8 activations (`x0` the first 16).
-__device__ __forceinline__ int iq4_run_dot(int4 q, int4 x0, int4 x1) {
+__device__ __forceinline__ int iq4_run_dot(int format, int4 q, int4 x0, int4 x1) {
     const unsigned int* w = reinterpret_cast<const unsigned int*>(&q);
     const int* xa = reinterpret_cast<const int*>(&x0);
     const int* xb = reinterpret_cast<const int*>(&x1);
     int dot = 0;
 #pragma unroll
     for (int i = 0; i < 4; i++) {
-        dot = i8_dot4(iq4_lookup4(w[i] & 0x0F0F0F0Fu), xa[i], dot);
-        dot = i8_dot4(iq4_lookup4((w[i] >> 4) & 0x0F0F0F0Fu), xb[i], dot);
+        dot = i8_dot4(iq4_values4(format, w[i] & 0x0F0F0F0Fu), xa[i], dot);
+        dot = i8_dot4(iq4_values4(format, (w[i] >> 4) & 0x0F0F0F0Fu), xb[i], dot);
     }
     return dot;
 }
 
-// out[r, c] = sum_k a[r, k] * W[k, c] (+ addend) for a packed `IQ4_NL` or
-// `IQ4_XS` weight stored transposed, over int8 activations: one warp per
+// out[r, c] = sum_k a[r, k] * W[k, c] (+ addend) for a packed `IQ4_NL`,
+// `IQ4_XS` or `Q4_0` weight stored transposed, over int8 activations: one warp per
 // column, one 32-value run (one activation block) per lane per step.
 extern "C" __global__ void iq4_matmul_rows_int8_kernel(
     int format,
@@ -3887,7 +3951,7 @@ extern "C" __global__ void iq4_matmul_rows_int8_kernel(
                 unsigned long long at = (first_row + r) * k + u * 32;
                 int4 x0 = *reinterpret_cast<const int4*>(aq + at);
                 int4 x1 = *reinterpret_cast<const int4*>(aq + at + 16);
-                acc[r] += scale * ad[at >> 5] * (float)iq4_run_dot(q, x0, x1);
+                acc[r] += scale * ad[at >> 5] * (float)iq4_run_dot(format, q, x0, x1);
             }
         }
     }
@@ -3910,7 +3974,7 @@ extern "C" __global__ void iq4_matmul_rows_int8_kernel(
     }
 }
 
-// `silu(a x gate) * (a x up)` for two packed `IQ4_NL`/`IQ4_XS` weights of
+// `silu(a x gate) * (a x up)` for two packed `IQ4_NL`/`IQ4_XS`/`Q4_0` weights of
 // one format, stored transposed, over int8 activations.
 extern "C" __global__ void iq4_gated_matmul_rows_int8_kernel(
     int format,
@@ -3961,8 +4025,8 @@ extern "C" __global__ void iq4_gated_matmul_rows_int8_kernel(
                 int4 x0 = *reinterpret_cast<const int4*>(aq + at);
                 int4 x1 = *reinterpret_cast<const int4*>(aq + at + 16);
                 float da = ad[at >> 5];
-                gate_acc[r] += sg * da * (float)iq4_run_dot(qg, x0, x1);
-                up_acc[r] += su * da * (float)iq4_run_dot(qu, x0, x1);
+                gate_acc[r] += sg * da * (float)iq4_run_dot(format, qg, x0, x1);
+                up_acc[r] += su * da * (float)iq4_run_dot(format, qu, x0, x1);
             }
         }
     }
@@ -4763,15 +4827,18 @@ extern "C" __global__ void iq_dequantize_kernel(
     float* out,
     unsigned long long stored_rows,
     unsigned long long stored_cols,
-    unsigned int transposed
+    unsigned int transposed,
+    // An embedding lookup's ids, or null (`packed_element`).
+    const float* row_ids,
+    unsigned long long id_count,
+    int* invalid_id_flag
 ) {
     unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= stored_rows * stored_cols) {
+    unsigned long long r, c;
+    if (!packed_element(idx, stored_rows, stored_cols, row_ids, id_count, invalid_id_flag, &r, &c)) {
         return;
     }
-    unsigned long long r = idx / stored_cols;
-    unsigned long long c = idx % stored_cols;
-    unsigned long long super_block = idx / 256;
+    unsigned long long super_block = (r * stored_cols + c) / 256;
     unsigned int w = (unsigned int)(c % 256);
     unsigned int words;
     const unsigned int* grid = iq_global_grid(format, &words);
@@ -5008,14 +5075,17 @@ extern "C" __global__ void q5k_dequantize_kernel(
     float* out,
     unsigned long long stored_rows,
     unsigned long long stored_cols,
-    unsigned int transposed
+    unsigned int transposed,
+    // An embedding lookup's ids, or null (`packed_element`).
+    const float* row_ids,
+    unsigned long long id_count,
+    int* invalid_id_flag
 ) {
     unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= stored_rows * stored_cols) {
+    unsigned long long r, c;
+    if (!packed_element(idx, stored_rows, stored_cols, row_ids, id_count, invalid_id_flag, &r, &c)) {
         return;
     }
-    unsigned long long r = idx / stored_cols;
-    unsigned long long c = idx % stored_cols;
     const unsigned char* block = blocks
         + (r * (stored_cols / Q4K_BLOCK_VALUES) + c / Q4K_BLOCK_VALUES) * Q5K_BLOCK_BYTES;
     unsigned int w = (unsigned int)(c % Q4K_BLOCK_VALUES);
