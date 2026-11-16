@@ -32,7 +32,8 @@ use magnetar_core::{
     ScheduledOperationId,
 };
 use magnetar_core::{
-    operator::OperatorAttributeValue, operator::OperatorSpec, operator::RopeBandedFrequencyScaling,
+    operator::ConcatAxis, operator::OperatorAttributeValue, operator::OperatorSpec,
+    operator::RopeBandedFrequencyScaling, operator::RopeYarnFrequencyScaling,
 };
 use magnetar_graph::{
     memory::MemoryAllocationClass, memory::MemoryAllocationId, memory::MemoryAllocationOwner,
@@ -1550,6 +1551,11 @@ impl CudaExecutor {
                             .map_err(|attribute| KernelError::KernelAttributeUnsupported {
                                 attribute,
                             })?;
+                    // `express-latent-attention-forms`.
+                    let yarn = RopeYarnFrequencyScaling::from_attributes(&invocation.attributes)
+                        .map_err(|attribute| KernelError::KernelAttributeUnsupported {
+                            attribute,
+                        })?;
                     // `partial_rotary_factor`: only the first
                     // floor(factor * dimension / 2) pairs rotate.
                     let rotated_pairs = match invocation.attributes.get("partial_rotary_factor") {
@@ -1568,7 +1574,7 @@ impl CudaExecutor {
                         }
                     };
                     self.kernels
-                        .rope_partial(
+                        .rope_scaled(
                             input,
                             base,
                             scale,
@@ -1577,6 +1583,7 @@ impl CudaExecutor {
                             head_count,
                             pairing,
                             frequency_scaling.as_ref(),
+                            yarn.as_ref(),
                             rotated_pairs,
                         )
                         .map_err(KernelError::from)?
@@ -1623,13 +1630,29 @@ impl CudaExecutor {
                     }
                     let key_count = Self::attribute_integer(&invocation.attributes, "key_count");
                     let scale = Self::attribute_float_opt(&invocation.attributes, "scale")?;
+                    // `express-latent-attention-forms`: V rows of their
+                    // own width.
+                    let value_dimension = match invocation.attributes.get("value_head_dimension") {
+                        None => None,
+                        Some(OperatorAttributeValue::Integer(width)) if *width > 0 => {
+                            Some(*width as u64)
+                        }
+                        Some(other) => {
+                            return Err(KernelError::KernelAttributeUnsupported {
+                                attribute: format!(
+                                    "value_head_dimension {other:?} must be a positive integer"
+                                ),
+                            });
+                        }
+                    };
                     self.kernels
-                        .attention_scaled(
+                        .attention_valued(
                             q,
                             k,
                             v,
                             head_count,
                             head_dimension,
+                            value_dimension,
                             kv_head_count,
                             window_size,
                             causal,
@@ -1764,7 +1787,32 @@ impl CudaExecutor {
                 "concat" => {
                     let a = get(0)?;
                     let b = get(1)?;
-                    self.kernels.concat(a, b).map_err(KernelError::from)?
+                    match magnetar_core::operator::concat_axis(&invocation.attributes) {
+                        Some(ConcatAxis::Rows) => {
+                            self.kernels.concat(a, b).map_err(KernelError::from)?
+                        }
+                        // `express-latent-attention-forms`: head by head.
+                        Some(ConcatAxis::Heads) => {
+                            let head_count =
+                                Self::attribute_integer(&invocation.attributes, "head_count")
+                                    .ok_or_else(|| KernelError::KernelAttributeUnsupported {
+                                        attribute: "head_count".into(),
+                                    })?;
+                            let second_head_count = Self::attribute_integer(
+                                &invocation.attributes,
+                                "second_head_count",
+                            )
+                            .unwrap_or(head_count);
+                            self.kernels
+                                .concat_heads(a, b, head_count, second_head_count)
+                                .map_err(KernelError::from)?
+                        }
+                        None => {
+                            return Err(KernelError::KernelAttributeUnsupported {
+                                attribute: "concat axis must be 'rows' or 'heads'".into(),
+                            });
+                        }
+                    }
                 }
                 "residual-add" => {
                     let input = get(0)?;

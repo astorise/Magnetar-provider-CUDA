@@ -23,7 +23,7 @@ use cudarc::driver::{
     DevicePtrMut, LaunchConfig, PushKernelArg, sys,
 };
 use cudarc::nvrtc::compile_ptx;
-use magnetar_core::operator::RopeBandedFrequencyScaling;
+use magnetar_core::operator::{RopeBandedFrequencyScaling, RopeYarnFrequencyScaling};
 use magnetar_provider_api::HostTensor;
 use magnetar_provider_api::{packed_weight::PackedWeight, packed_weight::PackedWeightFormat};
 use std::collections::BTreeSet;
@@ -2985,7 +2985,50 @@ impl CudaKernels {
         frequency_scaling: Option<&RopeBandedFrequencyScaling>,
         rotated_pairs: Option<u64>,
     ) -> Result<CudaDeviceBuffer, CudaError> {
+        self.rope_scaled(
+            input,
+            base,
+            scale,
+            dimension,
+            position_offset,
+            head_count,
+            pairing,
+            frequency_scaling,
+            None,
+            rotated_pairs,
+        )
+    }
+
+    /// [`Self::rope_partial`] with YaRN instead of the banded scaling
+    /// (`frequency_scaling = "yarn"`, `express-latent-attention-forms`):
+    /// each rotated pair's frequency blended along the correction range,
+    /// and its `cos` and `sin` multiplied by `attention_factor`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_scaled(
+        &self,
+        input: &CudaDeviceBuffer,
+        base: f32,
+        scale: f32,
+        dimension: u64,
+        position_offset: u64,
+        head_count: u64,
+        pairing: CudaRopePairing,
+        frequency_scaling: Option<&RopeBandedFrequencyScaling>,
+        yarn: Option<&RopeYarnFrequencyScaling>,
+        rotated_pairs: Option<u64>,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
         Self::require_f32(&[input], "rope")?;
+        if frequency_scaling.is_some() && yarn.is_some() {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                "RoPE takes one frequency scaling, not banded and YaRN together",
+            ));
+        }
+        if let Some(scaling) = yarn {
+            scaling
+                .validate()
+                .map_err(|reason| CudaError::new(CudaErrorCode::ShapeUnsupported, reason))?;
+        }
         if let Some(scaling) = frequency_scaling {
             scaling
                 .validate()
@@ -3033,6 +3076,18 @@ impl CudaKernels {
         }
         let half = dimension / 2;
         let rotated_pairs = rotated_pairs.unwrap_or(half).min(half);
+        // `0` disables YaRN in the Kernel; the range is computed once here,
+        // in `f64`, as every Kernel takes it.
+        let (yarn_factor, yarn_low, yarn_high, amplitude) =
+            yarn.map_or((0.0_f32, 0.0_f32, 0.0_f32, 1.0_f32), |scaling| {
+                let (low, high) = scaling.correction_range(dimension, base);
+                (
+                    scaling.factor as f32,
+                    low,
+                    high,
+                    scaling.attention_factor as f32,
+                )
+            });
         let half_split: u32 = match pairing {
             CudaRopePairing::Interleaved => 0,
             CudaRopePairing::HalfSplit => 1,
@@ -3067,7 +3122,11 @@ impl CudaKernels {
             .arg(&low_freq_factor)
             .arg(&high_freq_factor)
             .arg(&original_context_length)
-            .arg(&rotated_pairs);
+            .arg(&rotated_pairs)
+            .arg(&yarn_factor)
+            .arg(&yarn_low)
+            .arg(&yarn_high)
+            .arg(&amplitude);
         unsafe { args.launch(LaunchConfig::for_num_elems(work_items)) }?;
         Ok(CudaDeviceBuffer {
             slice: out_dev,
@@ -4334,8 +4393,49 @@ impl CudaKernels {
         key_count: Option<u64>,
         scale: Option<f32>,
     ) -> Result<CudaDeviceBuffer, CudaError> {
+        self.attention_valued(
+            q,
+            k,
+            v,
+            head_count,
+            head_dimension,
+            None,
+            kv_head_count,
+            window_size,
+            causal,
+            key_count,
+            scale,
+        )
+    }
+
+    /// [`Self::attention_scaled`] with V rows `value_dimension` wide per
+    /// head (`attention.value_head_dimension`,
+    /// `express-latent-attention-forms`): Q and K rows stay `head_dimension`
+    /// wide, and the output is `[T, head_count * value_dimension]`. A
+    /// distinct value width runs the general Kernels (block, one thread per
+    /// head and query, split-key decode); the Tensor Core, tiled and grouped
+    /// decode Kernels serve equal widths only.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_valued(
+        &self,
+        q: &CudaDeviceBuffer,
+        k: &CudaDeviceBuffer,
+        v: &CudaDeviceBuffer,
+        head_count: u64,
+        head_dimension: u64,
+        value_dimension: Option<u64>,
+        kv_head_count: Option<u64>,
+        window_size: Option<u64>,
+        causal: bool,
+        key_count: Option<u64>,
+        scale: Option<f32>,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
         Self::require_f32(&[q, k, v], "attention")?;
-        same_shape_buf(k, v)?;
+        let value_dimension = value_dimension.unwrap_or(head_dimension);
+        let same_width = value_dimension == head_dimension;
+        if same_width {
+            same_shape_buf(k, v)?;
+        }
         // `0` makes every Kernel use 1/sqrt(head_dimension).
         let score_scale = match scale {
             None => 0.0_f32,
@@ -4348,7 +4448,7 @@ impl CudaKernels {
             }
         };
         let kv_head_count = kv_head_count.unwrap_or(head_count);
-        if head_count == 0 || head_dimension == 0 || kv_head_count == 0 {
+        if head_count == 0 || head_dimension == 0 || kv_head_count == 0 || value_dimension == 0 {
             return Err(CudaError::new(
                 CudaErrorCode::ShapeUnsupported,
                 "head_count, kv_head_count, and head_dimension must all be positive",
@@ -4407,6 +4507,24 @@ impl CudaKernels {
                 ),
             ));
         }
+        let (v_rows, v_model_dim) = rows_cols_buf(v)?;
+        if v_rows != kv_rows || kv_head_count * value_dimension != v_model_dim {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!(
+                    "v must hold {kv_rows} rows of kv_head_count * value_dimension = \
+                     {kv_head_count} * {value_dimension}, got {:?}",
+                    v.shape
+                ),
+            ));
+        }
+        let out_len = usize::try_from(seq_len * head_count * value_dimension).map_err(|_| {
+            CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                "attention output size overflows",
+            )
+        })?;
+        let out_shape = vec![seq_len, head_count * value_dimension];
         let query_position_offset = kv_seq_len - seq_len;
         let causal_flag: i32 = if causal { 1 } else { 0 };
         let window_arg: i64 = window_size.map(|w| w as i64).unwrap_or(-1);
@@ -4431,6 +4549,8 @@ impl CudaKernels {
                     // Every key a replay may admit has a chunk, so a
                     // captured launch covers every later step.
                     kv_rows,
+                    value_dimension,
+                    v_model_dim,
                 ],
                 causal_flag,
                 window_arg,
@@ -4450,7 +4570,8 @@ impl CudaKernels {
         // on K and V split once, when their rows align. Otherwise the tiled
         // Kernel compiled for the head dimension.
         let kv_len = kv_seq_len * kv_model_dim;
-        if seq_len >= 16
+        if same_width
+            && seq_len >= 16
             && kv_model_dim % TCP_ALIGN == 0
             && kv_len > 0
             && let Some((name, shared_bytes)) = tensor_core_prefill_attention(head_dimension)
@@ -4515,7 +4636,7 @@ impl CudaKernels {
             128 => Some("attention_tiled_32_kernel"),
             _ => None,
         };
-        if let Some(tiled) = tiled.filter(|_| seq_len > 1) {
+        if let Some(tiled) = tiled.filter(|_| seq_len > 1 && same_width) {
             let overflow = || {
                 CudaError::new(
                     CudaErrorCode::ShapeUnsupported,
@@ -4585,7 +4706,7 @@ impl CudaKernels {
                 )
             })?;
             // Writes every element (zero for an empty key window).
-            let mut out_dev = self.alloc_output(q.slice.len())?;
+            let mut out_dev = self.alloc_output(out_len)?;
             let func = self.function("attention_block_kernel")?;
             let mut args = self.stream.launch_builder(&func);
             args.arg(&q.slice)
@@ -4603,7 +4724,9 @@ impl CudaKernels {
                 .arg(&window_arg)
                 .arg(&query_position_offset)
                 .arg(&step_offset)
-                .arg(&score_scale);
+                .arg(&score_scale)
+                .arg(&value_dimension)
+                .arg(&v_model_dim);
             let config = LaunchConfig {
                 grid_dim: (blocks, 1, 1),
                 block_dim: (ATTENTION_THREADS, 1, 1),
@@ -4612,7 +4735,7 @@ impl CudaKernels {
             unsafe { args.launch(config) }?;
             return Ok(CudaDeviceBuffer {
                 slice: out_dev,
-                shape: q.shape.clone(),
+                shape: out_shape,
                 bf16: None,
                 q8: None,
             });
@@ -4621,7 +4744,7 @@ impl CudaKernels {
             // The one-thread-per-(head, query) Kernel has no replay offset.
             self.forbid_in_capture("attention over a history this long")?;
         }
-        let mut out_dev = self.stream.alloc_zeros::<f32>(q.slice.len())?;
+        let mut out_dev = self.stream.alloc_zeros::<f32>(out_len)?;
         let func = self.function("attention_kernel")?;
         let mut args = self.stream.launch_builder(&func);
         args.arg(&q.slice)
@@ -4638,11 +4761,13 @@ impl CudaKernels {
             .arg(&causal_flag)
             .arg(&window_arg)
             .arg(&query_position_offset)
-            .arg(&score_scale);
+            .arg(&score_scale)
+            .arg(&value_dimension)
+            .arg(&v_model_dim);
         unsafe { args.launch(LaunchConfig::for_num_elems((head_count * seq_len) as u32)) }?;
         Ok(CudaDeviceBuffer {
             slice: out_dev,
-            shape: q.shape.clone(),
+            shape: out_shape,
             bf16: None,
             q8: None,
         })
@@ -4654,15 +4779,16 @@ impl CudaKernels {
     /// chunks of [`ATTENTION_CHUNK_KEYS`] scored by separate blocks, then
     /// merged in chunk order (`attention_split_kernel`,
     /// `attention_combine_kernel` in `kernels.cu`). `dims` is the key
-    /// count, head count, KV head count, head dimension, q and k/v row
-    /// widths, query position and the K/V row count.
+    /// count, head count, KV head count, head dimension, q and k row
+    /// widths, query position, the K/V row count, and each head's V width
+    /// and the V row width.
     #[allow(clippy::too_many_arguments)]
     fn attention_split(
         &self,
         q: &CudaDeviceBuffer,
         k: &CudaDeviceBuffer,
         v: &CudaDeviceBuffer,
-        dims: [u64; 8],
+        dims: [u64; 10],
         causal_flag: i32,
         window_arg: i64,
         step_offset: u64,
@@ -4677,6 +4803,8 @@ impl CudaKernels {
             kv_model_dim,
             query_position_offset,
             kv_rows,
+            value_dimension,
+            v_model_dim,
         ] = dims;
         let overflow = || {
             CudaError::new(
@@ -4687,14 +4815,15 @@ impl CudaKernels {
         // All query heads of a KV head in one block, reading its K and V
         // once, where the shapes allow it.
         let grouped = grouped_decode_kernel(head_dimension).filter(|_| {
-            kv_head_count > 0
+            value_dimension == head_dimension
+                && kv_head_count > 0
                 && head_count % kv_head_count == 0
                 && head_count / kv_head_count <= ATTENTION_GQA_MAX_GROUP
         });
         let chunk_keys = grouped.map_or(ATTENTION_CHUNK_KEYS, |(_, keys)| keys);
         let chunks = kv_rows.div_ceil(chunk_keys).max(1);
         let partial_len =
-            usize::try_from(head_count * chunks * (head_dimension + 2)).map_err(|_| overflow())?;
+            usize::try_from(head_count * chunks * (value_dimension + 2)).map_err(|_| overflow())?;
         let mut scratch = self.attention_scratch.lock().unwrap();
         if scratch
             .0
@@ -4710,7 +4839,8 @@ impl CudaKernels {
             }
         }
         let partial = scratch.0.as_mut().expect("allocated above");
-        let mut out_dev = self.alloc_output(q.slice.len())?;
+        let mut out_dev = self
+            .alloc_output(usize::try_from(head_count * value_dimension).map_err(|_| overflow())?)?;
         if let Some((grouped_name, _)) = grouped {
             let split = self.function(grouped_name)?;
             let mut args = self.stream.launch_builder(&split);
@@ -4756,7 +4886,9 @@ impl CudaKernels {
                 .arg(&query_position_offset)
                 .arg(&chunks)
                 .arg(&step_offset)
-                .arg(&score_scale);
+                .arg(&score_scale)
+                .arg(&value_dimension)
+                .arg(&v_model_dim);
             let config = LaunchConfig {
                 grid_dim: (
                     u32::try_from(chunks).map_err(|_| overflow())?,
@@ -4772,10 +4904,12 @@ impl CudaKernels {
         let weight_bytes = u32::try_from(chunks * 4).unwrap_or(u32::MAX);
         let cache_weights = i32::from(weight_bytes <= ATTENTION_COMBINE_MAX_DYNAMIC_SHARED);
         let mut args = self.stream.launch_builder(&combine);
+        // The partials and the output are V-wide: the combine Kernel's
+        // width is the value width.
         args.arg(&*partial)
             .arg(&mut out_dev)
             .arg(&head_count)
-            .arg(&head_dimension)
+            .arg(&value_dimension)
             .arg(&chunks)
             .arg(&cache_weights);
         let config = LaunchConfig {
@@ -4783,10 +4917,10 @@ impl CudaKernels {
             // Lanes of chunks per output dimension: up to 8, within 256
             // threads for small heads, one lane past 1024 dimensions.
             block_dim: (
-                u32::try_from(if head_dimension > 1024 {
+                u32::try_from(if value_dimension > 1024 {
                     1024
                 } else {
-                    head_dimension * (256 / head_dimension).clamp(1, 8)
+                    value_dimension * (256 / value_dimension).clamp(1, 8)
                 })
                 .map_err(|_| overflow())?,
                 1,
@@ -4800,7 +4934,59 @@ impl CudaKernels {
         unsafe { args.launch(config) }?;
         Ok(CudaDeviceBuffer {
             slice: out_dev,
-            shape: q.shape.clone(),
+            shape: vec![1, head_count * value_dimension],
+            bf16: None,
+            q8: None,
+        })
+    }
+
+    /// Head-wise `concat` (`axis = "heads"`, `express-latent-attention-forms`):
+    /// `[T, heads * a]` and `[T, second_head_count * b]` into
+    /// `[T, heads * (a + b)]`, each output head the first input's head then
+    /// the second's (its only head when `second_head_count` is 1).
+    pub fn concat_heads(
+        &self,
+        a: &CudaDeviceBuffer,
+        b: &CudaDeviceBuffer,
+        head_count: u64,
+        second_head_count: u64,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        Self::require_f32(&[a, b], "concat")?;
+        let (rows, a_cols) = rows_cols_buf(a)?;
+        let (b_rows, b_cols) = rows_cols_buf(b)?;
+        let invalid = |reason: String| CudaError::new(CudaErrorCode::ShapeUnsupported, reason);
+        if rows != b_rows {
+            return Err(invalid(format!(
+                "concat across heads needs inputs with the same rows, got {:?} and {:?}",
+                a.shape, b.shape
+            )));
+        }
+        let (a_width, b_width) = magnetar_core::operator::concat_heads_widths(
+            a_cols,
+            b_cols,
+            head_count,
+            second_head_count,
+        )
+        .map_err(invalid)?;
+        let total = rows
+            .checked_mul(head_count * (a_width + b_width))
+            .filter(|total| u32::try_from(*total).is_ok())
+            .ok_or_else(|| invalid("concat across heads overflows a launch".into()))?;
+        let mut out_dev = self.alloc_output(total as usize)?;
+        let func = self.function("concat_heads_kernel")?;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(&a.slice)
+            .arg(&b.slice)
+            .arg(&mut out_dev)
+            .arg(&rows)
+            .arg(&head_count)
+            .arg(&a_width)
+            .arg(&b_width)
+            .arg(&second_head_count);
+        unsafe { args.launch(LaunchConfig::for_num_elems(total as u32)) }?;
+        Ok(CudaDeviceBuffer {
+            slice: out_dev,
+            shape: vec![rows, head_count * (a_width + b_width)],
             bf16: None,
             q8: None,
         })
