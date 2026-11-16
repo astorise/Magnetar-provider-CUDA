@@ -2435,7 +2435,8 @@ fn packed_iq4(
     PackedWeight::new(format, stored_rows, stored_cols, true, bytes).unwrap()
 }
 
-/// Packed i-quant weights (`IQ4_NL`, `IQ4_XS` and the IQ2/IQ3 formats):
+/// Packed i-quant weights (`IQ4_NL`, `IQ4_XS` and the IQ2/IQ3 formats),
+/// and `Q4_0`, laid out like `IQ4_NL`:
 /// downloading or expanding gives
 /// back exactly the Runtime's dequantization; with int8 activations their
 /// decode matmul (with a residual addend) and gated matmul match the
@@ -2449,6 +2450,7 @@ fn iq_packed_matmuls_match_reference_cpu() {
     let (k, n) = (1024_u64, 97_u64);
     for format in [
         PackedWeightFormat::Iq4Nl,
+        PackedWeightFormat::Q4_0,
         PackedWeightFormat::Iq4Xs,
         PackedWeightFormat::Iq2Xxs,
         PackedWeightFormat::Iq2Xs,

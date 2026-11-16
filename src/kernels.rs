@@ -340,10 +340,11 @@ fn iq_format(format: PackedWeightFormat) -> Option<i32> {
     }
 }
 
-/// `IQ4_NL_FORMAT` / `IQ4_XS_FORMAT` in `kernels.cu`.
+/// `IQ4_NL_FORMAT` / `IQ4_XS_FORMAT` / `Q4_0_FORMAT` in `kernels.cu`.
 fn iq4_format(format: PackedWeightFormat) -> i32 {
     match format {
         PackedWeightFormat::Iq4Nl => 0,
+        PackedWeightFormat::Q4_0 => 2,
         _ => 1,
     }
 }
@@ -353,7 +354,7 @@ fn iq4_format(format: PackedWeightFormat) -> i32 {
 fn iq4_subscale_offset(weight: &CudaQ8Weight) -> usize {
     match weight.format {
         // No sub-block scales: the kernels never read them.
-        PackedWeightFormat::Iq4Nl => 0,
+        PackedWeightFormat::Iq4Nl | PackedWeightFormat::Q4_0 => 0,
         _ => (weight.stored_rows * weight.stored_cols / 32 * 16) as usize,
     }
 }
@@ -1404,7 +1405,7 @@ impl CudaKernels {
         }
         if matches!(
             weight.format(),
-            PackedWeightFormat::Iq4Nl | PackedWeightFormat::Iq4Xs
+            PackedWeightFormat::Iq4Nl | PackedWeightFormat::Iq4Xs | PackedWeightFormat::Q4_0
         ) {
             return self.upload_iq4_weight(weight);
         }
@@ -1542,11 +1543,11 @@ impl CudaKernels {
         })
     }
 
-    /// Stores an `IQ4_NL` or `IQ4_XS` weight in the layout
+    /// Stores an `IQ4_NL`, `IQ4_XS` or `Q4_0` weight in the layout
     /// `iq4_matmul_rows_int8_kernel` reads: every 32-value run's 16 index
     /// bytes in stored order, then (`IQ4_XS`) one signed byte per run, its
-    /// sub-block scale minus 32; `scales` holds each `IQ4_NL` block's `d`,
-    /// or each `IQ4_XS` super-block's.
+    /// sub-block scale minus 32; `scales` holds each `IQ4_NL` or `Q4_0`
+    /// block's `d`, or each `IQ4_XS` super-block's.
     fn upload_iq4_weight(&self, weight: &PackedWeight) -> Result<CudaDeviceBuffer, CudaError> {
         let format = weight.format();
         let block_bytes = format.block_bytes() as usize;
@@ -1559,7 +1560,7 @@ impl CudaKernels {
             scales.push(half_precision::f16_to_f32(u16::from_le_bytes([
                 block[0], block[1],
             ])));
-            if format == PackedWeightFormat::Iq4Nl {
+            if format != PackedWeightFormat::Iq4Xs {
                 quants.extend(block[2..18].iter().map(|&byte| byte as i8));
             } else {
                 subscales.extend(magnetar_provider_api::iq4_xs_scales(&block[2..8]));
@@ -1658,7 +1659,7 @@ impl CudaKernels {
                     .arg(&transposed);
                 unsafe { args.launch(LaunchConfig::for_num_elems(elements as u32)) }?;
             }
-            PackedWeightFormat::Iq4Nl | PackedWeightFormat::Iq4Xs => {
+            PackedWeightFormat::Iq4Nl | PackedWeightFormat::Iq4Xs | PackedWeightFormat::Q4_0 => {
                 let func = self.function("iq4_dequantize_kernel")?;
                 let format = iq4_format(q8.format);
                 let subscales = q8.quants.slice(iq4_subscale_offset(q8)..);
@@ -3254,7 +3255,7 @@ impl CudaKernels {
         if let (Some(gate_iq), Some(up_iq)) = (&gate.q8, &up.q8)
             && matches!(
                 gate_iq.format,
-                PackedWeightFormat::Iq4Nl | PackedWeightFormat::Iq4Xs
+                PackedWeightFormat::Iq4Nl | PackedWeightFormat::Iq4Xs | PackedWeightFormat::Q4_0
             )
             && up_iq.format == gate_iq.format
             && gate_iq.transposed
@@ -4004,7 +4005,9 @@ impl CudaKernels {
                             }
                         }
                     }
-                    PackedWeightFormat::Iq4Nl | PackedWeightFormat::Iq4Xs => {
+                    PackedWeightFormat::Iq4Nl
+                    | PackedWeightFormat::Iq4Xs
+                    | PackedWeightFormat::Q4_0 => {
                         match self.iq4_matmul_rows(a, q8, m, k, n, addend)? {
                             Some(out) => Ok(out),
                             None => {
