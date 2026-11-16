@@ -20,7 +20,7 @@
 
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaGraph, CudaModule, CudaSlice, CudaStream, DevicePtr,
-    LaunchConfig, PushKernelArg, sys,
+    DevicePtrMut, LaunchConfig, PushKernelArg, sys,
 };
 use cudarc::nvrtc::compile_ptx;
 use magnetar_core::operator::RopeBandedFrequencyScaling;
@@ -280,6 +280,16 @@ pub struct CudaQ8Weight {
     pub(crate) stored_rows: u64,
     pub(crate) stored_cols: u64,
     pub(crate) transposed: bool,
+}
+
+/// The ids of an embedding lookup in a packed table, as device addresses
+/// (`dequantize_packed`): `count` f32 ids and the lookup's invalid-id flag.
+/// Without them, the kernels read every stored row (`ids` and the flag 0,
+/// `count` the stored rows).
+struct PackedRows {
+    ids: u64,
+    count: u64,
+    invalid_id_flag: u64,
 }
 
 impl CudaDeviceBuffer {
@@ -1621,13 +1631,39 @@ impl CudaKernels {
         })
     }
 
-    /// A packed `Q8_0` buffer's logical matrix as f32, dequantized on the
-    /// Device.
+    /// A packed buffer's logical matrix as f32, dequantized on the Device.
     pub fn dequantize_q8(&self, buffer: &CudaDeviceBuffer) -> Result<CudaDeviceBuffer, CudaError> {
+        self.dequantize_packed(buffer, None)
+    }
+
+    /// A packed buffer's logical matrix as f32, or with `rows` (a table
+    /// stored untransposed) only the stored rows its ids name, shaped
+    /// `[ids, columns]`: an embedding lookup then reads those rows' blocks,
+    /// not the whole table. An invalid id sets the rows' flag.
+    fn dequantize_packed(
+        &self,
+        buffer: &CudaDeviceBuffer,
+        rows: Option<PackedRows>,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
         let q8 = buffer.q8.as_ref().ok_or_else(|| {
             CudaError::new(CudaErrorCode::DTypeUnsupported, "not a packed weight")
         })?;
-        let elements = q8.stored_rows * q8.stored_cols;
+        if rows.is_some() && q8.transposed {
+            return Err(CudaError::new(
+                CudaErrorCode::DTypeUnsupported,
+                "rows of a packed weight stored transposed",
+            ));
+        }
+        let PackedRows {
+            ids: row_ids,
+            count: id_count,
+            invalid_id_flag,
+        } = rows.unwrap_or(PackedRows {
+            ids: 0,
+            count: q8.stored_rows,
+            invalid_id_flag: 0,
+        });
+        let elements = id_count * q8.stored_cols;
         let mut out = self.alloc_output(elements as usize)?;
         let transposed = u32::from(q8.transposed);
         match q8.format {
@@ -1639,7 +1675,10 @@ impl CudaKernels {
                     .arg(&mut out)
                     .arg(&q8.stored_rows)
                     .arg(&q8.stored_cols)
-                    .arg(&transposed);
+                    .arg(&transposed)
+                    .arg(&row_ids)
+                    .arg(&id_count)
+                    .arg(&invalid_id_flag);
                 unsafe { args.launch(LaunchConfig::for_num_elems(elements as u32)) }?;
             }
             PackedWeightFormat::Iq2Xxs
@@ -1656,7 +1695,10 @@ impl CudaKernels {
                     .arg(&mut out)
                     .arg(&q8.stored_rows)
                     .arg(&q8.stored_cols)
-                    .arg(&transposed);
+                    .arg(&transposed)
+                    .arg(&row_ids)
+                    .arg(&id_count)
+                    .arg(&invalid_id_flag);
                 unsafe { args.launch(LaunchConfig::for_num_elems(elements as u32)) }?;
             }
             PackedWeightFormat::Iq4Nl | PackedWeightFormat::Iq4Xs | PackedWeightFormat::Q4_0 => {
@@ -1671,7 +1713,10 @@ impl CudaKernels {
                     .arg(&mut out)
                     .arg(&q8.stored_rows)
                     .arg(&q8.stored_cols)
-                    .arg(&transposed);
+                    .arg(&transposed)
+                    .arg(&row_ids)
+                    .arg(&id_count)
+                    .arg(&invalid_id_flag);
                 unsafe { args.launch(LaunchConfig::for_num_elems(elements as u32)) }?;
             }
             PackedWeightFormat::Q2K | PackedWeightFormat::Q3K => {
@@ -1684,7 +1729,10 @@ impl CudaKernels {
                     .arg(&mut out)
                     .arg(&q8.stored_rows)
                     .arg(&q8.stored_cols)
-                    .arg(&transposed);
+                    .arg(&transposed)
+                    .arg(&row_ids)
+                    .arg(&id_count)
+                    .arg(&invalid_id_flag);
                 unsafe { args.launch(LaunchConfig::for_num_elems(elements as u32)) }?;
             }
             PackedWeightFormat::Q6K => {
@@ -1695,7 +1743,10 @@ impl CudaKernels {
                     .arg(&mut out)
                     .arg(&q8.stored_rows)
                     .arg(&q8.stored_cols)
-                    .arg(&transposed);
+                    .arg(&transposed)
+                    .arg(&row_ids)
+                    .arg(&id_count)
+                    .arg(&invalid_id_flag);
                 unsafe { args.launch(LaunchConfig::for_num_elems(elements as u32)) }?;
             }
             PackedWeightFormat::Q4K | PackedWeightFormat::Q5K => {
@@ -1709,13 +1760,21 @@ impl CudaKernels {
                     .arg(&mut out)
                     .arg(&q8.stored_rows)
                     .arg(&q8.stored_cols)
-                    .arg(&transposed);
+                    .arg(&transposed)
+                    .arg(&row_ids)
+                    .arg(&id_count)
+                    .arg(&invalid_id_flag);
                 unsafe { args.launch(LaunchConfig::for_num_elems(elements as u32)) }?;
             }
         }
+        let shape = if row_ids == 0 {
+            buffer.shape.clone()
+        } else {
+            vec![id_count, q8.stored_cols]
+        };
         Ok(CudaDeviceBuffer {
             slice: out,
-            shape: buffer.shape.clone(),
+            shape,
             bf16: None,
             q8: None,
         })
@@ -2578,16 +2637,18 @@ impl CudaKernels {
                 )
             }
         };
-        if table
-            .q8
-            .as_ref()
-            .is_some_and(|q8| q8.transposed || q8.format != PackedWeightFormat::Q8_0)
-        {
+        if table.q8.as_ref().is_some_and(|q8| q8.transposed) {
             let dense = self
                 .dequantize_q8(table)
                 .map_err(context("dequantizing a transposed table"))?;
             return self.embedding_lookup(&dense, ids);
         }
+        // A packed table in another format than `Q8_0`: its kernel
+        // dequantizes the looked-up rows only.
+        let packed_rows = table
+            .q8
+            .as_ref()
+            .is_some_and(|q8| q8.format != PackedWeightFormat::Q8_0);
         let table16 = self.bf16_address(table);
         let (table_q8, table_q8_scales) = match &table.q8 {
             Some(q8) => (
@@ -2598,9 +2659,14 @@ impl CudaKernels {
         };
         let num_ids = ids.slice.len() as u64;
         // Rows of invalid ids stay unwritten, but those fail the lookup.
-        let mut out_dev = self
-            .alloc_output(ids.slice.len() * dim as usize)
-            .map_err(context("output allocation"))?;
+        let out_dev = if packed_rows {
+            None
+        } else {
+            Some(
+                self.alloc_output(ids.slice.len() * dim as usize)
+                    .map_err(context("output allocation"))?,
+            )
+        };
         let mut flag_slot = self.embedding_flag.lock().unwrap();
         let mut invalid_id_flag = match flag_slot.take() {
             Some(flag) => flag,
@@ -2619,34 +2685,50 @@ impl CudaKernels {
                 .map_err(CudaError::from)
                 .map_err(context("flag reset"))?;
         }
-        let func = self
-            .function("embedding_lookup_kernel")
-            .map_err(context("function load"))?;
-        let mut args = self.stream.launch_builder(&func);
-        args.arg(&table.slice)
-            .arg(&ids.slice)
-            .arg(&mut out_dev)
-            .arg(&dim)
-            .arg(&num_ids)
-            .arg(&vocab)
-            .arg(&mut invalid_id_flag)
-            .arg(&table16)
-            .arg(&table_q8)
-            .arg(&table_q8_scales);
-        let launched =
-            unsafe { args.launch(LaunchConfig::for_num_elems(num_ids as u32)) }.map_err(|error| {
-                CudaError::new(
-                    CudaErrorCode::ExecutionFailed,
-                    format!(
-                        "embedding_lookup_kernel launch ({num_ids} ids, table {vocab}x{dim}, \
-                         packed {}): {error}",
-                        table.is_q8()
-                    ),
-                )
-            });
+        let launched = match out_dev {
+            None => {
+                let rows = PackedRows {
+                    ids: ids.slice.device_ptr(&self.stream).0,
+                    count: num_ids,
+                    invalid_id_flag: invalid_id_flag.device_ptr_mut(&self.stream).0,
+                };
+                self.dequantize_packed(table, Some(rows))
+                    .map(|rows| rows.slice)
+                    .map_err(context("of packed rows"))
+            }
+            Some(mut out_dev) => {
+                self.function("embedding_lookup_kernel")
+                    .map_err(context("function load"))
+                    .and_then(|func| {
+                        let mut args = self.stream.launch_builder(&func);
+                        args.arg(&table.slice)
+                            .arg(&ids.slice)
+                            .arg(&mut out_dev)
+                            .arg(&dim)
+                            .arg(&num_ids)
+                            .arg(&vocab)
+                            .arg(&mut invalid_id_flag)
+                            .arg(&table16)
+                            .arg(&table_q8)
+                            .arg(&table_q8_scales);
+                        unsafe { args.launch(LaunchConfig::for_num_elems(num_ids as u32)) }
+                            .map_err(|error| {
+                                CudaError::new(
+                                    CudaErrorCode::ExecutionFailed,
+                                    format!(
+                                        "embedding_lookup_kernel launch ({num_ids} ids, table \
+                                     {vocab}x{dim}, packed {}): {error}",
+                                        table.is_q8()
+                                    ),
+                                )
+                            })?;
+                        Ok(out_dev)
+                    })
+            }
+        };
         *flag_slot = Some(invalid_id_flag);
         drop(flag_slot);
-        launched?;
+        let out_dev = launched?;
         // A captured lookup's flag is checked once the captured step has
         // run (`Self::check_embedding_flag`), and every replay checks its
         // ids on the host.

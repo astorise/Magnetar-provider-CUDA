@@ -1786,6 +1786,84 @@ fn decode_matmul_bandwidth() {
     }
 }
 
+/// The Device time and transient bytes of an embedding lookup from a
+/// packed table, one id (a decode step) and 512 (a prefill), at the shapes
+/// of `gemma-4-E2B-it-qat-q4_0-gguf` (each of its 35 per-layer tables,
+/// `[262144, 256]`, and its token table, `[262144, 1536]`, both `Q6_K`)
+/// and of a `Q4_K` `[32000, 4096]` token table: the lookup reading the
+/// looked-up rows against dequantizing the whole table first, as it did
+/// before. Not a conformance check: run it with `--ignored --nocapture`
+/// on a GPU.
+#[test]
+#[ignore = "GPU timing diagnostic"]
+fn packed_embedding_lookup_times() {
+    if cfg!(debug_assertions) {
+        return;
+    }
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let context = kernels.stream().context().clone();
+    let timing = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
+    let time = |repeats: usize, run: &dyn Fn()| -> f32 {
+        run();
+        let start = context.new_event(timing).unwrap();
+        let end = context.new_event(timing).unwrap();
+        start.record(kernels.stream()).unwrap();
+        for _ in 0..repeats {
+            run();
+        }
+        end.record(kernels.stream()).unwrap();
+        start.elapsed_ms(&end).unwrap() / repeats as f32
+    };
+    let gb = |bytes: u64| bytes as f64 / 1e9;
+    for (name, table) in [
+        (
+            "Q6_K per-layer [262144, 256]",
+            packed_q6k(262_144, 256, false, 81),
+        ),
+        (
+            "Q6_K token [262144, 1536]",
+            packed_q6k(262_144, 1536, false, 82),
+        ),
+        (
+            "Q4_K token [32000, 4096]",
+            packed_q4k(32_000, 4096, false, 83),
+        ),
+    ] {
+        let [rows, cols] = table.logical_shape();
+        let table_dev = kernels.upload_packed_weight(&table).unwrap();
+        drop(table);
+        for count in [1_u64, 512] {
+            let ids = upload(
+                &kernels,
+                &HostTensor::new(
+                    [count],
+                    (0..count)
+                        .map(|i| ((i * 7919) % rows) as f32)
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap(),
+            );
+            let rows_ms = time(20, &|| {
+                kernels.embedding_lookup(&table_dev, &ids).unwrap();
+            });
+            let whole_ms = time(3, &|| {
+                let dense = kernels.dequantize_q8(&table_dev).unwrap();
+                kernels.embedding_lookup(&dense, &ids).unwrap();
+            });
+            eprintln!(
+                "embedding lookup, {name}, {count} ids: looked-up rows {:.1} us \
+                 ({:.6} GB written), whole table first {:.1} us ({:.3} GB written)",
+                rows_ms * 1e3,
+                gb(count * cols * 4),
+                whole_ms * 1e3,
+                gb((rows + count) * cols * 4),
+            );
+        }
+    }
+}
+
 /// The Device time of a mixture-of-experts decode step's Kernels at
 /// Qwen1.5-MoE-A2.7B's shapes (hidden 2048, 60 experts of 1408, top 4, a
 /// 5632 shared expert, 2048-wide attention projections, a 151936-token
@@ -2682,6 +2760,83 @@ fn q8_packed_gated_matmul_and_embedding_match_reference_cpu() {
         )
         .unwrap();
     assert_eq!(download(&kernels, &actual).data, expected.data);
+}
+
+/// An embedding lookup from a packed table stored untransposed, in every
+/// packed format: the looked-up rows equal the same rows of the
+/// dequantized table (other formats than `Q8_0` dequantize the looked-up
+/// rows only), and an id that is not a row of the table fails the lookup.
+#[test]
+fn packed_embedding_tables_read_only_the_looked_up_rows() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let (vocab, dim) = (7_u64, 512_u64);
+    let untransposed = |weight: PackedWeight| {
+        PackedWeight::new(
+            weight.format(),
+            weight.stored_rows(),
+            weight.stored_cols(),
+            false,
+            weight.bytes().to_vec(),
+        )
+        .unwrap()
+    };
+    let mut tables = vec![
+        packed_q8(vocab, dim, false, 71),
+        packed_q4k(vocab, dim, false, 72),
+        untransposed(packed_q5k(vocab, dim, 73)),
+        packed_q6k(vocab, dim, false, 74),
+    ];
+    for format in [PackedWeightFormat::Q2K, PackedWeightFormat::Q3K] {
+        tables.push(untransposed(packed_low_bit(format, vocab, dim, 75)));
+    }
+    for format in [
+        PackedWeightFormat::Q4_0,
+        PackedWeightFormat::Iq4Nl,
+        PackedWeightFormat::Iq4Xs,
+        PackedWeightFormat::Iq2Xxs,
+        PackedWeightFormat::Iq2Xs,
+        PackedWeightFormat::Iq2S,
+        PackedWeightFormat::Iq3Xxs,
+        PackedWeightFormat::Iq3S,
+    ] {
+        tables.push(untransposed(packed_iq4(format, vocab, dim, 76)));
+    }
+    let ids = HostTensor::new([5], vec![6.0, 0.0, 3.0, 6.0, 1.0]).unwrap();
+    for table in &tables {
+        let format = table.format();
+        assert!(!table.transposed(), "{format:?}");
+        let expected = magnetar_provider_cpu::embedding_lookup(&table.dequantize(), &ids).unwrap();
+        let table_dev = kernels.upload_packed_weight(table).unwrap();
+        let actual = kernels
+            .embedding_lookup(&table_dev, &upload(&kernels, &ids))
+            .unwrap();
+        assert_eq!(actual.shape, vec![5, dim], "{format:?}");
+        assert_eq!(
+            download(&kernels, &actual).data,
+            expected.data,
+            "{format:?}"
+        );
+        for invalid in [vocab as f32, -1.0, 2.5] {
+            let ids = HostTensor::new([2], vec![1.0, invalid]).unwrap();
+            assert!(
+                kernels
+                    .embedding_lookup(&table_dev, &upload(&kernels, &ids))
+                    .is_err(),
+                "{format:?} id {invalid}"
+            );
+        }
+        // The flag is reset for the next lookup.
+        let actual = kernels
+            .embedding_lookup(&table_dev, &upload(&kernels, &ids))
+            .unwrap();
+        assert_eq!(
+            download(&kernels, &actual).data,
+            expected.data,
+            "{format:?}"
+        );
+    }
 }
 
 /// The real Qwen2.5-0.5B shapes (`execute-direct-quantized-weights`): a
