@@ -156,8 +156,10 @@ fn dispatch(
         "matmul" => OperatorFamily::LinearAlgebra,
         "rmsnorm" => OperatorFamily::Normalization,
         "rope" => OperatorFamily::PositionEncoding,
-        "add" | "mul" => OperatorFamily::Tensor,
+        "add" | "mul" | "embedding" => OperatorFamily::Tensor,
         "attention" => OperatorFamily::Attention,
+        "activation" | "gelu" => OperatorFamily::Activation,
+        "moe-experts" => OperatorFamily::LinearAlgebra,
         other => panic!("{step_name}: no OperatorFamily mapping for '{other}'"),
     };
     let operator = OperatorId::magnetar(operator_name, 1, family);
@@ -167,6 +169,12 @@ fn dispatch(
         fixture.affinity.clone(),
     );
     for (id, tensor_descriptor) in &inputs {
+        // Selection matches each input's dtype, as the engine's
+        // `merge_graph_edge_requirements` does: without it an `f32` `mul`
+        // ties with `mul-half`, whose stable key sorts first.
+        if let DTypeDescriptor::Portable(dtype) = &tensor_descriptor.dtype {
+            request.dtype_requirements.insert(*dtype);
+        }
         request = request.with_input(KernelResource::new(
             TensorResourceDescriptor::new(
                 id.clone(),
@@ -911,5 +919,236 @@ fn a_compact_weight_read_as_f32_is_expanded_on_real_hardware() {
     assert_eq!(
         product(&compact, "compact.out"),
         product(&plain, "plain.out")
+    );
+}
+
+/// `dispatch-layered-model-forms`: every optional form of the layered
+/// models' Operators, dispatched through the Kernel Registry and the real
+/// `CudaExecutor` with its node attributes, matches the Reference CPU.
+#[test]
+fn layered_operator_forms_dispatch_through_the_executor_on_real_hardware() {
+    use magnetar_provider_api::operator_semantics;
+    let Some(mut fixture) = chain_fixture_or_skip() else {
+        return;
+    };
+    let tensor = |rows: u64, cols: u64, seed: u32| {
+        let data: Vec<f32> = (0..rows * cols)
+            .map(|i| {
+                (((i as u32).wrapping_mul(2_654_435_761).wrapping_add(seed) % 1000) as f32) / 500.0
+                    - 1.0
+            })
+            .collect();
+        HostTensor::new([rows, cols], data).unwrap()
+    };
+    let float = |value: f64| OperatorAttributeValue::Float(value);
+    let int = |value: i64| OperatorAttributeValue::Integer(value);
+    let text = |value: &str| OperatorAttributeValue::String(value.into());
+    let check = |fixture: &mut ChainFixture,
+                 name: &str,
+                 operator: &str,
+                 inputs: Vec<(&str, HostTensor)>,
+                 attributes: Vec<(&str, OperatorAttributeValue)>,
+                 expected: HostTensor| {
+        let mut resources = Vec::new();
+        for (input, value) in inputs {
+            let id = TensorResourceId::new(format!("layered-{name}-{input}"));
+            let descriptor = match value.shape.as_slice() {
+                [len] => descriptor_1d(*len),
+                [rows, cols] => descriptor(*rows, *cols),
+                other => panic!("{name}: unexpected shape {other:?}"),
+            };
+            stage_weight(fixture, &id, value);
+            resources.push((id, descriptor));
+        }
+        let output = TensorResourceId::new(format!("layered-{name}-out"));
+        let [rows, cols] = expected.shape[..] else {
+            panic!("{name}: rank-2 output expected");
+        };
+        dispatch(
+            fixture,
+            name,
+            operator,
+            resources,
+            output.clone(),
+            descriptor(rows, cols),
+            attributes
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value))
+                .collect(),
+        );
+        let actual = fixture.executor.read_tensor(&output).unwrap();
+        assert_eq!(actual.shape, expected.shape, "{name}");
+        for (index, (a, e)) in actual.data.iter().zip(&expected.data).enumerate() {
+            assert!(
+                (a - e).abs() <= TOLERANCE,
+                "{name}, element {index}: cuda={a} reference={e}"
+            );
+        }
+    };
+
+    // embedding, scaled.
+    let table = tensor(6, 8, 1);
+    let ids = HostTensor::new([3], vec![4.0, 0.0, 5.0]).unwrap();
+    let gathered = magnetar_provider_cpu::embedding_lookup(&table, &ids).unwrap();
+    check(
+        &mut fixture,
+        "embedding",
+        "embedding",
+        vec![("table", table), ("ids", ids)],
+        vec![("scale", float(2.0))],
+        operator_semantics::scale(&gathered, 2.0).unwrap(),
+    );
+    // rmsnorm per head, without a weight.
+    let x = tensor(3, 8, 2);
+    check(
+        &mut fixture,
+        "rmsnorm",
+        "rmsnorm",
+        vec![("input", x.clone())],
+        vec![
+            ("epsilon", float(1e-6)),
+            ("head_count", int(2)),
+            ("head_dimension", int(4)),
+            ("with_scale", OperatorAttributeValue::Boolean(false)),
+        ],
+        operator_semantics::rmsnorm_blocks(&x, None, 1e-6, Some((2, 4))).unwrap(),
+    );
+    // rope, half of each head rotated.
+    check(
+        &mut fixture,
+        "rope",
+        "rope",
+        vec![("input", x.clone())],
+        vec![
+            ("base", float(4.0)),
+            ("dimension", int(4)),
+            ("head_count", int(2)),
+            ("position_offset", int(1)),
+            ("rotation_pairing", text("half_split")),
+            ("partial_rotary_factor", float(0.5)),
+        ],
+        magnetar_runtime::reference_cpu::rope_partial(
+            &x,
+            4.0,
+            1.0,
+            4,
+            1,
+            2,
+            magnetar_runtime::RopePairing::HalfSplit,
+            None,
+            Some(0.5),
+        )
+        .unwrap(),
+    );
+    // attention with its own score scale.
+    let (q, k, v) = (tensor(3, 8, 3), tensor(3, 4, 4), tensor(3, 4, 5));
+    check(
+        &mut fixture,
+        "attention",
+        "attention",
+        vec![("q", q.clone()), ("k", k.clone()), ("v", v.clone())],
+        vec![
+            ("causal", OperatorAttributeValue::Boolean(true)),
+            ("head_count", int(2)),
+            ("kv_head_count", int(1)),
+            ("head_dimension", int(4)),
+            ("attention_mask_kind", text("causal")),
+            ("scale", float(1.0)),
+        ],
+        magnetar_runtime::reference_cpu::attention_scaled(
+            &q,
+            &k,
+            &v,
+            2,
+            4,
+            Some(1),
+            None,
+            true,
+            Some(1.0),
+        )
+        .unwrap(),
+    );
+    // activation softcap and scale, gelu (tanh), mul by a [1] operand.
+    check(
+        &mut fixture,
+        "softcap",
+        "activation",
+        vec![("input", x.clone())],
+        vec![("kind", text("softcap")), ("cap", float(0.5))],
+        operator_semantics::softcap(&x, 0.5).unwrap(),
+    );
+    check(
+        &mut fixture,
+        "scale",
+        "activation",
+        vec![("input", x.clone())],
+        vec![("kind", text("scale")), ("factor", float(-1.5))],
+        operator_semantics::scale(&x, -1.5).unwrap(),
+    );
+    check(
+        &mut fixture,
+        "gelu",
+        "gelu",
+        vec![("input", x.clone())],
+        vec![("approximate", text("tanh"))],
+        HostTensor::new(
+            x.shape.clone(),
+            x.data
+                .iter()
+                .map(|value| operator_semantics::gelu_tanh(*value))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap(),
+    );
+    let scalar = HostTensor::new([1], vec![0.375]).unwrap();
+    check(
+        &mut fixture,
+        "mul",
+        "mul",
+        vec![("a", x.clone()), ("b", scalar.clone())],
+        vec![],
+        operator_semantics::mul_broadcast(&x, &scalar).unwrap(),
+    );
+    // moe-experts with a GELU gate and per-expert scales.
+    let (h, logits) = (tensor(2, 8, 6), tensor(2, 3, 7));
+    let (gate, up, down) = (tensor(8, 12, 8), tensor(8, 12, 9), tensor(4, 24, 10));
+    let per_expert = HostTensor::new([3], vec![0.5, 1.25, 2.0]).unwrap();
+    let routing = magnetar_provider_api::MoeRouting {
+        experts: 3,
+        top_k: 2,
+        normalize: true,
+    };
+    let expected = operator_semantics::moe_experts_local_with(
+        &h,
+        &logits,
+        [&gate, &up, &down],
+        routing,
+        0,
+        3,
+        operator_semantics::MoeExpertOptions {
+            activation: operator_semantics::MoeExpertActivation::GeluTanh,
+            per_expert_scale: Some(&per_expert),
+        },
+    )
+    .unwrap();
+    check(
+        &mut fixture,
+        "moe",
+        "moe-experts",
+        vec![
+            ("h", h),
+            ("logits", logits),
+            ("gate", gate),
+            ("up", up),
+            ("down", down),
+            ("per_expert_scale", per_expert),
+        ],
+        vec![
+            ("experts", int(3)),
+            ("top_k", int(2)),
+            ("normalize_top_k", OperatorAttributeValue::Boolean(true)),
+            ("activation", text("gelu_tanh")),
+        ],
+        expected,
     );
 }

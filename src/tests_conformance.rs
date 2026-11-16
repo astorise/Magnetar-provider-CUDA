@@ -3229,3 +3229,273 @@ fn a_captured_packed_matmul_skips_a_replays_padding_rows() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Layered models' optional operator forms (`dispatch-layered-model-forms`),
+// against the Reference CPU and the shared `operator_semantics`.
+// ---------------------------------------------------------------------------
+
+/// GELU (tanh), `scale`, `softcap` and the `[1]`-broadcast `mul`.
+#[test]
+fn layered_elementwise_forms_match_reference_cpu() {
+    use magnetar_provider_api::operator_semantics;
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let x = activations(3, 70, 81);
+    let mut scaled = x.clone();
+    for value in &mut scaled.data {
+        *value *= 4.0;
+    }
+    let device = upload(&kernels, &scaled);
+    let gelu = HostTensor::new(
+        scaled.shape.clone(),
+        scaled
+            .data
+            .iter()
+            .map(|value| operator_semantics::gelu_tanh(*value))
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    assert_close(
+        &download(&kernels, &kernels.gelu_tanh(&device).unwrap()),
+        &gelu,
+    );
+    assert_close(
+        &download(&kernels, &kernels.scale(&device, 0.25).unwrap()),
+        &operator_semantics::scale(&scaled, 0.25).unwrap(),
+    );
+    assert_close(
+        &download(&kernels, &kernels.softcap(&device, 1.5).unwrap()),
+        &operator_semantics::softcap(&scaled, 1.5).unwrap(),
+    );
+    let scalar = HostTensor::new([1], vec![-0.75]).unwrap();
+    assert_close(
+        &download(
+            &kernels,
+            &kernels
+                .mul_scalar(&device, &upload(&kernels, &scalar))
+                .unwrap(),
+        ),
+        &operator_semantics::mul_broadcast(&scaled, &scalar).unwrap(),
+    );
+    assert!(kernels.softcap(&device, 0.0).is_err());
+    let mut in_place = upload(&kernels, &scaled);
+    kernels.scale_in_place(&mut in_place, 0.25).unwrap();
+    assert_close(
+        &download(&kernels, &in_place),
+        &operator_semantics::scale(&scaled, 0.25).unwrap(),
+    );
+}
+
+/// Per-head RMSNorm with a `[head_dimension]` weight, and without a weight
+/// (per row and per head).
+#[test]
+fn per_head_and_weightless_rmsnorm_match_reference_cpu() {
+    use magnetar_provider_api::operator_semantics::rmsnorm_blocks;
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let input = activations(5, 4 * 16, 82);
+    let weight = activations(1, 16, 83);
+    let weight = HostTensor::new([16], weight.data).unwrap();
+    let device = upload(&kernels, &input);
+    let device_weight = upload(&kernels, &weight);
+    for (weight_host, weight_device, heads) in [
+        (Some(&weight), Some(&device_weight), Some((4, 16))),
+        (None, None, Some((4, 16))),
+        (None, None, None),
+    ] {
+        let expected = rmsnorm_blocks(&input, weight_host, 1e-6, heads).unwrap();
+        let actual = kernels
+            .rmsnorm_with(&device, weight_device, 1e-6, heads)
+            .unwrap();
+        assert_close(&download(&kernels, &actual), &expected);
+    }
+    // Heads that do not tile the row are refused.
+    assert!(
+        kernels
+            .rmsnorm_with(&device, None, 1e-6, Some((3, 16)))
+            .is_err()
+    );
+}
+
+/// Partial rotation: only the first `floor(factor * dimension / 2)` pairs
+/// rotate, the frequencies still dividing by the whole dimension.
+#[test]
+fn partial_rope_matches_reference_cpu() {
+    use crate::kernels::CudaRopePairing;
+    use magnetar_runtime::RopePairing;
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let input = activations(6, 2 * 32, 84);
+    let device = upload(&kernels, &input);
+    for (pairing, cuda_pairing) in [
+        (RopePairing::HalfSplit, CudaRopePairing::HalfSplit),
+        (RopePairing::Interleaved, CudaRopePairing::Interleaved),
+    ] {
+        for factor in [0.25_f32, 0.5, 1.0] {
+            let expected = magnetar_runtime::reference_cpu::rope_partial(
+                &input,
+                4.0,
+                1.0,
+                32,
+                3,
+                2,
+                pairing,
+                None,
+                Some(factor),
+            )
+            .unwrap();
+            let rotated = (factor as f64 * 32.0 / 2.0).floor() as u64;
+            let actual = kernels
+                .rope_partial(
+                    &device,
+                    4.0,
+                    1.0,
+                    32,
+                    3,
+                    2,
+                    cuda_pairing,
+                    None,
+                    Some(rotated),
+                )
+                .unwrap();
+            assert_close(&download(&kernels, &actual), &expected);
+        }
+    }
+}
+
+/// `attention.scale` replaces 1/sqrt(head_dimension) in every attention
+/// Kernel: decode (split and grouped), the tiled and Tensor Core prefills,
+/// and the block Kernel for heads wider than those handle; `None` keeps
+/// today's scale exactly.
+#[test]
+fn scaled_attention_matches_reference_cpu_in_every_kernel() {
+    use magnetar_runtime::reference_cpu::attention_scaled;
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    // (query rows, key rows, heads, kv heads, head dimension, window).
+    let shapes = [
+        (1_u64, 40_u64, 4_u64, 1_u64, 64_u64, None),
+        (1, 40, 4, 1, 256, Some(16_u64)),
+        (24, 24, 2, 1, 64, None),
+        (24, 24, 2, 2, 128, Some(8)),
+        (6, 9, 2, 1, 256, None),
+        (5, 5, 2, 1, 512, Some(3)),
+    ];
+    for (seq, kv_seq, heads, kv_heads, dim, window) in shapes {
+        let q = activations(seq, heads * dim, 85);
+        let k = activations(kv_seq, kv_heads * dim, 86);
+        let v = activations(kv_seq, kv_heads * dim, 87);
+        let (dq, dk, dv) = (
+            upload(&kernels, &q),
+            upload(&kernels, &k),
+            upload(&kernels, &v),
+        );
+        for scale in [None, Some(1.0_f32), Some(0.03)] {
+            let expected =
+                attention_scaled(&q, &k, &v, heads, dim, Some(kv_heads), window, true, scale)
+                    .unwrap();
+            let actual = kernels
+                .attention_scaled(
+                    &dq,
+                    &dk,
+                    &dv,
+                    heads,
+                    dim,
+                    Some(kv_heads),
+                    window,
+                    true,
+                    None,
+                    scale,
+                )
+                .unwrap();
+            let actual = download(&kernels, &actual);
+            assert_eq!(actual.shape, expected.shape);
+            for (index, (a, e)) in actual.data.iter().zip(&expected.data).enumerate() {
+                assert!(
+                    (a - e).abs() <= 2e-3,
+                    "shape {:?}, scale {scale:?}, element {index}: cuda={a} reference={e}",
+                    (seq, kv_seq, heads, kv_heads, dim, window)
+                );
+            }
+        }
+    }
+    let q = upload(&kernels, &activations(1, 64, 88));
+    assert!(
+        kernels
+            .attention_scaled(&q, &q, &q, 1, 64, None, None, true, None, Some(f32::NAN))
+            .is_err()
+    );
+}
+
+/// Routed experts with a GELU (tanh) gate and a per-expert output scale,
+/// f32 and packed `Q8_0`, prefill and decode.
+#[test]
+fn moe_experts_with_gelu_and_per_expert_scale_match_reference_cpu() {
+    use crate::kernels::CudaMoeOptions;
+    use magnetar_provider_api::MoeRouting;
+    use magnetar_provider_api::operator_semantics::{
+        MoeExpertActivation, MoeExpertOptions, moe_experts_local_with,
+    };
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let (experts, top_k, hidden, inter) = (6_u64, 2_u64, 64_u64, 32_u64);
+    let routing = MoeRouting {
+        experts,
+        top_k,
+        normalize: true,
+    };
+    let gate = packed_q8(experts * inter, hidden, true, 91);
+    let up = packed_q8(experts * inter, hidden, true, 92);
+    let down = packed_q8(experts * hidden, inter, true, 93);
+    let (gate_f32, up_f32, down_f32) = (gate.dequantize(), up.dequantize(), down.dequantize());
+    let scale = HostTensor::new(
+        [experts],
+        (0..experts)
+            .map(|e| 0.5 + e as f32 * 0.25)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let device_scale = upload(&kernels, &scale);
+    for tokens in [1_u64, 9] {
+        let h = activations(tokens, hidden, 94);
+        let logits = activations(tokens, experts, 95);
+        let expected = moe_experts_local_with(
+            &h,
+            &logits,
+            [&gate_f32, &up_f32, &down_f32],
+            routing,
+            0,
+            experts,
+            MoeExpertOptions {
+                activation: MoeExpertActivation::GeluTanh,
+                per_expert_scale: Some(&scale),
+            },
+        )
+        .unwrap();
+        let options = CudaMoeOptions {
+            gelu_tanh: true,
+            per_expert_scale: Some(&device_scale),
+        };
+        let f32_experts = [&gate_f32, &up_f32, &down_f32].map(|w| upload(&kernels, w));
+        let packed_experts = [&gate, &up, &down].map(|w| kernels.upload_packed_weight(w).unwrap());
+        for weights in [&f32_experts, &packed_experts] {
+            let actual = kernels
+                .moe_experts_with(
+                    &upload(&kernels, &h),
+                    &upload(&kernels, &logits),
+                    [&weights[0], &weights[1], &weights[2]],
+                    routing,
+                    (0, experts),
+                    options,
+                )
+                .unwrap();
+            assert_close_relative(&download(&kernels, &actual), &expected);
+        }
+    }
+}

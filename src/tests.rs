@@ -115,13 +115,13 @@ fn kernel_advertisements_agree_with_availability() {
     if provider.is_available() {
         assert_eq!(
             advertisements.len(),
-            21,
+            22,
             "expected exactly the required-now kernel set this baseline implements, plus the \
              add-half/mul-half native half-precision Kernels \
              (enable-native-cuda-half-precision-elementwise-compute), the Runtime's fused \
              matmul-bias, matmul-residual and silu-mul (cache-and-optimize-prepared-graphs C03), \
-             gated-matmul and kv-write (append-kv-history-in-place), and moe-experts, row-scale \
-             and activation (execute-and-cache-moe-experts)"
+             gated-matmul and kv-write (append-kv-history-in-place), moe-experts, row-scale \
+             and activation (execute-and-cache-moe-experts), and gelu (layered models)"
         );
         let names: std::collections::BTreeSet<_> =
             advertisements.iter().map(|a| a.id.name.as_str()).collect();
@@ -141,6 +141,7 @@ fn kernel_advertisements_agree_with_availability() {
             "attention",
             "softmax",
             "silu",
+            "gelu",
             "add",
             "mul",
             "concat",
