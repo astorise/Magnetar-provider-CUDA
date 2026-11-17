@@ -1686,8 +1686,37 @@ impl CudaExecutor {
                             });
                         }
                     };
-                    self.kernels
-                        .attention_valued(
+                    // `cache-latent-attention-history`: V heads wider than
+                    // the value.
+                    let value_stride = match invocation.attributes.get("value_head_stride") {
+                        None => None,
+                        Some(OperatorAttributeValue::Integer(stride)) if *stride > 0 => {
+                            Some(*stride as u64)
+                        }
+                        Some(other) => {
+                            return Err(KernelError::KernelAttributeUnsupported {
+                                attribute: format!(
+                                    "value_head_stride {other:?} must be a positive integer"
+                                ),
+                            });
+                        }
+                    };
+                    match value_stride {
+                        Some(stride) => self.kernels.attention_strided_values(
+                            q,
+                            k,
+                            v,
+                            head_count,
+                            head_dimension,
+                            value_dimension,
+                            stride,
+                            kv_head_count,
+                            window_size,
+                            causal,
+                            key_count,
+                            scale,
+                        ),
+                        None => self.kernels.attention_valued(
                             q,
                             k,
                             v,
@@ -1699,7 +1728,19 @@ impl CudaExecutor {
                             causal,
                             key_count,
                             scale,
-                        )
+                        ),
+                    }
+                    .map_err(KernelError::from)?
+                }
+                // `cache-latent-attention-history`.
+                "batched-matmul" => {
+                    let groups = Self::attribute_integer(&invocation.attributes, "group_count")
+                        .filter(|groups| *groups > 0)
+                        .ok_or_else(|| KernelError::KernelAttributeUnsupported {
+                            attribute: "group_count".into(),
+                        })?;
+                    self.kernels
+                        .batched_matmul(get(0)?, get(1)?, groups)
                         .map_err(KernelError::from)?
                 }
                 "softmax" => {

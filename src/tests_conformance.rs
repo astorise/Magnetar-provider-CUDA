@@ -1273,6 +1273,91 @@ fn turboquant_kv_stores_round_trip_and_attend_like_the_cpu() {
     }
 }
 
+/// `cache-latent-attention-history`: `batched-matmul` matches the CPU's,
+/// and attention over a latent history read as its own V
+/// (`value_head_stride`) matches the CPU's attention over the extracted
+/// values, for a decode step over a store and a prefill.
+#[test]
+fn batched_matmul_and_strided_values_match_the_cpu() {
+    use magnetar_provider_api::{batched_matmul, value_heads};
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let (heads, nope, latent, rope) = (16u64, 128u64, 512u64, 64u64);
+    for rows in [1u64, 5] {
+        let a = HostTensor::new(
+            [rows, heads * nope],
+            attention_values((rows * heads * nope) as usize, 3),
+        )
+        .unwrap();
+        let b = HostTensor::new(
+            [heads * nope, latent],
+            attention_values((heads * nope * latent) as usize, 4),
+        )
+        .unwrap();
+        let actual = kernels
+            .batched_matmul(&upload(&kernels, &a), &upload(&kernels, &b), heads)
+            .unwrap();
+        assert_close(
+            &download(&kernels, &actual),
+            &batched_matmul(&a, &b, heads).unwrap(),
+        );
+    }
+    let width = latent + rope;
+    let (capacity, keys) = (40u64, 33u64);
+    let history = HostTensor::new(
+        [capacity, width],
+        attention_values((capacity * width) as usize, 5),
+    )
+    .unwrap();
+    let values = value_heads(&history, 1, width, latent).unwrap();
+    let leading = |tensor: &HostTensor, rows: u64| {
+        HostTensor::new(
+            [rows, tensor.shape[1]],
+            tensor.data[..(rows * tensor.shape[1]) as usize].to_vec(),
+        )
+        .unwrap()
+    };
+    for queries in [1u64, 4] {
+        let q = HostTensor::new(
+            [queries, heads * width],
+            attention_values((queries * heads * width) as usize, 6),
+        )
+        .unwrap();
+        let expected = magnetar_provider_cpu::attention_with_value_width(
+            &q,
+            &leading(&history, keys),
+            &leading(&values, keys),
+            heads,
+            width,
+            latent,
+            Some(1),
+            None,
+            true,
+            Some(0.1),
+        )
+        .unwrap();
+        let store = upload(&kernels, &history);
+        let actual = kernels
+            .attention_strided_values(
+                &upload(&kernels, &q),
+                &store,
+                &store,
+                heads,
+                width,
+                Some(latent),
+                width,
+                Some(1),
+                None,
+                true,
+                Some(keys),
+                Some(0.1),
+            )
+            .unwrap();
+        assert_close(&download(&kernels, &actual), &expected);
+    }
+}
+
 /// Deterministic pseudo-random values in [-0.5, 0.5).
 fn attention_values(len: usize, seed: usize) -> Vec<f32> {
     (0..len)

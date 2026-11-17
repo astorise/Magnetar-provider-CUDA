@@ -4953,6 +4953,144 @@ impl CudaKernels {
         )
     }
 
+    /// `batched-matmul` (`cache-latent-attention-history`): `a [rows,
+    /// groups * k]` times `b [groups * k, n]` group by group, giving `[rows,
+    /// groups * n]`. f32 operands.
+    pub fn batched_matmul(
+        &self,
+        a: &CudaDeviceBuffer,
+        b: &CudaDeviceBuffer,
+        groups: u64,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        Self::require_f32(&[a, b], "batched-matmul")?;
+        if a.is_q8() || b.is_q8() || a.is_tq() || b.is_tq() {
+            return Err(CudaError::new(
+                CudaErrorCode::DTypeUnsupported,
+                "batched-matmul reads f32 operands",
+            ));
+        }
+        let (rows, a_cols) = rows_cols_buf(a)?;
+        let (b_rows, n) = rows_cols_buf(b)?;
+        if groups == 0 || !a_cols.is_multiple_of(groups) || a_cols != b_rows {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!(
+                    "batched-matmul of {groups} groups needs [T, G*K] and [G*K, N], got {:?} and {:?}",
+                    a.shape, b.shape
+                ),
+            ));
+        }
+        let k = a_cols / groups;
+        let len = rows * groups * n;
+        let mut out = self.alloc_output(len as usize)?;
+        if len > 0 {
+            let func = self.function("batched_matmul_kernel")?;
+            let mut args = self.stream.launch_builder(&func);
+            args.arg(&a.slice)
+                .arg(&b.slice)
+                .arg(&mut out)
+                .arg(&rows)
+                .arg(&groups)
+                .arg(&k)
+                .arg(&n);
+            unsafe { args.launch(LaunchConfig::for_num_elems(len as u32)) }?;
+        }
+        Ok(CudaDeviceBuffer {
+            slice: out,
+            shape: vec![rows, groups * n],
+            bf16: None,
+            q8: None,
+            tq: None,
+        })
+    }
+
+    /// Attention whose V heads are `value_stride` wide, the value being
+    /// each head's leading `value_dimension` (`attention.value_head_stride`,
+    /// `cache-latent-attention-history`): V may be the key history. The
+    /// values are gathered into a scratch buffer kept per shape, so a
+    /// captured step allocates nothing, and the attention reads them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_strided_values(
+        &self,
+        q: &CudaDeviceBuffer,
+        k: &CudaDeviceBuffer,
+        v: &CudaDeviceBuffer,
+        head_count: u64,
+        head_dimension: u64,
+        value_dimension: Option<u64>,
+        value_stride: u64,
+        kv_head_count: Option<u64>,
+        window_size: Option<u64>,
+        causal: bool,
+        key_count: Option<u64>,
+        scale: Option<f32>,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        Self::require_f32(&[v], "attention's strided values")?;
+        if v.is_q8() || v.is_tq() {
+            return Err(CudaError::new(
+                CudaErrorCode::DTypeUnsupported,
+                "attention reads strided values from f32 rows only",
+            ));
+        }
+        let heads = kv_head_count.unwrap_or(head_count);
+        let width = value_dimension.unwrap_or(head_dimension);
+        let (rows, cols) = rows_cols_buf(v)?;
+        if heads == 0 || width > value_stride || cols != heads * value_stride {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!(
+                    "V rows of {cols} values cannot hold {heads} heads of {value_stride} values \
+                     with {width}-value values"
+                ),
+            ));
+        }
+        let shape = vec![rows, heads * width];
+        let len = rows * heads * width;
+        let mut scratch = self.tq_scratch.lock().unwrap();
+        let key = (2u8, shape.clone());
+        let mut slice = match scratch.remove(&key) {
+            Some(slice) => slice,
+            None => {
+                self.forbid_in_capture("allocating a strided-values scratch buffer")?;
+                self.stream.alloc_zeros::<f32>((len as usize).max(1))?
+            }
+        };
+        if len > 0 {
+            let func = self.function("value_heads_kernel")?;
+            let mut args = self.stream.launch_builder(&func);
+            args.arg(&v.slice)
+                .arg(&mut slice)
+                .arg(&rows)
+                .arg(&heads)
+                .arg(&value_stride)
+                .arg(&width);
+            unsafe { args.launch(LaunchConfig::for_num_elems(len as u32)) }?;
+        }
+        let values = CudaDeviceBuffer {
+            slice,
+            shape,
+            bf16: None,
+            q8: None,
+            tq: None,
+        };
+        drop(scratch);
+        let result = self.attention_valued(
+            q,
+            k,
+            &values,
+            head_count,
+            head_dimension,
+            Some(width),
+            kv_head_count,
+            window_size,
+            causal,
+            key_count,
+            scale,
+        );
+        self.tq_scratch.lock().unwrap().insert(key, values.slice);
+        result
+    }
+
     /// [`Self::attention_scaled`] with V rows `value_dimension` wide per
     /// head (`attention.value_head_dimension`,
     /// `express-latent-attention-forms`): Q and K rows stay `head_dimension`

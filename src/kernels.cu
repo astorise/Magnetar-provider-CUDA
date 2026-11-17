@@ -5794,3 +5794,58 @@ extern "C" __global__ void tq_attention_split_kernel(
         out[value_dimension + 1] = sum;
     }
 }
+
+// ---------------------------------------------------------------------------
+// `cache-latent-attention-history`.
+
+// `batched-matmul`: `out [rows, groups * n]`, group `g` of row `r` being
+// `a[r, g*k..(g+1)*k]` times `b[g*k..(g+1)*k, :]`. One thread per output
+// value, summing in index order as `magnetar_provider_api::batched_matmul`.
+extern "C" __global__ void batched_matmul_kernel(
+    const float* a,
+    const float* b,
+    float* out,
+    unsigned long long rows,
+    unsigned long long groups,
+    unsigned long long k,
+    unsigned long long n
+) {
+    unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long width = groups * n;
+    if (index >= rows * width) {
+        return;
+    }
+    unsigned long long r = index / width;
+    unsigned long long column = index % width;
+    unsigned long long g = column / n;
+    unsigned long long j = column % n;
+    const float* input = a + r * groups * k + g * k;
+    const float* weight = b + g * k * n + j;
+    float sum = 0.0f;
+    for (unsigned long long i = 0; i < k; i++) {
+        sum += input[i] * weight[i * n];
+    }
+    out[index] = sum;
+}
+
+// The values `attention` reads under `value_head_stride`: of `rows` rows of
+// `heads` heads of `stride` values, each head's leading `width`, as
+// `out [rows, heads * width]`. One thread per output value.
+extern "C" __global__ void value_heads_kernel(
+    const float* v,
+    float* out,
+    unsigned long long rows,
+    unsigned long long heads,
+    unsigned long long stride,
+    unsigned long long width
+) {
+    unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long row_width = heads * width;
+    if (index >= rows * row_width) {
+        return;
+    }
+    unsigned long long r = index / row_width;
+    unsigned long long h = (index % row_width) / width;
+    unsigned long long j = index % width;
+    out[index] = v[r * heads * stride + h * stride + j];
+}

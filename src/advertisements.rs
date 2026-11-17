@@ -21,12 +21,13 @@ use magnetar_core::operator::{ATTENTION_TURBOQUANT_KV_FEATURE, KV_WRITE_TURBOQUA
 use magnetar_core::{DeviceBinding, ProviderBinding};
 use magnetar_core::{
     operator::ATTENTION_SCALE_FEATURE, operator::ATTENTION_VALUE_HEAD_DIMENSION_FEATURE,
-    operator::CONCAT_HEADS_FEATURE, operator::EMBEDDING_SCALE_FEATURE,
-    operator::MOE_EXPERTS_ACTIVATION_FEATURE, operator::MOE_PER_EXPERT_SCALE_FEATURE,
-    operator::OperatorFamily, operator::OperatorId, operator::RMSNORM_PER_HEAD_FEATURE,
-    operator::RMSNORM_WITHOUT_WEIGHT_FEATURE, operator::ROPE_BANDED_FREQUENCY_SCALING_FEATURE,
-    operator::ROPE_PARTIAL_ROTARY_FEATURE, operator::ROPE_YARN_FREQUENCY_SCALING_FEATURE,
-    operator::TensorLayoutKind, operator::TensorRole,
+    operator::ATTENTION_VALUE_HEAD_STRIDE_FEATURE, operator::CONCAT_HEADS_FEATURE,
+    operator::EMBEDDING_SCALE_FEATURE, operator::MOE_EXPERTS_ACTIVATION_FEATURE,
+    operator::MOE_PER_EXPERT_SCALE_FEATURE, operator::OperatorFamily, operator::OperatorId,
+    operator::RMSNORM_PER_HEAD_FEATURE, operator::RMSNORM_WITHOUT_WEIGHT_FEATURE,
+    operator::ROPE_BANDED_FREQUENCY_SCALING_FEATURE, operator::ROPE_PARTIAL_ROTARY_FEATURE,
+    operator::ROPE_YARN_FREQUENCY_SCALING_FEATURE, operator::TensorLayoutKind,
+    operator::TensorRole,
 };
 use magnetar_kernel::{
     kernel::KernelAdvertisement, kernel::KernelCancellationSupport, kernel::KernelId,
@@ -167,6 +168,13 @@ pub fn cuda_kernel_advertisements(
             device_id,
             provider_name,
         ),
+        // `cache-latent-attention-history`: f32 weights.
+        baseline_advertisement(
+            "batched-matmul",
+            OperatorFamily::LinearAlgebra,
+            device_id,
+            provider_name,
+        ),
         // Honours `activation` and the sixth input, `per_expert_scale`.
         advertisement_with_features(
             "moe-experts",
@@ -216,8 +224,9 @@ pub fn cuda_kernel_advertisements(
                 ROPE_YARN_FREQUENCY_SCALING_FEATURE,
             ],
         ),
-        // Honours `key_count` (`append-kv-history-in-place`), `scale` and
-        // `value_head_dimension`.
+        // Honours `key_count` (`append-kv-history-in-place`), `scale`,
+        // `value_head_dimension` and `value_head_stride`
+        // (`cache-latent-attention-history`).
         advertisement_with_features(
             "attention",
             OperatorFamily::Attention,
@@ -227,6 +236,7 @@ pub fn cuda_kernel_advertisements(
                 KEY_COUNT_FEATURE,
                 ATTENTION_SCALE_FEATURE,
                 ATTENTION_VALUE_HEAD_DIMENSION_FEATURE,
+                ATTENTION_VALUE_HEAD_STRIDE_FEATURE,
                 ATTENTION_TURBOQUANT_KV_FEATURE,
             ],
         ),
