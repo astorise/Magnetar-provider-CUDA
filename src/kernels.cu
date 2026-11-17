@@ -6062,6 +6062,23 @@ extern "C" __global__ void tq_attention_split_grouped_kernel(
                     }
                 }
             }
+        } else if (k_bits == 3u) {
+            // Eight 3-bit codes in every three bytes, little-endian.
+            for (unsigned int d = 0; d < dim; d += 8) {
+                const unsigned char* bytes = k_row + (d >> 3) * 3u;
+                unsigned int word = (unsigned int)bytes[0] | ((unsigned int)bytes[1] << 8)
+                    | ((unsigned int)bytes[2] << 16);
+#pragma unroll
+                for (unsigned int e = 0; e < 8; e++) {
+                    float centroid = k_book[(word >> (3u * e)) & 7u];
+#pragma unroll
+                    for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
+                        if (g < group) {
+                            dot[g] += q_shared[g * dim + d + e] * centroid;
+                        }
+                    }
+                }
+            }
         } else {
             for (unsigned int d = 0; d < dim; d++) {
                 float centroid = k_book[tq_code(k_row, k_bits, d)];
