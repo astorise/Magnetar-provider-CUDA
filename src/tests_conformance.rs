@@ -1156,10 +1156,14 @@ fn turboquant_kv_stores_round_trip_and_attend_like_the_cpu() {
             let width = kv_heads * dim;
             let capacity = history + 3;
             // Rows sharing a large per-column component, as keys with a
-            // bias do: the store's offsets hold it.
+            // bias do: the store's offsets hold it. Hashed values: the
+            // arithmetic sequence of `attention_values` puts rotated
+            // coordinates exactly on codebook boundaries once the offsets
+            // are subtracted, where any rounding difference picks the other
+            // centroid.
             let values = |seed: usize| {
-                let common = attention_values(width as usize, 10 * case + seed + 5);
-                let data: Vec<f32> = attention_values((history * width) as usize, 10 * case + seed)
+                let common = hashed_values(width as usize, 10 * case + seed + 5);
+                let data: Vec<f32> = hashed_values((history * width) as usize, 10 * case + seed)
                     .into_iter()
                     .enumerate()
                     .map(|(i, value)| value + 8.0 * common[i % width as usize])
@@ -1380,6 +1384,22 @@ fn batched_matmul_and_strided_values_match_the_cpu() {
             .unwrap();
         assert_close(&download(&kernels, &actual), &expected);
     }
+}
+
+/// Pseudo-random values in [-0.5, 0.5) from splitmix64: no arithmetic
+/// structure for a rotation to line up.
+fn hashed_values(len: usize, seed: usize) -> Vec<f32> {
+    let mut state = 0x9e37_79b9_7f4a_7c15u64 ^ (seed as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    (0..len)
+        .map(|_| {
+            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^= z >> 31;
+            (z >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+        })
+        .collect()
 }
 
 /// Deterministic pseudo-random values in [-0.5, 0.5).
