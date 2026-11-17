@@ -1384,6 +1384,67 @@ fn batched_matmul_and_strided_values_match_the_cpu() {
             .unwrap();
         assert_close(&download(&kernels, &actual), &expected);
     }
+
+    // `turboquant-kv-history` on the latent history: a tq4 store of
+    // 576-value rows in groups of 64, read as both K and V, against the
+    // CPU's attention over the same rounded rows.
+    use magnetar_provider_api::{KvStorePrecision, TurboQuantStoreState};
+    let group = 64u64;
+    // Hashed rows: no rotated coordinate on a codebook boundary.
+    let latent_rows = hashed_values((keys * width) as usize, 11);
+    let mut store = kernels
+        .tq_zeros(&[capacity, width], KvStorePrecision::Tq4, group)
+        .unwrap();
+    kernels
+        .kv_write(
+            &mut store,
+            &upload(
+                &kernels,
+                &HostTensor::new([keys, width], latent_rows.clone()).unwrap(),
+            ),
+            0,
+        )
+        .unwrap();
+    let mut rounded = TurboQuantStoreState::new(KvStorePrecision::Tq4, group, width);
+    let rounded = HostTensor::new([keys, width], rounded.write(&latent_rows, 0).unwrap()).unwrap();
+    let rounded_values = value_heads(&rounded, 1, width, latent).unwrap();
+    for queries in [1u64, 4] {
+        let q = HostTensor::new(
+            [queries, heads * width],
+            attention_values((queries * heads * width) as usize, 9),
+        )
+        .unwrap();
+        let expected = magnetar_provider_cpu::attention_with_value_width(
+            &q,
+            &rounded,
+            &rounded_values,
+            heads,
+            width,
+            latent,
+            Some(1),
+            None,
+            true,
+            Some(0.1),
+        )
+        .unwrap();
+        let actual = kernels
+            .attention_strided_values(
+                &upload(&kernels, &q),
+                &store,
+                &store,
+                heads,
+                width,
+                Some(latent),
+                width,
+                Some(1),
+                None,
+                true,
+                Some(keys),
+                Some(0.1),
+            )
+            .unwrap();
+        assert_close(&download(&kernels, &actual), &expected);
+    }
 }
 
 /// Pseudo-random values in [-0.5, 0.5) from splitmix64: no arithmetic

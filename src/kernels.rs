@@ -5039,8 +5039,74 @@ impl CudaKernels {
         key_count: Option<u64>,
         scale: Option<f32>,
     ) -> Result<CudaDeviceBuffer, CudaError> {
+        // TurboQuant stores (`turboquant-kv-history`): the rows attention
+        // may read, dequantized into scratch buffers kept per role and
+        // shape; a store read as both K and V once.
+        if k.is_tq() || v.is_tq() {
+            let kv_rows = k.shape.first().copied().unwrap_or(0);
+            let rows = key_count.unwrap_or(kv_rows);
+            let step_offset = match key_count {
+                Some(_) => self.advancing_offset("key_count", kv_rows.saturating_sub(rows)),
+                None => 0,
+            };
+            let take = |role: u8,
+                        store: &CudaDeviceBuffer|
+             -> Result<Option<CudaDeviceBuffer>, CudaError> {
+                if !store.is_tq() {
+                    return Ok(None);
+                }
+                let key = (role, store.shape.clone());
+                let reused = self.tq_scratch.lock().unwrap().remove(&key);
+                let mut slice = match reused {
+                    Some(slice) => slice,
+                    None => {
+                        self.forbid_in_capture("allocating a TurboQuant attention scratch buffer")?;
+                        let len = store.shape.iter().product::<u64>() as usize;
+                        self.stream.alloc_zeros::<f32>(len.max(1))?
+                    }
+                };
+                self.tq_dequantize_into(store, &mut slice, rows, step_offset)?;
+                Ok(Some(CudaDeviceBuffer {
+                    slice,
+                    shape: store.shape.clone(),
+                    bf16: None,
+                    q8: None,
+                    tq: None,
+                }))
+            };
+            let same = std::ptr::eq(k, v);
+            let k_values = take(3, k)?;
+            let v_values = if same { None } else { take(4, v)? };
+            let k_read = k_values.as_ref().unwrap_or(k);
+            let v_read = if same {
+                k_read
+            } else {
+                v_values.as_ref().unwrap_or(v)
+            };
+            let result = self.attention_strided_values(
+                q,
+                k_read,
+                v_read,
+                head_count,
+                head_dimension,
+                value_dimension,
+                value_stride,
+                kv_head_count,
+                window_size,
+                causal,
+                key_count,
+                scale,
+            );
+            let mut scratch = self.tq_scratch.lock().unwrap();
+            for (role, values) in [(3u8, k_values), (4, v_values)] {
+                if let Some(values) = values {
+                    scratch.insert((role, values.shape), values.slice);
+                }
+            }
+            return result;
+        }
         Self::require_f32(&[v], "attention's strided values")?;
-        if v.is_q8() || v.is_tq() {
+        if v.is_q8() {
             return Err(CudaError::new(
                 CudaErrorCode::DTypeUnsupported,
                 "attention reads strided values from f32 rows only",
