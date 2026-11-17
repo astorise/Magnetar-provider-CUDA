@@ -5008,11 +5008,41 @@ impl CudaKernels {
         let k = a_cols / groups;
         let n = if transpose_b { b_rows / groups } else { b_cols };
         let len = rows * groups * n;
-        let transposed: i32 = transpose_b.into();
+
         let mut out = self.alloc_output(len as usize)?;
-        if len > 0 {
+        if len > 0 && transpose_b {
+            // One warp per output value: each reads a weight row.
+            let func = self.function("batched_matmul_t_kernel")?;
+            let mut args = self.stream.launch_builder(&func);
+            args.arg(&a.slice)
+                .arg(&b.slice)
+                .arg(&mut out)
+                .arg(&rows)
+                .arg(&groups)
+                .arg(&k)
+                .arg(&n);
+            let warps_per_block = 4u64;
+            let config = LaunchConfig {
+                grid_dim: (
+                    u32::try_from(len.div_ceil(warps_per_block)).map_err(|_| {
+                        CudaError::new(
+                            CudaErrorCode::ShapeUnsupported,
+                            "batched-matmul launch size overflows a grid dimension",
+                        )
+                    })?,
+                    1,
+                    1,
+                ),
+                block_dim: (32 * warps_per_block as u32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe { args.launch(config) }?;
+        } else if len > 0 {
+            // One thread per output value: a warp reads a weight row's
+            // consecutive values.
             let func = self.function("batched_matmul_kernel")?;
             let mut args = self.stream.launch_builder(&func);
+            let transposed = 0i32;
             args.arg(&a.slice)
                 .arg(&b.slice)
                 .arg(&mut out)

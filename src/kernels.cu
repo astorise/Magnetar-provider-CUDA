@@ -5837,6 +5837,43 @@ extern "C" __global__ void batched_matmul_kernel(
     out[index] = sum;
 }
 
+// `batched-matmul` with `transpose_b`, one warp per output value: its lanes
+// read the input row and the weight row (group `g`'s row `j`, `k` values)
+// together, so every load is coalesced. Blocks of `blockDim.x / 32` outputs.
+extern "C" __global__ void batched_matmul_t_kernel(
+    const float* a,
+    const float* b,
+    float* out,
+    unsigned long long rows,
+    unsigned long long groups,
+    unsigned long long k,
+    unsigned long long n
+) {
+    unsigned long long index =
+        (unsigned long long)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    unsigned int lane = threadIdx.x & 31;
+    unsigned long long width = groups * n;
+    if (index >= rows * width) {
+        return;
+    }
+    unsigned long long r = index / width;
+    unsigned long long column = index % width;
+    unsigned long long g = column / n;
+    unsigned long long j = column % n;
+    const float* input = a + r * groups * k + g * k;
+    const float* weight = b + (g * n + j) * k;
+    float sum = 0.0f;
+    for (unsigned long long i = lane; i < k; i += 32) {
+        sum += input[i] * weight[i];
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_xor_sync(0xffffffffu, sum, offset);
+    }
+    if (lane == 0) {
+        out[index] = sum;
+    }
+}
+
 // The values `attention` reads under `value_head_stride`: of `rows` rows of
 // `heads` heads of `stride` values, each head's leading `width`, as
 // `out [rows, heads * width]`. One thread per output value.
