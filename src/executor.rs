@@ -1739,8 +1739,10 @@ impl CudaExecutor {
                         .ok_or_else(|| KernelError::KernelAttributeUnsupported {
                             attribute: "group_count".into(),
                         })?;
+                    let transpose_b =
+                        Self::attribute_bool(&invocation.attributes, "transpose_b", false);
                     self.kernels
-                        .batched_matmul(get(0)?, get(1)?, groups)
+                        .batched_matmul(get(0)?, get(1)?, groups, transpose_b)
                         .map_err(KernelError::from)?
                 }
                 "softmax" => {

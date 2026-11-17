@@ -4954,13 +4954,16 @@ impl CudaKernels {
     }
 
     /// `batched-matmul` (`cache-latent-attention-history`): `a [rows,
-    /// groups * k]` times `b [groups * k, n]` group by group, giving `[rows,
-    /// groups * n]`. f32 operands.
+    /// groups * k]` times `b` group by group, each group's block `[k, n]`
+    /// (`b [groups * k, n]`) or, with `transpose_b`, `[n, k]` used
+    /// transposed (`b [groups * n, k]`), giving `[rows, groups * n]`. f32
+    /// operands.
     pub fn batched_matmul(
         &self,
         a: &CudaDeviceBuffer,
         b: &CudaDeviceBuffer,
         groups: u64,
+        transpose_b: bool,
     ) -> Result<CudaDeviceBuffer, CudaError> {
         Self::require_f32(&[a, b], "batched-matmul")?;
         if a.is_q8() || b.is_q8() || a.is_tq() || b.is_tq() {
@@ -4970,18 +4973,28 @@ impl CudaKernels {
             ));
         }
         let (rows, a_cols) = rows_cols_buf(a)?;
-        let (b_rows, n) = rows_cols_buf(b)?;
-        if groups == 0 || !a_cols.is_multiple_of(groups) || a_cols != b_rows {
+        let (b_rows, b_cols) = rows_cols_buf(b)?;
+        let fits = groups > 0
+            && a_cols.is_multiple_of(groups)
+            && b_rows.is_multiple_of(groups)
+            && if transpose_b {
+                b_cols == a_cols / groups
+            } else {
+                b_rows == a_cols
+            };
+        if !fits {
             return Err(CudaError::new(
                 CudaErrorCode::ShapeUnsupported,
                 format!(
-                    "batched-matmul of {groups} groups needs [T, G*K] and [G*K, N], got {:?} and {:?}",
+                    "batched-matmul of {groups} groups (transpose_b {transpose_b}) cannot take {:?} and {:?}",
                     a.shape, b.shape
                 ),
             ));
         }
         let k = a_cols / groups;
+        let n = if transpose_b { b_rows / groups } else { b_cols };
         let len = rows * groups * n;
+        let transposed: i32 = transpose_b.into();
         let mut out = self.alloc_output(len as usize)?;
         if len > 0 {
             let func = self.function("batched_matmul_kernel")?;
@@ -4992,7 +5005,8 @@ impl CudaKernels {
                 .arg(&rows)
                 .arg(&groups)
                 .arg(&k)
-                .arg(&n);
+                .arg(&n)
+                .arg(&transposed);
             unsafe { args.launch(LaunchConfig::for_num_elems(len as u32)) }?;
         }
         Ok(CudaDeviceBuffer {

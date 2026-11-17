@@ -1296,11 +1296,35 @@ fn batched_matmul_and_strided_values_match_the_cpu() {
         )
         .unwrap();
         let actual = kernels
-            .batched_matmul(&upload(&kernels, &a), &upload(&kernels, &b), heads)
+            .batched_matmul(&upload(&kernels, &a), &upload(&kernels, &b), heads, false)
             .unwrap();
         assert_close(
             &download(&kernels, &actual),
-            &batched_matmul(&a, &b, heads).unwrap(),
+            &batched_matmul(&a, &b, heads, false).unwrap(),
+        );
+        // `transpose_b`: per-head `[n, k]` blocks, as the value rows of the
+        // latent up-projection are stored.
+        let latent_rows = HostTensor::new(
+            [rows, heads * latent],
+            attention_values((rows * heads * latent) as usize, 7),
+        )
+        .unwrap();
+        let values = HostTensor::new(
+            [heads * nope, latent],
+            attention_values((heads * nope * latent) as usize, 8),
+        )
+        .unwrap();
+        let actual = kernels
+            .batched_matmul(
+                &upload(&kernels, &latent_rows),
+                &upload(&kernels, &values),
+                heads,
+                true,
+            )
+            .unwrap();
+        assert_close(
+            &download(&kernels, &actual),
+            &batched_matmul(&latent_rows, &values, heads, true).unwrap(),
         );
     }
     let width = latent + rope;

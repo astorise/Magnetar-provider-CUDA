@@ -5799,8 +5799,9 @@ extern "C" __global__ void tq_attention_split_kernel(
 // `cache-latent-attention-history`.
 
 // `batched-matmul`: `out [rows, groups * n]`, group `g` of row `r` being
-// `a[r, g*k..(g+1)*k]` times `b[g*k..(g+1)*k, :]`. One thread per output
-// value, summing in index order as `magnetar_provider_api::batched_matmul`.
+// `a[r, g*k..(g+1)*k]` times `b[g*k..(g+1)*k, :]` or, with `transpose_b`,
+// times `b[g*n..(g+1)*n, :]` transposed. One thread per output value,
+// summing in index order as `magnetar_provider_api::batched_matmul`.
 extern "C" __global__ void batched_matmul_kernel(
     const float* a,
     const float* b,
@@ -5808,7 +5809,8 @@ extern "C" __global__ void batched_matmul_kernel(
     unsigned long long rows,
     unsigned long long groups,
     unsigned long long k,
-    unsigned long long n
+    unsigned long long n,
+    int transpose_b
 ) {
     unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     unsigned long long width = groups * n;
@@ -5820,10 +5822,17 @@ extern "C" __global__ void batched_matmul_kernel(
     unsigned long long g = column / n;
     unsigned long long j = column % n;
     const float* input = a + r * groups * k + g * k;
-    const float* weight = b + g * k * n + j;
     float sum = 0.0f;
-    for (unsigned long long i = 0; i < k; i++) {
-        sum += input[i] * weight[i * n];
+    if (transpose_b) {
+        const float* weight = b + (g * n + j) * k;
+        for (unsigned long long i = 0; i < k; i++) {
+            sum += input[i] * weight[i];
+        }
+    } else {
+        const float* weight = b + g * k * n + j;
+        for (unsigned long long i = 0; i < k; i++) {
+            sum += input[i] * weight[i * n];
+        }
     }
     out[index] = sum;
 }
