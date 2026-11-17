@@ -1546,16 +1546,21 @@ impl CudaExecutor {
                             });
                         }
                     };
-                    let frequency_scaling =
-                        RopeBandedFrequencyScaling::from_attributes(&invocation.attributes)
-                            .map_err(|attribute| KernelError::KernelAttributeUnsupported {
-                                attribute,
-                            })?;
-                    // `express-latent-attention-forms`.
+                    // `express-latent-attention-forms`: YaRN first, the
+                    // banded scheme only when `frequency_scaling` names no
+                    // YaRN, as the Runtime reads them (the banded reader
+                    // refuses every other scheme, YaRN included).
                     let yarn = RopeYarnFrequencyScaling::from_attributes(&invocation.attributes)
                         .map_err(|attribute| KernelError::KernelAttributeUnsupported {
                             attribute,
                         })?;
+                    let frequency_scaling = match yarn {
+                        Some(_) => None,
+                        None => RopeBandedFrequencyScaling::from_attributes(&invocation.attributes)
+                            .map_err(|attribute| KernelError::KernelAttributeUnsupported {
+                                attribute,
+                            })?,
+                    };
                     // `partial_rotary_factor`: only the first
                     // floor(factor * dimension / 2) pairs rotate.
                     let rotated_pairs = match invocation.attributes.get("partial_rotary_factor") {

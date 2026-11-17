@@ -1040,6 +1040,49 @@ fn layered_operator_forms_dispatch_through_the_executor_on_real_hardware() {
         )
         .unwrap(),
     );
+    // rope with YaRN (`express-latent-attention-forms`), its attributes
+    // as the Runtime forwards them.
+    let yarn = magnetar_core::operator::RopeYarnFrequencyScaling {
+        factor: 4.0,
+        original_context_length: 16,
+        beta_fast: 32.0,
+        beta_slow: 1.0,
+        attention_factor: 1.25,
+        truncate: true,
+    };
+    let mut yarn_attributes = BTreeMap::new();
+    yarn.insert_attributes(&mut yarn_attributes);
+    let mut attributes = vec![
+        ("base", float(100.0)),
+        ("dimension", int(4)),
+        ("head_count", int(2)),
+        ("position_offset", int(30)),
+        ("rotation_pairing", text("interleaved")),
+    ];
+    attributes.extend(
+        yarn_attributes
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.clone())),
+    );
+    check(
+        &mut fixture,
+        "rope-yarn",
+        "rope",
+        vec![("input", x.clone())],
+        attributes,
+        magnetar_runtime::reference_cpu::rope_scaled(
+            &x,
+            100.0,
+            1.0,
+            4,
+            30,
+            2,
+            magnetar_runtime::RopePairing::Interleaved,
+            magnetar_runtime::reference_cpu::RopeFrequencies::Yarn(&yarn),
+            None,
+        )
+        .unwrap(),
+    );
     // attention with its own score scale.
     let (q, k, v) = (tensor(3, 8, 3), tensor(3, 4, 4), tensor(3, 4, 5));
     check(
