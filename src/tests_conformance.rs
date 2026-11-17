@@ -1134,8 +1134,9 @@ fn kv_write_and_key_count_attention_ignore_the_store_tail() {
 /// write at row 0, each row's difference from them quantized), and
 /// attention over the store -- a decode step on the codes, a prefill
 /// through dequantized scratch -- matches the CPU reference over those
-/// values, for 4- and 3-bit codes, grouped-query heads 64 to 512 wide and a
-/// sliding window.
+/// values, for 4- and 3-bit codes, grouped-query heads 64 to 512 wide (one
+/// block per KV head for up to 8 query heads, one per query head beyond)
+/// and a sliding window.
 #[test]
 fn turboquant_kv_stores_round_trip_and_attend_like_the_cpu() {
     use magnetar_provider_api::{KvStorePrecision, TurboQuantStoreState};
@@ -1148,6 +1149,9 @@ fn turboquant_kv_stores_round_trip_and_attend_like_the_cpu() {
             (300, 4, 1, 128, None),
             (129, 8, 1, 256, Some(64u64)),
             (5, 2, 2, 512, None),
+            // More query heads per KV head than one grouped block serves:
+            // a block per query head.
+            (70, 16, 1, 64, None),
         ]
         .into_iter()
         .enumerate()

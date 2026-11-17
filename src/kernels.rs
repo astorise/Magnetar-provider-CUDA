@@ -370,6 +370,10 @@ pub const PADDING_ROWS_ATTRIBUTE: &str = "padding_rows";
 /// Dequantized TurboQuant K and V scratch, by role (0 K, 1 V) and shape.
 type TqScratch = std::collections::BTreeMap<(u8, Vec<u64>), CudaSlice<f32>>;
 
+/// `TQ_MAX_GROUP` in `kernels.cu`: the most query heads one block of the
+/// grouped TurboQuant decode attention serves.
+const TQ_MAX_GROUP: u64 = 8;
+
 /// `TQ_MAX_DIM` in `kernels.cu`: the widest TurboQuant head.
 const TQ_MAX_DIMENSION: u64 = 512;
 
@@ -2485,7 +2489,16 @@ impl CudaKernels {
         let causal_flag: i32 = if causal { 1 } else { 0 };
         let window_arg: i64 = window_size.map(|w| w as i64).unwrap_or(-1);
         let query_position_offset = kv_seq_len - 1;
-        let split = self.function("tq_attention_split_kernel")?;
+        // A block per KV head serves its grouped query heads when they are
+        // few enough (`TQ_MAX_GROUP`): every code is decoded once for them
+        // all. Otherwise a block per query head.
+        let group = head_count / kv_head_count;
+        let grouped = group <= TQ_MAX_GROUP;
+        let split = self.function(if grouped {
+            "tq_attention_split_grouped_kernel"
+        } else {
+            "tq_attention_split_kernel"
+        })?;
         let mut args = self.stream.launch_builder(&split);
         args.arg(&q.slice)
             .arg(&k.codes)
@@ -2513,7 +2526,8 @@ impl CudaKernels {
         let config = LaunchConfig {
             grid_dim: (
                 u32::try_from(chunks).map_err(|_| overflow())?,
-                u32::try_from(head_count).map_err(|_| overflow())?,
+                u32::try_from(if grouped { kv_head_count } else { head_count })
+                    .map_err(|_| overflow())?,
                 1,
             ),
             block_dim: (ATTENTION_SPLIT_THREADS, 1, 1),
