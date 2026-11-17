@@ -1130,13 +1130,15 @@ fn kv_write_and_key_count_attention_ignore_the_store_tail() {
 }
 
 /// `turboquant-kv-history`: `kv-write` into a TurboQuant store keeps each
-/// row's TurboQuant round trip (`kv_store_round_trip`), and attention over
-/// the store -- a decode step on the codes, a prefill through dequantized
-/// scratch -- matches the CPU reference over those values, for 4- and 3-bit
-/// codes, grouped-query heads 64 to 512 wide and a sliding window.
+/// row as the CPU's store does (`TurboQuantStoreState`: offsets set by the
+/// write at row 0, each row's difference from them quantized), and
+/// attention over the store -- a decode step on the codes, a prefill
+/// through dequantized scratch -- matches the CPU reference over those
+/// values, for 4- and 3-bit codes, grouped-query heads 64 to 512 wide and a
+/// sliding window.
 #[test]
 fn turboquant_kv_stores_round_trip_and_attend_like_the_cpu() {
-    use magnetar_provider_api::{KvStorePrecision, kv_store_round_trip};
+    use magnetar_provider_api::{KvStorePrecision, TurboQuantStoreState};
     let Some(kernels) = kernels_or_skip() else {
         return;
     };
@@ -1153,12 +1155,16 @@ fn turboquant_kv_stores_round_trip_and_attend_like_the_cpu() {
             let label = format!("{} case {case}", precision.as_str());
             let width = kv_heads * dim;
             let capacity = history + 3;
+            // Rows sharing a large per-column component, as keys with a
+            // bias do: the store's offsets hold it.
             let values = |seed: usize| {
-                HostTensor::new(
-                    [history, width],
-                    attention_values((history * width) as usize, 10 * case + seed),
-                )
-                .unwrap()
+                let common = attention_values(width as usize, 10 * case + seed + 5);
+                let data: Vec<f32> = attention_values((history * width) as usize, 10 * case + seed)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, value)| value + 8.0 * common[i % width as usize])
+                    .collect();
+                HostTensor::new([history, width], data).unwrap()
             };
             let (k, v) = (values(2), values(3));
             // Written as a prefill and then one appended row.
@@ -1179,18 +1185,21 @@ fn turboquant_kv_stores_round_trip_and_attend_like_the_cpu() {
                 store
             };
             let (k_store, v_store) = (store_of(&k), store_of(&v));
+            // The same writes into the CPU's store: offsets from the
+            // prefill's rows.
             let round_trip = |tensor: &HostTensor| {
-                HostTensor::new(
-                    [history, width],
-                    kv_store_round_trip(&tensor.data, dim, precision).unwrap(),
-                )
-                .unwrap()
+                let mut store = TurboQuantStoreState::new(precision, dim, width);
+                let split = ((history - 1) * width) as usize;
+                let mut data = store.write(&tensor.data[..split], 0).unwrap();
+                data.extend(store.write(&tensor.data[split..], history - 1).unwrap());
+                HostTensor::new([history, width], data).unwrap()
             };
             let (k_values, v_values) = (round_trip(&k), round_trip(&v));
 
-            // Each head row reads back as its round trip: the norms are
-            // summed in another order, so a coordinate on a centroid
-            // boundary may rarely take the other centroid.
+            // Each head row reads back as its round trip: the offsets are
+            // summed in the same order, but the norms in another, so a
+            // coordinate on a centroid boundary may rarely take the other
+            // centroid.
             let stored = download(&kernels, &k_store);
             assert_eq!(stored.shape, vec![capacity, width], "{label}");
             let head_rows = (history * kv_heads) as usize;
@@ -1213,11 +1222,16 @@ fn turboquant_kv_stores_round_trip_and_attend_like_the_cpu() {
                 exact * 100 >= head_rows * 99,
                 "{label}: {exact}/{head_rows}"
             );
+            // Unwritten rows read back as the offsets.
+            let offsets = magnetar_provider_api::turboquant_store_offsets(
+                &k.data[..((history - 1) * width) as usize],
+                width as usize,
+            );
             assert!(
                 stored.data[(history * width) as usize..]
-                    .iter()
-                    .all(|value| *value == 0.0),
-                "{label}: unwritten rows read back as zeros"
+                    .chunks(width as usize)
+                    .all(|row| row == offsets.as_slice()),
+                "{label}: unwritten rows read back as the offsets"
             );
 
             // A decode step on the codes, and a four-query prefill.

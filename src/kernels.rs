@@ -274,6 +274,9 @@ pub struct CudaTqStore {
     pub(crate) codes: CudaSlice<u8>,
     /// `[capacity][heads]` norms.
     pub(crate) norms: CudaSlice<f32>,
+    /// `[heads][head_dimension]`: the offsets the write at row 0 sets
+    /// (`tq_offsets_kernel`), zeros before it.
+    pub(crate) offsets: CudaSlice<f32>,
     pub(crate) precision: KvStorePrecision,
     pub(crate) bits: u32,
     pub(crate) head_dimension: u64,
@@ -2101,6 +2104,7 @@ impl CudaKernels {
                 tq: Some(CudaTqStore {
                     codes: self.stream.clone_dtod(&tq.codes)?,
                     norms: self.stream.clone_dtod(&tq.norms)?,
+                    offsets: self.stream.clone_dtod(&tq.offsets)?,
                     precision: tq.precision,
                     bits: tq.bits,
                     head_dimension: tq.head_dimension,
@@ -2174,6 +2178,7 @@ impl CudaKernels {
             tq: Some(CudaTqStore {
                 codes: self.stream.alloc_zeros::<u8>(cells * code_bytes)?,
                 norms: self.stream.alloc_zeros::<f32>(cells)?,
+                offsets: self.stream.alloc_zeros::<f32>(width as usize)?,
                 precision,
                 bits,
                 head_dimension,
@@ -2224,9 +2229,23 @@ impl CudaKernels {
             return Ok(());
         }
         let tq = store.tq.as_mut().expect("a TurboQuant store");
+        // The write at row 0 starts the history: it sets the offsets from
+        // the rows it computes (`tq_offsets_kernel`).
+        if row_offset == 0 && step_offset == 0 {
+            let padding = self.padding_rows(count);
+            let func = self.function("tq_offsets_kernel")?;
+            let mut args = self.stream.launch_builder(&func);
+            args.arg(&rows.slice)
+                .arg(&mut tq.offsets)
+                .arg(&width)
+                .arg(&count)
+                .arg(&padding);
+            unsafe { args.launch(LaunchConfig::for_num_elems(width as u32)) }?;
+        }
         let func = self.function("tq_kv_write_kernel")?;
         let mut args = self.stream.launch_builder(&func);
         args.arg(&rows.slice)
+            .arg(&tq.offsets)
             .arg(&mut tq.codes)
             .arg(&mut tq.norms)
             .arg(&tq.signs)
@@ -2266,6 +2285,7 @@ impl CudaKernels {
             .arg(&tq.norms)
             .arg(&tq.signs)
             .arg(&tq.centroids)
+            .arg(&tq.offsets)
             .arg(out)
             .arg(&tq.heads)
             .arg(&tq.head_dimension)
@@ -2472,6 +2492,7 @@ impl CudaKernels {
             .arg(&k.norms)
             .arg(&k.centroids)
             .arg(&k.signs)
+            .arg(&k.offsets)
             .arg(&k.bits)
             .arg(&v.codes)
             .arg(&v.norms)
@@ -2508,7 +2529,12 @@ impl CudaKernels {
         )?;
         let rotate = self.function("tq_rotate_back_kernel")?;
         let mut args = self.stream.launch_builder(&rotate);
-        args.arg(&mut out_dev).arg(&v.signs).arg(&value_dimension);
+        let group_size = head_count / kv_head_count;
+        args.arg(&mut out_dev)
+            .arg(&v.signs)
+            .arg(&v.offsets)
+            .arg(&value_dimension)
+            .arg(&group_size);
         let config = LaunchConfig {
             grid_dim: (u32::try_from(head_count).map_err(|_| overflow())?, 1, 1),
             block_dim: (tq_threads(value_dimension), 1, 1),

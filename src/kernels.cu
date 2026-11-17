@@ -5404,8 +5404,11 @@ extern "C" __global__ void concat_heads_kernel(
 // after the fixed signs `D`), the index of its nearest Lloyd-Max centroid
 // (`magnetar_provider_api::turboquant`). A (row, head)'s codes are
 // contiguous: `bits` (3 or 4) per coordinate, little-endian bit order (two
-// 4-bit codes per byte, low nibble first). The store reads back as
-// `|x| * Pi^T c[idx]`.
+// 4-bit codes per byte, low nibble first). The store also keeps one f32
+// offset per column of its rows: the mean of the rows of the write that
+// starts its history (`tq_offsets_kernel`). A row is quantized as its
+// difference from the offsets, and the store reads back as
+// `offsets + |x - offsets| * Pi^T c[idx]`.
 
 #define TQ_MAX_DIM 512
 #define TQ_MAX_THREADS 256
@@ -5438,11 +5441,38 @@ __device__ __forceinline__ void tq_hadamard(float* values, unsigned int d) {
     }
 }
 
+// A TurboQuant store's offsets, set by the write at row 0: per column of
+// the `width`-wide rows, the mean of the first `count - *padding` of its
+// `count` rows (a replayed bucketed prefill does not compute its trailing
+// padding rows), summed in row order as `turboquant_store_offsets` sums
+// them. One thread per column.
+extern "C" __global__ void tq_offsets_kernel(
+    const float* rows,
+    float* offsets,
+    unsigned long long width,
+    unsigned long long count,
+    const unsigned long long* padding
+) {
+    unsigned long long column = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (column >= width) {
+        return;
+    }
+    unsigned long long skipped = padding ? *padding : 0ull;
+    unsigned long long read = count > skipped ? count - skipped : 0ull;
+    float sum = 0.0f;
+    for (unsigned long long r = 0; r < read; r++) {
+        sum += rows[r * width + column];
+    }
+    offsets[column] = read > 0 ? sum / (float)read : 0.0f;
+}
+
 // `kv-write` into a TurboQuant store: block (r, h) quantizes head `h` of
-// written row `r` into store row `row_offset + step_offset + r`. The block
-// has a power-of-two thread count of at most TQ_MAX_THREADS.
+// written row `r`, less the store's offsets, into store row
+// `row_offset + step_offset + r`. The block has a power-of-two thread count
+// of at most TQ_MAX_THREADS.
 extern "C" __global__ void tq_kv_write_kernel(
     const float* rows,
+    const float* offsets,
     unsigned char* codes,
     float* norms,
     const float* signs,
@@ -5461,9 +5491,10 @@ extern "C" __global__ void tq_kv_write_kernel(
     unsigned int tid = threadIdx.x;
     unsigned int dim = (unsigned int)d;
     const float* x = rows + (r * heads + h) * d;
+    const float* offset = offsets + h * d;
     float local = 0.0f;
     for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        float value = x[i];
+        float value = x[i] - offset[i];
         values[i] = value;
         local += value * value;
     }
@@ -5524,6 +5555,7 @@ extern "C" __global__ void tq_dequantize_kernel(
     const float* norms,
     const float* signs,
     const float* centroids,
+    const float* offsets,
     float* out,
     unsigned long long heads,
     unsigned long long d,
@@ -5549,21 +5581,27 @@ extern "C" __global__ void tq_dequantize_kernel(
     tq_hadamard(values, dim);
     float scale = 1.0f / sqrtf((float)dim);
     float* out_row = out + (r * heads + h) * d;
+    const float* offset = offsets + h * d;
     for (unsigned int i = tid; i < dim; i += blockDim.x) {
-        out_row[i] = norm == 0.0f ? 0.0f : values[i] * (signs[i] * scale) * norm;
+        out_row[i] = (norm == 0.0f ? 0.0f : values[i] * (signs[i] * scale) * norm) + offset[i];
     }
 }
 
-// `out[h] <- Pi^T out[h]` for each of `heads` rows of `d` values: the
-// decode attention's rotated value sums back to values. Block `h`.
+// `out[h] <- Pi^T out[h] + offsets[h / group_size]` for each of `heads`
+// rows of `d` values: the decode attention's rotated value sums back to
+// values, plus the value offsets of the query head's KV head (the weights
+// sum to one). Block `h`.
 extern "C" __global__ void tq_rotate_back_kernel(
     float* out,
     const float* signs,
-    unsigned long long d
+    const float* offsets,
+    unsigned long long d,
+    unsigned long long group_size
 ) {
     __shared__ float values[TQ_MAX_DIM];
     unsigned int dim = (unsigned int)d;
     float* row = out + blockIdx.x * d;
+    const float* offset = offsets + (blockIdx.x / group_size) * d;
     for (unsigned int i = threadIdx.x; i < dim; i += blockDim.x) {
         values[i] = row[i];
     }
@@ -5571,22 +5609,24 @@ extern "C" __global__ void tq_rotate_back_kernel(
     tq_hadamard(values, dim);
     float scale = 1.0f / sqrtf((float)dim);
     for (unsigned int i = threadIdx.x; i < dim; i += blockDim.x) {
-        row[i] = values[i] * (signs[i] * scale);
+        row[i] = values[i] * (signs[i] * scale) + offset[i];
     }
 }
 
 // Split-key decode attention over TurboQuant K and V stores, one query row:
 // `attention_split_kernel`'s blocks, chunks and partial layout, computed on
 // the codes. The block rotates its query head (`q' = Pi q`), scores a key
-// as `|k| * sum_i q'_i c_k[idx_i]`, and accumulates
-// `p * |v| * c_v[idx_i]`: values in the rotated domain, which
-// `attention_combine_kernel` merges and `tq_rotate_back_kernel` rotates back.
+// as `q . k_offsets + |k - k_offsets| * sum_i q'_i c_k[idx_i]`, and
+// accumulates `p * |v - v_offsets| * c_v[idx_i]`: values in the rotated
+// domain, which `attention_combine_kernel` merges and
+// `tq_rotate_back_kernel` rotates back and adds the value offsets to.
 extern "C" __global__ void tq_attention_split_kernel(
     const float* q,
     const unsigned char* k_codes,
     const float* k_norms,
     const float* k_centroids,
     const float* k_signs,
+    const float* k_offsets,
     unsigned int k_bits,
     const unsigned char* v_codes,
     const float* v_norms,
@@ -5661,9 +5701,22 @@ extern "C" __global__ void tq_attention_split_kernel(
         v_book[tid] = v_centroids[tid];
     }
     const float* q_row = q + head * head_dimension;
+    // Every key's score has `q . k_offsets` of its KV head.
+    const float* k_offset = k_offsets + kv_head * head_dimension;
+    float offset_part = 0.0f;
     for (unsigned int d = tid; d < dim; d += ATTENTION_SPLIT_THREADS) {
         q_shared[d] = q_row[d] * k_signs[d];
+        offset_part += q_row[d] * k_offset[d];
     }
+    reduce[tid] = offset_part;
+    __syncthreads();
+    for (unsigned int stride = ATTENTION_SPLIT_THREADS / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            reduce[tid] += reduce[tid + stride];
+        }
+        __syncthreads();
+    }
+    float q_offset = reduce[0];
     __syncthreads();
     tq_hadamard(q_shared, dim);
     float rotate_scale = 1.0f / sqrtf((float)dim);
@@ -5684,7 +5737,7 @@ extern "C" __global__ void tq_attention_split_kernel(
             dot += __shfl_xor_sync(0xffffffffu, dot, offset);
         }
         if (lane == 0) {
-            scores[j] = dot * k_norms[cell] * scale;
+            scores[j] = (q_offset + dot * k_norms[cell]) * scale;
         }
     }
     __syncthreads();
