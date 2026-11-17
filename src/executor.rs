@@ -45,7 +45,7 @@ use magnetar_kernel::{
     kernel::KernelObservation, kernel::KernelObservationKind, kernel::KernelResult,
     kernel::KernelResultStatus,
 };
-use magnetar_provider_api::{ExecutionPlanId, HostTensor};
+use magnetar_provider_api::{ExecutionPlanId, HostTensor, KvStorePrecision};
 use magnetar_provider_api::{
     ProviderCancellationOutcome, ProviderExecutionHandle, ProviderExecutionId,
     ProviderExecutionRequest, ProviderExecutionResult, ProviderExecutionStatus, SchedulingState,
@@ -547,6 +547,36 @@ impl CudaExecutor {
 
     /// See [`ProviderExecutionApi::write_zeroed_tensor`]: the zeros are set
     /// on the Device, replacing whatever this Provider held for `id`.
+    /// See [`ProviderExecutionApi::write_zeroed_kv_store`]: a TurboQuant
+    /// store of codes and norms (`turboquant-kv-history`); an f32 one for
+    /// `KvStorePrecision::F32`.
+    pub fn write_zeroed_kv_store(
+        &self,
+        id: &TensorResourceId,
+        shape: &[u64],
+        precision: KvStorePrecision,
+        head_dimension: u64,
+    ) -> Result<bool, ProviderExecutionError> {
+        let buffer = match precision {
+            KvStorePrecision::F32 => self.kernels.zeros(shape),
+            _ => self.kernels.tq_zeros(shape, precision, head_dimension),
+        }
+        .map_err(|error| {
+            ProviderExecutionError::new(
+                ProviderExecutionErrorCode::MaterializationFailed,
+                ProviderExecutionPhase::Submit,
+                self.provider_binding(),
+                Some(self.device_binding()),
+                format!(
+                    "CUDA {} KV store allocation failed: {error}",
+                    precision.as_str()
+                ),
+            )
+        })?;
+        self.storage.lock().unwrap().insert(id.clone(), buffer);
+        Ok(true)
+    }
+
     pub fn write_zeroed_tensor(
         &self,
         id: &TensorResourceId,
@@ -1250,6 +1280,7 @@ impl CudaExecutor {
                     shape,
                     bf16: None,
                     q8: None,
+                    tq: None,
                 },
             );
         }
@@ -1271,6 +1302,11 @@ impl CudaExecutor {
             // other compact ones expanded per call.
             "moe-experts" => index >= 2,
             "embedding" => index == 0,
+            // TurboQuant KV stores (`turboquant-kv-history`): `kv-write`
+            // writes its store's codes and attention reads K and V codes
+            // or dequantizes them for the call; neither is expanded for good.
+            "kv-write" => index == 0,
+            "attention" => index == 1 || index == 2,
             _ => false,
         };
         let mut storage = self.storage.lock().unwrap();
@@ -2317,6 +2353,16 @@ impl ProviderExecutionApi for CudaExecutor {
         shape: &[u64],
     ) -> Result<bool, ProviderExecutionError> {
         CudaExecutor::write_zeroed_tensor(self, id, shape).map(|()| true)
+    }
+
+    fn write_zeroed_kv_store(
+        &self,
+        id: &TensorResourceId,
+        shape: &[u64],
+        precision: KvStorePrecision,
+        head_dimension: u64,
+    ) -> Result<bool, ProviderExecutionError> {
+        CudaExecutor::write_zeroed_kv_store(self, id, shape, precision, head_dimension)
     }
 
     fn write_tensor_value_admitted(

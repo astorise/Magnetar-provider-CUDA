@@ -1129,6 +1129,136 @@ fn kv_write_and_key_count_attention_ignore_the_store_tail() {
     }
 }
 
+/// `turboquant-kv-history`: `kv-write` into a TurboQuant store keeps each
+/// row's TurboQuant round trip (`kv_store_round_trip`), and attention over
+/// the store -- a decode step on the codes, a prefill through dequantized
+/// scratch -- matches the CPU reference over those values, for 4- and 3-bit
+/// codes, grouped-query heads 64 to 512 wide and a sliding window.
+#[test]
+fn turboquant_kv_stores_round_trip_and_attend_like_the_cpu() {
+    use magnetar_provider_api::{KvStorePrecision, kv_store_round_trip};
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    for precision in [KvStorePrecision::Tq4, KvStorePrecision::Tq3] {
+        for (case, (history, heads, kv_heads, dim, window)) in [
+            (37u64, 8u64, 2u64, 64u64, None),
+            (300, 4, 1, 128, None),
+            (129, 8, 1, 256, Some(64u64)),
+            (5, 2, 2, 512, None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let label = format!("{} case {case}", precision.as_str());
+            let width = kv_heads * dim;
+            let capacity = history + 3;
+            let values = |seed: usize| {
+                HostTensor::new(
+                    [history, width],
+                    attention_values((history * width) as usize, 10 * case + seed),
+                )
+                .unwrap()
+            };
+            let (k, v) = (values(2), values(3));
+            // Written as a prefill and then one appended row.
+            let store_of = |tensor: &HostTensor| {
+                let mut store = kernels
+                    .tq_zeros(&[capacity, width], precision, dim)
+                    .unwrap();
+                let split = ((history - 1) * width) as usize;
+                let prefix =
+                    HostTensor::new([history - 1, width], tensor.data[..split].to_vec()).unwrap();
+                let last = HostTensor::new([1, width], tensor.data[split..].to_vec()).unwrap();
+                kernels
+                    .kv_write(&mut store, &upload(&kernels, &prefix), 0)
+                    .unwrap();
+                kernels
+                    .kv_write(&mut store, &upload(&kernels, &last), history - 1)
+                    .unwrap();
+                store
+            };
+            let (k_store, v_store) = (store_of(&k), store_of(&v));
+            let round_trip = |tensor: &HostTensor| {
+                HostTensor::new(
+                    [history, width],
+                    kv_store_round_trip(&tensor.data, dim, precision).unwrap(),
+                )
+                .unwrap()
+            };
+            let (k_values, v_values) = (round_trip(&k), round_trip(&v));
+
+            // Each head row reads back as its round trip: the norms are
+            // summed in another order, so a coordinate on a centroid
+            // boundary may rarely take the other centroid.
+            let stored = download(&kernels, &k_store);
+            assert_eq!(stored.shape, vec![capacity, width], "{label}");
+            let head_rows = (history * kv_heads) as usize;
+            let mut exact = 0;
+            for (read, expected) in stored.data[..(history * width) as usize]
+                .chunks(dim as usize)
+                .zip(k_values.data.chunks(dim as usize))
+            {
+                let difference = read
+                    .iter()
+                    .zip(expected)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0_f32, f32::max);
+                assert!(difference < 0.05, "{label}: {difference}");
+                if difference < 1e-4 {
+                    exact += 1;
+                }
+            }
+            assert!(
+                exact * 100 >= head_rows * 99,
+                "{label}: {exact}/{head_rows}"
+            );
+            assert!(
+                stored.data[(history * width) as usize..]
+                    .iter()
+                    .all(|value| *value == 0.0),
+                "{label}: unwritten rows read back as zeros"
+            );
+
+            // A decode step on the codes, and a four-query prefill.
+            for queries in [1u64, 4] {
+                let q = HostTensor::new(
+                    [queries, heads * dim],
+                    attention_values((queries * heads * dim) as usize, 10 * case + 1),
+                )
+                .unwrap();
+                let expected = magnetar_provider_cpu::attention(
+                    &q,
+                    &k_values,
+                    &v_values,
+                    heads,
+                    dim,
+                    Some(kv_heads),
+                    window,
+                    true,
+                )
+                .unwrap();
+                let actual = kernels
+                    .attention_valued(
+                        &upload(&kernels, &q),
+                        &k_store,
+                        &v_store,
+                        heads,
+                        dim,
+                        None,
+                        Some(kv_heads),
+                        window,
+                        true,
+                        Some(history),
+                        None,
+                    )
+                    .unwrap();
+                assert_close(&download(&kernels, &actual), &expected);
+            }
+        }
+    }
+}
+
 /// Deterministic pseudo-random values in [-0.5, 0.5).
 fn attention_values(len: usize, seed: usize) -> Vec<f32> {
     (0..len)
