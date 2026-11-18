@@ -646,6 +646,10 @@ const SPLIT_TCP_BLOCK_ROWS: u64 = 2048;
 /// grouped `moe-experts` Kernels serves.
 const MOE_GROUP_ROWS: u64 = 8;
 
+/// `MOE_GROUP_COLS` in `kernels.cu`: the output columns one warp of the
+/// grouped `moe-experts` Kernels serves.
+const MOE_GROUP_COLS: u64 = 2;
+
 /// Tokens of a grouped `moe-experts` prefill served at once: its
 /// activations and per-pair sums are this many tokens' at most.
 const MOE_GROUP_CHUNK_TOKENS: u64 = 1024;
@@ -3552,7 +3556,9 @@ impl CudaKernels {
     /// A `moe-experts` prefill over packed `Q8_0` experts, its pairs grouped
     /// by expert: each block of `moe_q8_gated_grouped_kernel` and
     /// `moe_q8_down_grouped_kernel` reads one expert's weights once for up
-    /// to [`MOE_GROUP_ROWS`] of its pairs. Tokens are served
+    /// to [`MOE_GROUP_ROWS`] of its pairs, each warp [`MOE_GROUP_COLS`]
+    /// output columns (a lane's quants converted once per step, its values
+    /// of a pair read once for every column). Tokens are served
     /// [`MOE_GROUP_CHUNK_TOKENS`] at a time. Every value is the per-pair
     /// Kernels' own (same lanes, order and reductions).
     #[allow(clippy::too_many_arguments)]
@@ -3600,7 +3606,7 @@ impl CudaKernels {
         let tiles_bound = |pairs: u64| pairs.div_ceil(MOE_GROUP_ROWS) + local_experts;
         let warps_grid = |cols: u64, blocks: u64| LaunchConfig {
             grid_dim: (
-                cols.div_ceil(u64::from(Q8_MATMUL_WARPS)) as u32,
+                cols.div_ceil(u64::from(Q8_MATMUL_WARPS) * MOE_GROUP_COLS) as u32,
                 blocks as u32,
                 1,
             ),

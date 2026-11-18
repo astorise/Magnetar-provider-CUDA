@@ -748,7 +748,45 @@ __device__ __forceinline__ bool moe_group_tile(
     return true;
 }
 
-// `moe_q8_gated_kernel` over a tile: act[(tk - pair_first) * inter + j].
+// Output columns one warp of the grouped kernels below serves: each lane
+// converts its quants of every column once per step and reads its x values
+// of a pair once for every column.
+#define MOE_GROUP_COLS 2
+
+// `q8_dot16` over quants already converted to floats, and x values already
+// loaded: the same products added in the same order (each quant converts
+// exactly).
+__device__ __forceinline__ float moe_dot16(const float* w, const float* x) {
+    float s = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 16; j += 4) {
+        s += x[j] * w[j] + x[j + 1] * w[j + 1] + x[j + 2] * w[j + 2] + x[j + 3] * w[j + 3];
+    }
+    return s;
+}
+
+__device__ __forceinline__ void moe_quants16(const signed char* quants, float* w) {
+    int4 q = *reinterpret_cast<const int4*>(quants);
+    const signed char* b = reinterpret_cast<const signed char*>(&q);
+#pragma unroll
+    for (int j = 0; j < 16; j++) {
+        w[j] = (float)b[j];
+    }
+}
+
+__device__ __forceinline__ void moe_values16(const float* source, float* x) {
+#pragma unroll
+    for (int j = 0; j < 16; j += 4) {
+        float4 v = *reinterpret_cast<const float4*>(source + j);
+        x[j] = v.x;
+        x[j + 1] = v.y;
+        x[j + 2] = v.z;
+        x[j + 3] = v.w;
+    }
+}
+
+// `moe_q8_gated_kernel` over a tile, MOE_GROUP_COLS columns per warp:
+// act[(tk - pair_first) * inter + j].
 extern "C" __global__ void moe_q8_gated_grouped_kernel(
     const float* h,
     const unsigned int* order,
@@ -766,59 +804,86 @@ extern "C" __global__ void moe_q8_gated_grouped_kernel(
     unsigned long long inter,
     int gelu
 ) {
-    unsigned long long j = (unsigned long long)blockIdx.x * Q8_MATMUL_WARPS + threadIdx.y;
+    unsigned long long j0 =
+        ((unsigned long long)blockIdx.x * Q8_MATMUL_WARPS + threadIdx.y) * MOE_GROUP_COLS;
     unsigned int expert, first, rows;
-    if (j >= inter || !moe_group_tile(offsets, tiles, experts, blockIdx.y, &expert, &first, &rows)) {
+    if (j0 >= inter || !moe_group_tile(offsets, tiles, experts, blockIdx.y, &expert, &first, &rows)) {
         return;
     }
-    unsigned long long row = (unsigned long long)expert * inter + j;
-    const signed char* wg = gate_quants + row * hidden;
-    const signed char* wu = up_quants + row * hidden;
-    const float* sg = gate_scales + row * (hidden >> 5);
-    const float* su = up_scales + row * (hidden >> 5);
-    unsigned long long tk[MOE_GROUP_ROWS];
-    const float* x[MOE_GROUP_ROWS];
-    float g[MOE_GROUP_ROWS];
-    float u[MOE_GROUP_ROWS];
+    const signed char* wg[MOE_GROUP_COLS];
+    const signed char* wu[MOE_GROUP_COLS];
+    const float* sg[MOE_GROUP_COLS];
+    const float* su[MOE_GROUP_COLS];
+#pragma unroll
+    for (int c = 0; c < MOE_GROUP_COLS; c++) {
+        // A column past the last reads the first's weights, unwritten.
+        unsigned long long j = j0 + c < inter ? j0 + c : j0;
+        unsigned long long row = (unsigned long long)expert * inter + j;
+        wg[c] = gate_quants + row * hidden;
+        wu[c] = up_quants + row * hidden;
+        sg[c] = gate_scales + row * (hidden >> 5);
+        su[c] = up_scales + row * (hidden >> 5);
+    }
+    unsigned int tk[MOE_GROUP_ROWS];
+    float g[MOE_GROUP_COLS][MOE_GROUP_ROWS];
+    float u[MOE_GROUP_COLS][MOE_GROUP_ROWS];
 #pragma unroll
     for (int r = 0; r < MOE_GROUP_ROWS; r++) {
         tk[r] = order[first + (r < rows ? r : 0)];
-        x[r] = h + (tk[r] / top_k) * hidden;
-        g[r] = 0.0f;
-        u[r] = 0.0f;
+#pragma unroll
+        for (int c = 0; c < MOE_GROUP_COLS; c++) {
+            g[c][r] = 0.0f;
+            u[c][r] = 0.0f;
+        }
     }
     for (unsigned long long i = (unsigned long long)threadIdx.x * Q8_LANE_QUANTS; i < hidden;
          i += Q8_WARP_QUANTS) {
-        int4 qg = *reinterpret_cast<const int4*>(wg + i);
-        int4 qu = *reinterpret_cast<const int4*>(wu + i);
-        float gate_scale = sg[i >> 5];
-        float up_scale = su[i >> 5];
+        float gate_w[MOE_GROUP_COLS][16];
+        float up_w[MOE_GROUP_COLS][16];
+        float gate_scale[MOE_GROUP_COLS];
+        float up_scale[MOE_GROUP_COLS];
+#pragma unroll
+        for (int c = 0; c < MOE_GROUP_COLS; c++) {
+            moe_quants16(wg[c] + i, gate_w[c]);
+            moe_quants16(wu[c] + i, up_w[c]);
+            gate_scale[c] = sg[c][i >> 5];
+            up_scale[c] = su[c][i >> 5];
+        }
 #pragma unroll
         for (int r = 0; r < MOE_GROUP_ROWS; r++) {
             if (r < rows) {
-                g[r] += gate_scale * q8_dot16(qg, x[r] + i);
-                u[r] += up_scale * q8_dot16(qu, x[r] + i);
+                float x[16];
+                moe_values16(h + (unsigned long long)(tk[r] / top_k) * hidden + i, x);
+#pragma unroll
+                for (int c = 0; c < MOE_GROUP_COLS; c++) {
+                    g[c][r] += gate_scale[c] * moe_dot16(gate_w[c], x);
+                    u[c][r] += up_scale[c] * moe_dot16(up_w[c], x);
+                }
             }
         }
     }
 #pragma unroll
-    for (int r = 0; r < MOE_GROUP_ROWS; r++) {
-        float gr = g[r];
-        float ur = u[r];
+    for (int c = 0; c < MOE_GROUP_COLS; c++) {
 #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            gr += __shfl_xor_sync(0xffffffffu, gr, offset);
-            ur += __shfl_xor_sync(0xffffffffu, ur, offset);
-        }
-        if (threadIdx.x == 0 && r < rows) {
-            act[(tk[r] - pair_first) * inter + j] =
-                (gelu ? gelu_tanh(gr) : gr * (1.0f / (1.0f + expf(-gr)))) * ur;
+        for (int r = 0; r < MOE_GROUP_ROWS; r++) {
+            float gr = g[c][r];
+            float ur = u[c][r];
+#pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                gr += __shfl_xor_sync(0xffffffffu, gr, offset);
+                ur += __shfl_xor_sync(0xffffffffu, ur, offset);
+            }
+            if (threadIdx.x == 0 && r < rows && j0 + c < inter) {
+                act[((unsigned long long)tk[r] - pair_first) * inter + j0 + c] =
+                    (gelu ? gelu_tanh(gr) : gr * (1.0f / (1.0f + expf(-gr)))) * ur;
+            }
         }
     }
 }
 
-// `moe_q8_down_kernel`'s per-pair sums over a tile, before their weighted
-// total: partial[(tk - pair_first) * hidden + c] = act[tk] . down_e[:, c].
+// `moe_q8_down_kernel`'s per-pair sums over a tile, MOE_GROUP_COLS columns
+// per warp, before their weighted total:
+// partial[(tk - pair_first) * hidden + c] = act[tk] . down_e[:, c].
 extern "C" __global__ void moe_q8_down_grouped_kernel(
     const float* act,
     const unsigned int* order,
@@ -832,43 +897,64 @@ extern "C" __global__ void moe_q8_down_grouped_kernel(
     unsigned long long hidden,
     unsigned long long inter
 ) {
-    unsigned long long c = (unsigned long long)blockIdx.x * Q8_MATMUL_WARPS + threadIdx.y;
+    unsigned long long c0 =
+        ((unsigned long long)blockIdx.x * Q8_MATMUL_WARPS + threadIdx.y) * MOE_GROUP_COLS;
     unsigned int expert, first, rows;
-    if (c >= hidden || !moe_group_tile(offsets, tiles, experts, blockIdx.y, &expert, &first, &rows)) {
+    if (c0 >= hidden || !moe_group_tile(offsets, tiles, experts, blockIdx.y, &expert, &first, &rows)) {
         return;
     }
-    unsigned long long row = (unsigned long long)expert * hidden + c;
-    const signed char* w = down_quants + row * inter;
-    const float* scales = down_scales + row * (inter >> 5);
-    unsigned long long tk[MOE_GROUP_ROWS];
-    const float* a[MOE_GROUP_ROWS];
-    float sum[MOE_GROUP_ROWS];
+    const signed char* w[MOE_GROUP_COLS];
+    const float* scales[MOE_GROUP_COLS];
+#pragma unroll
+    for (int c = 0; c < MOE_GROUP_COLS; c++) {
+        unsigned long long column = c0 + c < hidden ? c0 + c : c0;
+        unsigned long long row = (unsigned long long)expert * hidden + column;
+        w[c] = down_quants + row * inter;
+        scales[c] = down_scales + row * (inter >> 5);
+    }
+    unsigned int tk[MOE_GROUP_ROWS];
+    float sum[MOE_GROUP_COLS][MOE_GROUP_ROWS];
 #pragma unroll
     for (int r = 0; r < MOE_GROUP_ROWS; r++) {
         tk[r] = order[first + (r < rows ? r : 0)];
-        a[r] = act + (tk[r] - pair_first) * inter;
-        sum[r] = 0.0f;
+#pragma unroll
+        for (int c = 0; c < MOE_GROUP_COLS; c++) {
+            sum[c][r] = 0.0f;
+        }
     }
     for (unsigned long long i = (unsigned long long)threadIdx.x * Q8_LANE_QUANTS; i < inter;
          i += Q8_WARP_QUANTS) {
-        int4 q = *reinterpret_cast<const int4*>(w + i);
-        float scale = scales[i >> 5];
+        float weights[MOE_GROUP_COLS][16];
+        float scale[MOE_GROUP_COLS];
+#pragma unroll
+        for (int c = 0; c < MOE_GROUP_COLS; c++) {
+            moe_quants16(w[c] + i, weights[c]);
+            scale[c] = scales[c][i >> 5];
+        }
 #pragma unroll
         for (int r = 0; r < MOE_GROUP_ROWS; r++) {
             if (r < rows) {
-                sum[r] += scale * q8_dot16(q, a[r] + i);
+                float a[16];
+                moe_values16(act + ((unsigned long long)tk[r] - pair_first) * inter + i, a);
+#pragma unroll
+                for (int c = 0; c < MOE_GROUP_COLS; c++) {
+                    sum[c][r] += scale[c] * moe_dot16(weights[c], a);
+                }
             }
         }
     }
 #pragma unroll
-    for (int r = 0; r < MOE_GROUP_ROWS; r++) {
-        float value = sum[r];
+    for (int c = 0; c < MOE_GROUP_COLS; c++) {
 #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            value += __shfl_xor_sync(0xffffffffu, value, offset);
-        }
-        if (threadIdx.x == 0 && r < rows) {
-            partial[(tk[r] - pair_first) * hidden + c] = value;
+        for (int r = 0; r < MOE_GROUP_ROWS; r++) {
+            float value = sum[c][r];
+#pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                value += __shfl_xor_sync(0xffffffffu, value, offset);
+            }
+            if (threadIdx.x == 0 && r < rows && c0 + c < hidden) {
+                partial[((unsigned long long)tk[r] - pair_first) * hidden + c0 + c] = value;
+            }
         }
     }
 }
