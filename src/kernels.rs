@@ -2764,8 +2764,15 @@ impl CudaKernels {
             }
             _ => chunks,
         };
-        let partial_len =
-            usize::try_from(head_count * parts * (value_dimension + 2)).map_err(|_| overflow())?;
+        // The scratch holds as many partials as any step over these stores
+        // may write: the split count grows with the history, and a captured
+        // step cannot grow the scratch.
+        let most_parts = match (staged_shared, schedule) {
+            (Some(_), TqDecodeSchedule::Split) => chunks.min(TQ_MAX_SPLITS).max(parts),
+            _ => parts,
+        };
+        let partial_len = usize::try_from(head_count * most_parts * (value_dimension + 2))
+            .map_err(|_| overflow())?;
         let mut scratch = self.attention_scratch.lock().unwrap();
         if scratch
             .0
