@@ -397,6 +397,12 @@ const TQ_MAX_DIMENSION: u64 = 512;
 /// (`speed-up-decode-attention-on-codes`): a value coordinate per thread.
 const TQ_STAGED_MAX_DIMENSION: u64 = 128;
 
+/// The dynamic shared memory the latent decode Kernels may take for their
+/// query heads (`latent_attention_split_kernel`,
+/// `tq_latent_attention_split_kernel`): within the 48 KB a block may take
+/// without opting in, beside their static arrays.
+const LATENT_QUERY_SHARED_BYTES: u64 = 40 * 1024;
+
 /// The most blocks per KV head a TurboQuant decode step splits its history
 /// over (`speed-up-decode-attention-on-codes`, decision 4).
 const TQ_MAX_SPLITS: u64 = 32;
@@ -5531,6 +5537,7 @@ impl CudaKernels {
                     .unwrap_or(head_dimension)
                     .is_multiple_of(tq.head_dimension)
                 && head_count > 0
+                && head_count.min(TQ_MAX_GROUP) * head_dimension * 4 <= LATENT_QUERY_SHARED_BYTES
                 && self
                     .tq_latent_on_codes
                     .load(std::sync::atomic::Ordering::Relaxed)
@@ -5824,6 +5831,85 @@ impl CudaKernels {
         })
     }
 
+    /// Decode attention over an f32 latent history read as both K and V
+    /// (`latent_attention_split_kernel`, then the combine): one query row of
+    /// `head_count` heads as wide as the rows, the values each row's
+    /// leading `width`.
+    #[allow(clippy::too_many_arguments)]
+    fn latent_attention_decode(
+        &self,
+        q: &CudaDeviceBuffer,
+        kv: &CudaDeviceBuffer,
+        [head_count, k_width, width, kv_seq_len, kv_rows]: [u64; 5],
+        causal_flag: i32,
+        window_arg: i64,
+        step_offset: u64,
+        score_scale: f32,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        let overflow = || {
+            CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                "attention launch size overflows a grid dimension",
+            )
+        };
+        let chunks = kv_rows.div_ceil(ATTENTION_CHUNK_KEYS).max(1);
+        let partial_len =
+            usize::try_from(head_count * chunks * (width + 2)).map_err(|_| overflow())?;
+        let mut scratch = self.attention_scratch.lock().unwrap();
+        if scratch
+            .0
+            .as_ref()
+            .is_none_or(|slice| slice.len() < partial_len)
+        {
+            self.forbid_in_capture("growing the attention scratch buffer")?;
+            // SAFETY: the split Kernel writes every partial of this launch
+            // before the combine Kernel reads it, on this same stream.
+            let grown = unsafe { self.stream.alloc::<f32>(partial_len.max(1 << 16)) }?;
+            if let Some(outgrown) = scratch.0.replace(grown) {
+                scratch.1.push(outgrown);
+            }
+        }
+        let partial = scratch.0.as_mut().expect("allocated above");
+        let mut out_dev =
+            self.alloc_output(usize::try_from(head_count * width).map_err(|_| overflow())?)?;
+        let query_position_offset = kv_seq_len - 1;
+        let split = self.function("latent_attention_split_kernel")?;
+        let mut args = self.stream.launch_builder(&split);
+        args.arg(&q.slice)
+            .arg(&kv.slice)
+            .arg(&mut *partial)
+            .arg(&kv_seq_len)
+            .arg(&head_count)
+            .arg(&k_width)
+            .arg(&width)
+            .arg(&causal_flag)
+            .arg(&window_arg)
+            .arg(&query_position_offset)
+            .arg(&chunks)
+            .arg(&step_offset)
+            .arg(&score_scale);
+        let config = LaunchConfig {
+            grid_dim: (
+                u32::try_from(chunks).map_err(|_| overflow())?,
+                u32::try_from(head_count.div_ceil(TQ_MAX_GROUP)).map_err(|_| overflow())?,
+                1,
+            ),
+            block_dim: (ATTENTION_SPLIT_THREADS, 1, 1),
+            // The queries of up to `TQ_MAX_GROUP` heads.
+            shared_mem_bytes: u32::try_from(4 * head_count.min(TQ_MAX_GROUP) * k_width)
+                .map_err(|_| overflow())?,
+        };
+        unsafe { args.launch(config) }?;
+        self.combine_attention_partials(&*partial, &mut out_dev, head_count, width, chunks)?;
+        Ok(CudaDeviceBuffer {
+            slice: out_dev,
+            shape: vec![1, head_count * width],
+            bf16: None,
+            q8: None,
+            tq: None,
+        })
+    }
+
     /// [`Self::attention_strided_values`] for one query row: the split
     /// Kernel reads each head's leading `width` values from V rows of
     /// `heads * value_stride` values in place. `None` for several query
@@ -5871,6 +5957,27 @@ impl CudaKernels {
             Some(_) => self.advancing_offset("key_count", kv_rows - kv_seq_len),
             None => 0,
         };
+        // A latent history read as both K and V (one KV head, the values
+        // each row's leading `width`): a block serves several query heads,
+        // reading each row once for them all.
+        if std::ptr::eq(k, v)
+            && heads == 1
+            && head_count > 1
+            && v_model_dim == kv_model_dim
+            && head_dimension.is_multiple_of(4)
+            && width <= head_dimension
+            && head_count.min(TQ_MAX_GROUP) * head_dimension * 4 <= LATENT_QUERY_SHARED_BYTES
+        {
+            return Some(self.latent_attention_decode(
+                q,
+                k,
+                [head_count, head_dimension, width, kv_seq_len, kv_rows],
+                if causal { 1 } else { 0 },
+                window_size.map(|w| w as i64).unwrap_or(-1),
+                step_offset,
+                score_scale,
+            ));
+        }
         Some(self.attention_split(
             q,
             k,

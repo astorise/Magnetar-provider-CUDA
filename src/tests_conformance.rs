@@ -1708,6 +1708,70 @@ fn captured_split_decode_steps_cover_longer_histories() {
     }
 }
 
+/// `cache-latent-attention-history`: a decode step over an f32 latent
+/// history read as both K and V (16 query heads over 576-value rows, the
+/// values the leading 512; a block serving eight heads) matches the CPU's
+/// attention, for short and longer histories and a sliding window.
+#[test]
+fn latent_decode_matches_the_cpu() {
+    use magnetar_provider_api::value_heads;
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let (heads, width, latent) = (16u64, 576u64, 512u64);
+    for (keys, window) in [
+        (33u64, None),
+        (300, None),
+        (1100, None),
+        (700, Some(300u64)),
+    ] {
+        let capacity = keys + 5;
+        let data = hashed_values((capacity * width) as usize, 21 + keys as usize);
+        let store = upload(
+            &kernels,
+            &HostTensor::new([capacity, width], data.clone()).unwrap(),
+        );
+        let history =
+            HostTensor::new([keys, width], data[..(keys * width) as usize].to_vec()).unwrap();
+        let history_values = value_heads(&history, 1, width, latent).unwrap();
+        let q = HostTensor::new(
+            [1, heads * width],
+            attention_values((heads * width) as usize, 13),
+        )
+        .unwrap();
+        let expected = magnetar_provider_cpu::attention_with_value_width(
+            &q,
+            &history,
+            &history_values,
+            heads,
+            width,
+            latent,
+            Some(1),
+            window,
+            true,
+            Some(0.1),
+        )
+        .unwrap();
+        let actual = kernels
+            .attention_strided_values(
+                &upload(&kernels, &q),
+                &store,
+                &store,
+                heads,
+                width,
+                Some(latent),
+                width,
+                Some(1),
+                window,
+                true,
+                Some(keys),
+                Some(0.1),
+            )
+            .unwrap();
+        assert_close(&download(&kernels, &actual), &expected);
+    }
+}
+
 /// `cache-latent-attention-history`, `speed-up-decode-attention-on-codes`:
 /// a decode step over a latent TurboQuant store read as both K and V (16
 /// query heads over 576-value rows in groups of 64, the values the leading
