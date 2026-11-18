@@ -604,6 +604,10 @@ pub struct CudaKernels {
     /// codes (`tq_latent_attention_split_kernel`) rather than through
     /// dequantized scratch; only the conformance and timing tests clear it.
     tq_latent_on_codes: std::sync::atomic::AtomicBool,
+    /// Whether a `moe-experts` prefill over packed `Q8_0` experts groups its
+    /// pairs by expert (`moe_q8_gated_grouped_kernel`); only the
+    /// conformance and timing tests clear it.
+    moe_grouped: std::sync::atomic::AtomicBool,
 }
 
 /// Int8 activations: [`INT8_SCRATCH_VALUES`] signed bytes and one f32 scale
@@ -611,6 +615,14 @@ pub struct CudaKernels {
 struct Int8Scratch {
     values: CudaSlice<i8>,
     scales: CudaSlice<f32>,
+}
+
+/// A `moe-experts` weight's packed `Q8_0` form the expert Kernels read
+/// (transposed storage, rows of `stored_cols` quants), if it has one.
+fn packed_moe_q8(buffer: &CudaDeviceBuffer, stored_cols: u64) -> Option<&CudaQ8Weight> {
+    buffer.q8.as_ref().filter(|q8| {
+        q8.format == PackedWeightFormat::Q8_0 && q8.transposed && q8.stored_cols == stored_cols
+    })
 }
 
 /// `moe-experts` scratch: the routed experts and weights of each
@@ -624,6 +636,14 @@ struct MoeScratch {
 /// Steps of at most this many tokens (decode) route through the persistent
 /// scratch, so they capture; longer ones (prefill) use temporaries.
 const MOE_PERSISTENT_TOKENS: u64 = 64;
+
+/// `MOE_GROUP_ROWS` in `kernels.cu`: the pairs of one expert a block of the
+/// grouped `moe-experts` Kernels serves.
+const MOE_GROUP_ROWS: u64 = 8;
+
+/// Tokens of a grouped `moe-experts` prefill served at once: its
+/// activations and per-pair sums are this many tokens' at most.
+const MOE_GROUP_CHUNK_TOKENS: u64 = 1024;
 
 /// The current hi/lo split buffer and the ones it outgrew.
 type SplitScratch = (Option<CudaSlice<u16>>, Vec<CudaSlice<u16>>);
@@ -818,7 +838,15 @@ impl CudaKernels {
             tq_decode_schedule: std::sync::atomic::AtomicU8::new(TqDecodeSchedule::Unstaged as u8),
             tq_staged_occupancy: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             tq_latent_on_codes: std::sync::atomic::AtomicBool::new(true),
+            moe_grouped: std::sync::atomic::AtomicBool::new(true),
         })
+    }
+
+    /// See `moe_grouped` (conformance and timing tests).
+    #[cfg(test)]
+    pub(crate) fn set_moe_grouped(&self, grouped: bool) {
+        self.moe_grouped
+            .store(grouped, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// See `tq_latent_on_codes` (conformance and timing tests).
@@ -3321,6 +3349,28 @@ impl CudaKernels {
             }
         };
         let gelu = i32::from(options.gelu_tanh);
+        let normalize = i32::from(routing.normalize);
+        let route = [tokens, experts, top_k, expert_first, local_experts];
+
+        if tokens > MOE_PERSISTENT_TOKENS
+            && self.moe_grouped.load(std::sync::atomic::Ordering::Relaxed)
+            && let (Some(gate_q8), Some(up_q8), Some(down_q8)) = (
+                packed_moe_q8(gate, hidden),
+                packed_moe_q8(up, hidden),
+                packed_moe_q8(down, inter),
+            )
+        {
+            return self.moe_q8_grouped(
+                h,
+                logits,
+                [gate_q8, up_q8, down_q8],
+                route,
+                [hidden, inter],
+                normalize,
+                per_expert_scale,
+                gelu,
+            );
+        }
 
         let mut scratch_slot = self.moe_scratch.lock().unwrap();
         let mut temporary = None;
@@ -3352,34 +3402,15 @@ impl CudaKernels {
             })
         };
 
-        let normalize = i32::from(routing.normalize);
-        let func = self.function("moe_route_kernel")?;
-        let mut args = self.stream.launch_builder(&func);
-        args.arg(&logits.slice)
-            .arg(&mut scratch.indices)
-            .arg(&mut scratch.weights)
-            .arg(&tokens)
-            .arg(&experts)
-            .arg(&top_k)
-            .arg(&normalize)
-            .arg(&expert_first)
-            .arg(&local_experts)
-            .arg(&per_expert_scale);
-        // One warp per token, four tokens per block.
-        let route_config = LaunchConfig {
-            grid_dim: (tokens.div_ceil(4) as u32, 1, 1),
-            block_dim: (128, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe { args.launch(route_config) }?;
-
-        fn packed(buffer: &CudaDeviceBuffer, stored_cols: u64) -> Option<&CudaQ8Weight> {
-            buffer.q8.as_ref().filter(|q8| {
-                q8.format == PackedWeightFormat::Q8_0
-                    && q8.transposed
-                    && q8.stored_cols == stored_cols
-            })
-        }
+        self.moe_route(
+            logits,
+            &mut scratch.indices,
+            &mut scratch.weights,
+            route,
+            normalize,
+            per_expert_scale,
+        )?;
+        let packed = packed_moe_q8;
         let warps_grid = |cols: u64, rows: u64| LaunchConfig {
             grid_dim: (
                 cols.div_ceil(u64::from(Q8_MATMUL_WARPS)) as u32,
@@ -3457,6 +3488,181 @@ impl CudaKernels {
         }
         drop(temporary);
         drop(scratch_slot);
+        Ok(CudaDeviceBuffer {
+            slice: out_dev,
+            shape: vec![tokens, hidden],
+            bf16: None,
+            q8: None,
+            tq: None,
+        })
+    }
+
+    /// `moe_route_kernel`: each token's chosen local experts and weights
+    /// (`route` = tokens, experts, top_k, first local expert, local
+    /// experts).
+    fn moe_route(
+        &self,
+        logits: &CudaDeviceBuffer,
+        indices: &mut CudaSlice<i32>,
+        weights: &mut CudaSlice<f32>,
+        [tokens, experts, top_k, expert_first, local_experts]: [u64; 5],
+        normalize: i32,
+        per_expert_scale: u64,
+    ) -> Result<(), CudaError> {
+        let func = self.function("moe_route_kernel")?;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(&logits.slice)
+            .arg(indices)
+            .arg(weights)
+            .arg(&tokens)
+            .arg(&experts)
+            .arg(&top_k)
+            .arg(&normalize)
+            .arg(&expert_first)
+            .arg(&local_experts)
+            .arg(&per_expert_scale);
+        // One warp per token, four tokens per block.
+        let route_config = LaunchConfig {
+            grid_dim: (tokens.div_ceil(4) as u32, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { args.launch(route_config) }?;
+        Ok(())
+    }
+
+    /// A `moe-experts` prefill over packed `Q8_0` experts, its pairs grouped
+    /// by expert: each block of `moe_q8_gated_grouped_kernel` and
+    /// `moe_q8_down_grouped_kernel` reads one expert's weights once for up
+    /// to [`MOE_GROUP_ROWS`] of its pairs. Tokens are served
+    /// [`MOE_GROUP_CHUNK_TOKENS`] at a time. Every value is the per-pair
+    /// Kernels' own (same lanes, order and reductions).
+    #[allow(clippy::too_many_arguments)]
+    fn moe_q8_grouped(
+        &self,
+        h: &CudaDeviceBuffer,
+        logits: &CudaDeviceBuffer,
+        [gate, up, down]: [&CudaQ8Weight; 3],
+        route: [u64; 5],
+        [hidden, inter]: [u64; 2],
+        normalize: i32,
+        per_expert_scale: u64,
+        gelu: i32,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        self.forbid_in_capture("a moe-experts prefill scratch")?;
+        let [tokens, _, top_k, _, local_experts] = route;
+        let pairs = tokens * top_k;
+        let mut indices = self.stream.alloc_zeros::<i32>(pairs as usize)?;
+        let mut weights = self.stream.alloc_zeros::<f32>(pairs as usize)?;
+        self.moe_route(
+            logits,
+            &mut indices,
+            &mut weights,
+            route,
+            normalize,
+            per_expert_scale,
+        )?;
+        let chunk_tokens = MOE_GROUP_CHUNK_TOKENS.min(tokens);
+        let chunk_pairs = chunk_tokens * top_k;
+        let slots = (local_experts + 1) as usize;
+        let mut counts = self.stream.alloc_zeros::<u32>(slots)?;
+        let mut offsets = self.stream.alloc_zeros::<u32>(slots)?;
+        let mut tiles = self.stream.alloc_zeros::<u32>(slots)?;
+        let mut cursor = self.stream.alloc_zeros::<u32>(slots)?;
+        let mut order = self.stream.alloc_zeros::<u32>(chunk_pairs as usize)?;
+        let mut act = self
+            .stream
+            .alloc_zeros::<f32>((chunk_pairs * inter) as usize)?;
+        let mut partial = self
+            .stream
+            .alloc_zeros::<f32>((chunk_pairs * hidden) as usize)?;
+        let mut out_dev = self.alloc_output((tokens * hidden) as usize)?;
+        let per_pair = |count: u64| LaunchConfig::for_num_elems(count as u32);
+        // Every expert of the chunk may leave a partial tile.
+        let tiles_bound = |pairs: u64| pairs.div_ceil(MOE_GROUP_ROWS) + local_experts;
+        let warps_grid = |cols: u64, blocks: u64| LaunchConfig {
+            grid_dim: (
+                cols.div_ceil(u64::from(Q8_MATMUL_WARPS)) as u32,
+                blocks as u32,
+                1,
+            ),
+            block_dim: (32, Q8_MATMUL_WARPS, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut token_first = 0;
+        while token_first < tokens {
+            let chunk = chunk_tokens.min(tokens - token_first);
+            let (pair_first, chunk_pairs) = (token_first * top_k, chunk * top_k);
+            self.stream.memset_zeros(&mut counts)?;
+            let func = self.function("moe_group_count_kernel")?;
+            let mut args = self.stream.launch_builder(&func);
+            args.arg(&indices)
+                .arg(&mut counts)
+                .arg(&pair_first)
+                .arg(&chunk_pairs);
+            unsafe { args.launch(per_pair(chunk_pairs)) }?;
+            let func = self.function("moe_group_offsets_kernel")?;
+            let mut args = self.stream.launch_builder(&func);
+            args.arg(&counts)
+                .arg(&mut offsets)
+                .arg(&mut tiles)
+                .arg(&mut cursor)
+                .arg(&local_experts);
+            unsafe { args.launch(LaunchConfig::for_num_elems(1)) }?;
+            let func = self.function("moe_group_scatter_kernel")?;
+            let mut args = self.stream.launch_builder(&func);
+            args.arg(&indices)
+                .arg(&mut cursor)
+                .arg(&mut order)
+                .arg(&pair_first)
+                .arg(&chunk_pairs);
+            unsafe { args.launch(per_pair(chunk_pairs)) }?;
+
+            let func = self.function("moe_q8_gated_grouped_kernel")?;
+            let mut args = self.stream.launch_builder(&func);
+            args.arg(&h.slice)
+                .arg(&order)
+                .arg(&offsets)
+                .arg(&tiles)
+                .arg(&local_experts)
+                .arg(&gate.quants)
+                .arg(&gate.scales)
+                .arg(&up.quants)
+                .arg(&up.scales)
+                .arg(&mut act)
+                .arg(&pair_first)
+                .arg(&top_k)
+                .arg(&hidden)
+                .arg(&inter)
+                .arg(&gelu);
+            unsafe { args.launch(warps_grid(inter, tiles_bound(chunk_pairs))) }?;
+            let func = self.function("moe_q8_down_grouped_kernel")?;
+            let mut args = self.stream.launch_builder(&func);
+            args.arg(&act)
+                .arg(&order)
+                .arg(&offsets)
+                .arg(&tiles)
+                .arg(&local_experts)
+                .arg(&down.quants)
+                .arg(&down.scales)
+                .arg(&mut partial)
+                .arg(&pair_first)
+                .arg(&hidden)
+                .arg(&inter);
+            unsafe { args.launch(warps_grid(hidden, tiles_bound(chunk_pairs))) }?;
+            let func = self.function("moe_down_combine_kernel")?;
+            let mut args = self.stream.launch_builder(&func);
+            args.arg(&partial)
+                .arg(&indices)
+                .arg(&weights)
+                .arg(&mut out_dev)
+                .arg(&token_first)
+                .arg(&chunk)
+                .arg(&top_k)
+                .arg(&hidden);
+            unsafe { args.launch(per_pair(chunk * hidden)) }?;
+            token_first += chunk;
+        }
         Ok(CudaDeviceBuffer {
             slice: out_dev,
             shape: vec![tokens, hidden],

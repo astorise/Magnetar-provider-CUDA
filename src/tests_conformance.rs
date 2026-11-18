@@ -4266,6 +4266,154 @@ fn moe_experts_match_reference_cpu_for_f32_and_packed_experts() {
     assert_eq!(download(&kernels, &captured).data, eager.data);
 }
 
+/// A `moe-experts` prefill over packed `Q8_0` experts, its pairs grouped by
+/// expert (`moe_q8_gated_grouped_kernel`), gives the per-pair Kernels' own
+/// values: for prompts served in one and in several token chunks, a share
+/// of the experts (pairs held elsewhere skipped), SiLU and GELU gates with
+/// a per-expert scale; and matches the Reference CPU.
+#[test]
+fn grouped_moe_prefill_matches_the_per_pair_kernels() {
+    use crate::kernels::CudaMoeOptions;
+    use magnetar_provider_api::{MoeRouting, moe_experts};
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let (hidden, inter, experts, top_k) = (64_u64, 32_u64, 16_u64, 4_u64);
+    for (tokens, held) in [(65_u64, (0, experts)), (300, (5, 6)), (2500, (0, experts))] {
+        let count = held.1;
+        let gate = packed_q8(count * inter, hidden, true, 71);
+        let up = packed_q8(count * inter, hidden, true, 72);
+        let down = packed_q8(count * hidden, inter, true, 73);
+        let packed = [&gate, &up, &down].map(|w| kernels.upload_packed_weight(w).unwrap());
+        let h = activations(tokens, hidden, 74);
+        let logits = activations(tokens, experts, 75);
+        let (dh, dlogits) = (upload(&kernels, &h), upload(&kernels, &logits));
+        let scale = upload(
+            &kernels,
+            &HostTensor::new(
+                [experts],
+                (0..experts)
+                    .map(|e| 0.5 + e as f32 / 16.0)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        );
+        for (normalize, gelu_tanh) in [(true, false), (false, true)] {
+            let routing = MoeRouting {
+                experts,
+                top_k,
+                normalize,
+            };
+            let options = CudaMoeOptions {
+                gelu_tanh,
+                per_expert_scale: gelu_tanh.then_some(&scale),
+            };
+            let run = |grouped: bool| {
+                kernels.set_moe_grouped(grouped);
+                let out = kernels
+                    .moe_experts_with(
+                        &dh,
+                        &dlogits,
+                        [&packed[0], &packed[1], &packed[2]],
+                        routing,
+                        held,
+                        options,
+                    )
+                    .unwrap();
+                download(&kernels, &out)
+            };
+            let per_pair = run(false);
+            let grouped = run(true);
+            assert_eq!(grouped.shape, per_pair.shape);
+            for (index, (g, p)) in grouped.data.iter().zip(&per_pair.data).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    p.to_bits(),
+                    "{tokens} tokens, experts {held:?}, normalize {normalize}, gelu \
+                     {gelu_tanh}, element {index}: grouped {g} per-pair {p}"
+                );
+            }
+            if held == (0, experts) && !gelu_tanh {
+                let expected = moe_experts(
+                    &h,
+                    &logits,
+                    [&gate.dequantize(), &up.dequantize(), &down.dequantize()],
+                    routing,
+                )
+                .unwrap();
+                assert_close_relative(&grouped, &expected);
+            }
+        }
+    }
+    kernels.set_moe_grouped(true);
+}
+
+/// The Device time of one `moe-experts` prefill at DeepSeek-V2-Lite's
+/// routed experts (2048 hidden, 1408 intermediate, 64 experts, top 6),
+/// packed `Q8_0`, over 1,024 and 4,096 tokens: the pairs grouped by expert
+/// against one pair at a time; diagnostic only.
+#[test]
+#[ignore = "GPU timing diagnostic"]
+fn moe_prefill_kernel_times() {
+    use magnetar_provider_api::MoeRouting;
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let context = kernels.stream().context().clone();
+    let timing = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
+    let time = |run: &dyn Fn(), repeats: u32| -> f32 {
+        run();
+        let start = context.new_event(timing).unwrap();
+        let end = context.new_event(timing).unwrap();
+        start.record(kernels.stream()).unwrap();
+        for _ in 0..repeats {
+            run();
+        }
+        end.record(kernels.stream()).unwrap();
+        start.elapsed_ms(&end).unwrap() / repeats as f32
+    };
+    let (hidden, inter, experts, top_k) = (2048_u64, 1408_u64, 64_u64, 6_u64);
+    let routing = MoeRouting {
+        experts,
+        top_k,
+        normalize: false,
+    };
+    let gate = kernels
+        .upload_packed_weight(&packed_q8(experts * inter, hidden, true, 76))
+        .unwrap();
+    let up = kernels
+        .upload_packed_weight(&packed_q8(experts * inter, hidden, true, 77))
+        .unwrap();
+    let down = kernels
+        .upload_packed_weight(&packed_q8(experts * hidden, inter, true, 78))
+        .unwrap();
+    for tokens in [1024_u64, 4096] {
+        let h = upload(&kernels, &activations(tokens, hidden, 79));
+        let logits = upload(&kernels, &activations(tokens, experts, 80));
+        for grouped in [false, true] {
+            kernels.set_moe_grouped(grouped);
+            let ms = time(
+                &|| {
+                    kernels
+                        .moe_experts(&h, &logits, [&gate, &up, &down], routing, (0, experts))
+                        .unwrap();
+                },
+                3,
+            );
+            eprintln!(
+                "moe-experts prefill, {tokens} tokens, {}: {:.2} ms",
+                if grouped {
+                    "pairs grouped by expert"
+                } else {
+                    "one pair at a time"
+                },
+                ms
+            );
+        }
+    }
+    kernels.set_moe_grouped(true);
+}
+
 /// Tensor parallelism splits a `moe-experts` layer's experts whole across
 /// GPUs: each share, f32 or packed `Q8_0`, matches the Reference CPU's
 /// share (routing over every expert, summing only those held), and the

@@ -643,6 +643,266 @@ extern "C" __global__ void moe_q8_down_kernel(
     }
 }
 
+// The grouped form of the two kernels above, for several tokens (a
+// prefill): the chosen pairs `[pair_first, pair_first + pairs)` are grouped
+// by expert (`order`: each expert's pairs in a run, `offsets[e]` its first
+// slot, `tiles[e]` its first tile of MOE_GROUP_ROWS pairs, `tiles[experts]`
+// their count), and a block serves one tile: it reads its expert's weights
+// once for every pair of the tile instead of once per pair. Each pair's
+// value takes the same lane partition, order and reduction as in the
+// per-pair kernels, so the results are theirs; the order of the pairs
+// within an expert's run does not matter.
+#define MOE_GROUP_ROWS 8
+
+// counts[e] = the pairs choosing local expert e (zeroed beforehand).
+extern "C" __global__ void moe_group_count_kernel(
+    const int* indices,
+    unsigned int* counts,
+    unsigned long long pair_first,
+    unsigned long long pairs
+) {
+    unsigned long long p = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= pairs) {
+        return;
+    }
+    int e = indices[pair_first + p];
+    if (e >= 0) {
+        atomicAdd(&counts[e], 1u);
+    }
+}
+
+// One thread: each expert's first slot and first tile (and a cursor at its
+// first slot), then the slots' and tiles' totals at index `experts`.
+extern "C" __global__ void moe_group_offsets_kernel(
+    const unsigned int* counts,
+    unsigned int* offsets,
+    unsigned int* tiles,
+    unsigned int* cursor,
+    unsigned long long experts
+) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) {
+        return;
+    }
+    unsigned int offset = 0;
+    unsigned int tile = 0;
+    for (unsigned long long e = 0; e < experts; e++) {
+        offsets[e] = offset;
+        cursor[e] = offset;
+        tiles[e] = tile;
+        offset += counts[e];
+        tile += (counts[e] + MOE_GROUP_ROWS - 1) / MOE_GROUP_ROWS;
+    }
+    offsets[experts] = offset;
+    tiles[experts] = tile;
+}
+
+// order[slot] = a pair's index (among every token's pairs), each pair in
+// its expert's run.
+extern "C" __global__ void moe_group_scatter_kernel(
+    const int* indices,
+    unsigned int* cursor,
+    unsigned int* order,
+    unsigned long long pair_first,
+    unsigned long long pairs
+) {
+    unsigned long long p = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= pairs) {
+        return;
+    }
+    int e = indices[pair_first + p];
+    if (e >= 0) {
+        unsigned int slot = atomicAdd(&cursor[e], 1u);
+        order[slot] = (unsigned int)(pair_first + p);
+    }
+}
+
+// Tile `tile`'s expert, first slot and pair count; false past the last
+// tile. The expert is the last whose first tile is at most `tile` (it has
+// pairs: the next expert's first tile is past `tile`).
+__device__ __forceinline__ bool moe_group_tile(
+    const unsigned int* offsets,
+    const unsigned int* tiles,
+    unsigned long long experts,
+    unsigned int tile,
+    unsigned int* expert,
+    unsigned int* first,
+    unsigned int* rows
+) {
+    if (tile >= tiles[experts]) {
+        return false;
+    }
+    unsigned int low = 0;
+    unsigned int high = (unsigned int)experts;
+    while (high - low > 1) {
+        unsigned int middle = (low + high) / 2;
+        if (tiles[middle] <= tile) {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    *expert = low;
+    *first = offsets[low] + (tile - tiles[low]) * MOE_GROUP_ROWS;
+    unsigned int end = offsets[low + 1];
+    *rows = end - *first < MOE_GROUP_ROWS ? end - *first : MOE_GROUP_ROWS;
+    return true;
+}
+
+// `moe_q8_gated_kernel` over a tile: act[(tk - pair_first) * inter + j].
+extern "C" __global__ void moe_q8_gated_grouped_kernel(
+    const float* h,
+    const unsigned int* order,
+    const unsigned int* offsets,
+    const unsigned int* tiles,
+    unsigned long long experts,
+    const signed char* gate_quants,
+    const float* gate_scales,
+    const signed char* up_quants,
+    const float* up_scales,
+    float* act,
+    unsigned long long pair_first,
+    unsigned long long top_k,
+    unsigned long long hidden,
+    unsigned long long inter,
+    int gelu
+) {
+    unsigned long long j = (unsigned long long)blockIdx.x * Q8_MATMUL_WARPS + threadIdx.y;
+    unsigned int expert, first, rows;
+    if (j >= inter || !moe_group_tile(offsets, tiles, experts, blockIdx.y, &expert, &first, &rows)) {
+        return;
+    }
+    unsigned long long row = (unsigned long long)expert * inter + j;
+    const signed char* wg = gate_quants + row * hidden;
+    const signed char* wu = up_quants + row * hidden;
+    const float* sg = gate_scales + row * (hidden >> 5);
+    const float* su = up_scales + row * (hidden >> 5);
+    unsigned long long tk[MOE_GROUP_ROWS];
+    const float* x[MOE_GROUP_ROWS];
+    float g[MOE_GROUP_ROWS];
+    float u[MOE_GROUP_ROWS];
+#pragma unroll
+    for (int r = 0; r < MOE_GROUP_ROWS; r++) {
+        tk[r] = order[first + (r < rows ? r : 0)];
+        x[r] = h + (tk[r] / top_k) * hidden;
+        g[r] = 0.0f;
+        u[r] = 0.0f;
+    }
+    for (unsigned long long i = (unsigned long long)threadIdx.x * Q8_LANE_QUANTS; i < hidden;
+         i += Q8_WARP_QUANTS) {
+        int4 qg = *reinterpret_cast<const int4*>(wg + i);
+        int4 qu = *reinterpret_cast<const int4*>(wu + i);
+        float gate_scale = sg[i >> 5];
+        float up_scale = su[i >> 5];
+#pragma unroll
+        for (int r = 0; r < MOE_GROUP_ROWS; r++) {
+            if (r < rows) {
+                g[r] += gate_scale * q8_dot16(qg, x[r] + i);
+                u[r] += up_scale * q8_dot16(qu, x[r] + i);
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < MOE_GROUP_ROWS; r++) {
+        float gr = g[r];
+        float ur = u[r];
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            gr += __shfl_xor_sync(0xffffffffu, gr, offset);
+            ur += __shfl_xor_sync(0xffffffffu, ur, offset);
+        }
+        if (threadIdx.x == 0 && r < rows) {
+            act[(tk[r] - pair_first) * inter + j] =
+                (gelu ? gelu_tanh(gr) : gr * (1.0f / (1.0f + expf(-gr)))) * ur;
+        }
+    }
+}
+
+// `moe_q8_down_kernel`'s per-pair sums over a tile, before their weighted
+// total: partial[(tk - pair_first) * hidden + c] = act[tk] . down_e[:, c].
+extern "C" __global__ void moe_q8_down_grouped_kernel(
+    const float* act,
+    const unsigned int* order,
+    const unsigned int* offsets,
+    const unsigned int* tiles,
+    unsigned long long experts,
+    const signed char* down_quants,
+    const float* down_scales,
+    float* partial,
+    unsigned long long pair_first,
+    unsigned long long hidden,
+    unsigned long long inter
+) {
+    unsigned long long c = (unsigned long long)blockIdx.x * Q8_MATMUL_WARPS + threadIdx.y;
+    unsigned int expert, first, rows;
+    if (c >= hidden || !moe_group_tile(offsets, tiles, experts, blockIdx.y, &expert, &first, &rows)) {
+        return;
+    }
+    unsigned long long row = (unsigned long long)expert * hidden + c;
+    const signed char* w = down_quants + row * inter;
+    const float* scales = down_scales + row * (inter >> 5);
+    unsigned long long tk[MOE_GROUP_ROWS];
+    const float* a[MOE_GROUP_ROWS];
+    float sum[MOE_GROUP_ROWS];
+#pragma unroll
+    for (int r = 0; r < MOE_GROUP_ROWS; r++) {
+        tk[r] = order[first + (r < rows ? r : 0)];
+        a[r] = act + (tk[r] - pair_first) * inter;
+        sum[r] = 0.0f;
+    }
+    for (unsigned long long i = (unsigned long long)threadIdx.x * Q8_LANE_QUANTS; i < inter;
+         i += Q8_WARP_QUANTS) {
+        int4 q = *reinterpret_cast<const int4*>(w + i);
+        float scale = scales[i >> 5];
+#pragma unroll
+        for (int r = 0; r < MOE_GROUP_ROWS; r++) {
+            if (r < rows) {
+                sum[r] += scale * q8_dot16(q, a[r] + i);
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < MOE_GROUP_ROWS; r++) {
+        float value = sum[r];
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            value += __shfl_xor_sync(0xffffffffu, value, offset);
+        }
+        if (threadIdx.x == 0 && r < rows) {
+            partial[(tk[r] - pair_first) * hidden + c] = value;
+        }
+    }
+}
+
+// out[t, c] for the tokens `[token_first, token_first + tokens)`: the
+// chosen experts' partial sums weighted and added in routing order, as
+// `moe_q8_down_kernel` adds them.
+extern "C" __global__ void moe_down_combine_kernel(
+    const float* partial,
+    const int* indices,
+    const float* weights,
+    float* out,
+    unsigned long long token_first,
+    unsigned long long tokens,
+    unsigned long long top_k,
+    unsigned long long hidden
+) {
+    unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= tokens * hidden) {
+        return;
+    }
+    unsigned long long local = index / hidden;
+    unsigned long long c = index % hidden;
+    unsigned long long t = token_first + local;
+    float total = 0.0f;
+    for (unsigned long long k = 0; k < top_k; k++) {
+        unsigned long long tk = t * top_k + k;
+        if (indices[tk] >= 0) {
+            total += weights[tk] * partial[(local * top_k + k) * hidden + c];
+        }
+    }
+    out[t * hidden + c] = total;
+}
+
 // The f32 forms of the two kernels above, for experts stored as plain f32
 // logical matrices: `gate`/`up` `[hidden, experts * inter]` and `down`
 // `[inter, experts * hidden]`, row-major. One thread per output element.
