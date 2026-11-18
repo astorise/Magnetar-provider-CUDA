@@ -3701,6 +3701,122 @@ impl CudaKernels {
         })
     }
 
+    /// `attention` over latent K and V (`latent_kv_width`,
+    /// `chunk-latent-prefills`): the first `key_count` rows (every row
+    /// without it) of `k` and `v`, latent rows `[c | k_rope]` (a TurboQuant
+    /// store's values when it is one), give each of `head_count` heads the
+    /// key `[c W_k_h | k_rope]` and the value `c W_v_h`, through this
+    /// Provider's matmul and head concatenation; then the expanded attention
+    /// over them ([`Self::attention_valued`]), the queries the last rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_latent_kv(
+        &self,
+        [q, k, v]: [&CudaDeviceBuffer; 3],
+        [w_k, w_v]: [&CudaDeviceBuffer; 2],
+        latent_width: u64,
+        [head_count, head_dimension]: [u64; 2],
+        value_dimension: Option<u64>,
+        kv_head_count: Option<u64>,
+        window_size: Option<u64>,
+        causal: bool,
+        key_count: Option<u64>,
+        scale: Option<f32>,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        self.forbid_in_capture("expanding latent keys and values")?;
+        let keys = self.latent_split(k, key_count, latent_width)?;
+        let values = if std::ptr::eq(k, v) {
+            None
+        } else {
+            Some(self.latent_split(v, key_count, latent_width)?)
+        };
+        let nope = self.matmul(&keys.0, w_k, false, false)?;
+        let expanded_keys = self.concat_heads(&nope, &keys.1, head_count, 1)?;
+        drop(nope);
+        let expanded_values = match &values {
+            None => self.matmul(&keys.0, w_v, false, false)?,
+            Some((latent, _)) => self.matmul(latent, w_v, false, false)?,
+        };
+        drop((keys, values));
+        self.attention_valued(
+            q,
+            &expanded_keys,
+            &expanded_values,
+            head_count,
+            head_dimension,
+            value_dimension,
+            kv_head_count,
+            window_size,
+            causal,
+            None,
+            scale,
+        )
+    }
+
+    /// The first `key_count` rows (every row without it) of the latent rows
+    /// `store` (`[rows, width]`, f32 or a TurboQuant store) as their leading
+    /// `latent_width` values and the rest (`latent_split_kernel`).
+    fn latent_split(
+        &self,
+        store: &CudaDeviceBuffer,
+        key_count: Option<u64>,
+        latent_width: u64,
+    ) -> Result<(CudaDeviceBuffer, CudaDeviceBuffer), CudaError> {
+        let (capacity, width) = rows_cols_buf(store)?;
+        let rows = key_count.unwrap_or(capacity);
+        if rows > capacity || latent_width == 0 || latent_width >= width {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!(
+                    "{rows} latent rows of {latent_width} latent values cannot come from {:?}",
+                    store.shape
+                ),
+            ));
+        }
+        let expanded;
+        let latent = if store.is_tq() {
+            expanded = {
+                let mut out = self
+                    .stream
+                    .alloc_zeros::<f32>((capacity * width).max(1) as usize)?;
+                self.tq_dequantize_into(store, &mut out, rows, 0)?;
+                out
+            };
+            &expanded
+        } else {
+            Self::require_f32(&[store], "attention's latent K and V")?;
+            &store.slice
+        };
+        let rope_width = width - latent_width;
+        // SAFETY: `latent_split_kernel` writes every element of both.
+        let mut c = unsafe {
+            self.stream
+                .alloc::<f32>((rows * latent_width).max(1) as usize)
+        }?;
+        let mut rope = unsafe {
+            self.stream
+                .alloc::<f32>((rows * rope_width).max(1) as usize)
+        }?;
+        if rows > 0 {
+            let func = self.function("latent_split_kernel")?;
+            let mut args = self.stream.launch_builder(&func);
+            args.arg(latent)
+                .arg(&mut c)
+                .arg(&mut rope)
+                .arg(&rows)
+                .arg(&width)
+                .arg(&latent_width);
+            unsafe { args.launch(LaunchConfig::for_num_elems((rows * width) as u32)) }?;
+        }
+        let buffer = |slice, cols| CudaDeviceBuffer {
+            slice,
+            shape: vec![rows, cols],
+            bf16: None,
+            q8: None,
+            tq: None,
+        };
+        Ok((buffer(c, latent_width), buffer(rope, rope_width)))
+    }
+
     /// `buffer` as plain f32: itself, or its expansion for this call,
     /// kept in `expanded`.
     fn as_f32<'b>(

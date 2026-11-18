@@ -5220,6 +5220,107 @@ fn yarn_rope_matches_reference_cpu() {
     );
 }
 
+/// Attention over latent K and V (`latent_kv_width`,
+/// `chunk-latent-prefills`): the key rows a pass reads (`key_count`, the
+/// queries the last of them) expanded per head by packed projections, from
+/// an f32 history and from `tq4` histories with and without an exact head,
+/// against the Reference CPU's expansion and attention.
+#[test]
+fn attention_over_latent_keys_and_values_matches_the_cpu() {
+    use magnetar_provider_api::operator_semantics::{latent_keys, latent_values};
+    use magnetar_provider_api::{KvStorePrecision, TurboQuantStoreState};
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    // Four heads of 16 + 8 key values and 16 values, 32 latent values.
+    let (heads, nope, rope, latent, value) = (4u64, 16u64, 8u64, 32u64, 16u64);
+    let (width, head_dimension) = (latent + rope, nope + rope);
+    let w_k = packed_q8(heads * nope, latent, true, 86);
+    let w_v = packed_q8(heads * value, latent, true, 87);
+    let (dw_k, dw_v) = (
+        kernels.upload_packed_weight(&w_k).unwrap(),
+        kernels.upload_packed_weight(&w_v).unwrap(),
+    );
+    let (w_k, w_v) = (w_k.dequantize(), w_v.dequantize());
+    for (queries, keys, exact, precision) in [
+        (70_u64, 260_u64, 0_u64, None),
+        (40, 40, 0, None),
+        (70, 260, 0, Some(KvStorePrecision::Tq4)),
+        (70, 260, 100, Some(KvStorePrecision::Tq4)),
+    ] {
+        let label = format!("{queries} queries over {keys} keys, {precision:?}, head {exact}");
+        let capacity = keys + 9;
+        let data = hashed_values((keys * width) as usize, 31 + keys as usize);
+        let (store, rows) = match precision {
+            None => {
+                let mut padded = data.clone();
+                padded.resize((capacity * width) as usize, 0.5);
+                (
+                    upload(
+                        &kernels,
+                        &HostTensor::new([capacity, width], padded).unwrap(),
+                    ),
+                    HostTensor::new([keys, width], data.clone()).unwrap(),
+                )
+            }
+            Some(precision) => {
+                let mut store = kernels
+                    .tq_zeros_with_exact_head(&[capacity, width], precision, 8, exact)
+                    .unwrap();
+                kernels
+                    .kv_write(
+                        &mut store,
+                        &upload(
+                            &kernels,
+                            &HostTensor::new([keys, width], data.clone()).unwrap(),
+                        ),
+                        0,
+                    )
+                    .unwrap();
+                let mut cpu = TurboQuantStoreState::new(precision, 8, width).with_exact_rows(exact);
+                let values = cpu.write(&data, 0).unwrap();
+                (store, HostTensor::new([keys, width], values).unwrap())
+            }
+        };
+        let q = activations(queries, heads * head_dimension, 88);
+        let expected = magnetar_provider_cpu::attention_with_value_width(
+            &q,
+            &latent_keys(&rows, &w_k, latent, heads).unwrap(),
+            &latent_values(&rows, &w_v, latent).unwrap(),
+            heads,
+            head_dimension,
+            value,
+            Some(heads),
+            None,
+            true,
+            Some(0.2),
+        )
+        .unwrap();
+        let actual = kernels
+            .attention_latent_kv(
+                [&upload(&kernels, &q), &store, &store],
+                [&dw_k, &dw_v],
+                latent,
+                [heads, head_dimension],
+                Some(value),
+                Some(heads),
+                None,
+                true,
+                Some(keys),
+                Some(0.2),
+            )
+            .unwrap();
+        let actual = download(&kernels, &actual);
+        assert_eq!(actual.shape, expected.shape, "{label}");
+        for (index, (a, e)) in actual.data.iter().zip(&expected.data).enumerate() {
+            assert!(
+                (a - e).abs() <= 2e-3,
+                "{label}, element {index}: cuda={a} reference={e}"
+            );
+        }
+    }
+}
+
 /// Attention with V rows narrower than Q and K (`value_head_dimension`,
 /// `express-latent-attention-forms`) in the Kernels that serve it: split-key
 /// decode (one chunk and several), the tiled prefill Kernel (192-dimension

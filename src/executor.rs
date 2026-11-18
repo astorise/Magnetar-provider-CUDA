@@ -1323,7 +1323,9 @@ impl CudaExecutor {
             // writes its store's codes and attention reads K and V codes
             // or dequantizes them for the call; neither is expanded for good.
             "kv-write" => index == 0,
-            "attention" => index == 1 || index == 2,
+            // Latent K and V's projections (`chunk-latent-prefills`) go
+            // through the matmul, which reads them compact.
+            "attention" => (1..=4).contains(&index),
             _ => false,
         };
         let mut storage = self.storage.lock().unwrap();
@@ -1718,8 +1720,35 @@ impl CudaExecutor {
                             });
                         }
                     };
-                    match value_stride {
-                        Some(stride) => self.kernels.attention_strided_values(
+                    // `chunk-latent-prefills`: latent K and V, expanded by
+                    // the fourth and fifth inputs.
+                    let latent_width = match invocation.attributes.get("latent_kv_width") {
+                        None => None,
+                        Some(OperatorAttributeValue::Integer(width)) if *width > 0 => {
+                            Some(*width as u64)
+                        }
+                        Some(other) => {
+                            return Err(KernelError::KernelAttributeUnsupported {
+                                attribute: format!(
+                                    "latent_kv_width {other:?} must be a positive integer"
+                                ),
+                            });
+                        }
+                    };
+                    match (latent_width, value_stride) {
+                        (Some(latent_width), _) => self.kernels.attention_latent_kv(
+                            [q, k, v],
+                            [get(3)?, get(4)?],
+                            latent_width,
+                            [head_count, head_dimension],
+                            value_dimension,
+                            kv_head_count,
+                            window_size,
+                            causal,
+                            key_count,
+                            scale,
+                        ),
+                        (None, Some(stride)) => self.kernels.attention_strided_values(
                             q,
                             k,
                             v,
@@ -1733,7 +1762,7 @@ impl CudaExecutor {
                             key_count,
                             scale,
                         ),
-                        None => self.kernels.attention_valued(
+                        (None, None) => self.kernels.attention_valued(
                             q,
                             k,
                             v,

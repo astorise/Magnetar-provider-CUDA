@@ -7648,6 +7648,31 @@ extern "C" __global__ void tq_latent_rotate_back_kernel(
     }
 }
 
+// `attention`'s latent K and V (`chunk-latent-prefills`): the first `rows`
+// rows of `latent` (rows of `width` values) split into their leading
+// `latent_width` values `c` and the rest, the rope key every head shares.
+extern "C" __global__ void latent_split_kernel(
+    const float* latent,
+    float* c,
+    float* rope,
+    unsigned long long rows,
+    unsigned long long width,
+    unsigned long long latent_width
+) {
+    unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= rows * width) {
+        return;
+    }
+    unsigned long long row = index / width;
+    unsigned long long col = index % width;
+    float value = latent[index];
+    if (col < latent_width) {
+        c[row * latent_width + col] = value;
+    } else {
+        rope[row * (width - latent_width) + (col - latent_width)] = value;
+    }
+}
+
 // One query row against an f32 latent history read as both K and V
 // (`cache-latent-attention-history`): rows of `k_width` values, each query
 // head `k_width` wide, the values each row's leading `v_width`. Block
