@@ -49,6 +49,10 @@ const TCP_BLOCK_M: u64 = 128;
 const TCP_BLOCK_N: u64 = 64;
 const TCP_THREADS: u32 = 256;
 const TCP_ALIGN: u64 = 8;
+/// Dynamic shared memory of `matmul_tcp_split3_kernel`: two pipeline stages
+/// of three `a` tiles (`TCP_BLOCK_M` rows of 16 + 8 halves) and three `b`
+/// tiles (16 rows of `TCP_BLOCK_N` + 8 halves).
+const TCP3_SHARED_BYTES: u32 = 2 * (3 * 128 * 24 + 3 * 16 * 72) * 2;
 /// `TCA_QUERIES` in `tensor_kernels.cu`: queries per Tensor Core attention
 /// block.
 const TCA_QUERIES: u64 = 64;
@@ -557,6 +561,8 @@ type SplitTerms<'a> = (std::sync::MutexGuard<'a, SplitScratch>, u64, u64);
 
 /// A multi-input split's scratch lock and each input's (hi, lo) addresses.
 type SplitTermsAll<'a> = (std::sync::MutexGuard<'a, SplitScratch>, Vec<(u64, u64)>);
+/// [`SplitTermsAll`] with three terms per input (hi, mid, lo).
+type SplitTerms3All<'a> = (std::sync::MutexGuard<'a, SplitScratch>, Vec<[u64; 3]>);
 
 /// The current split-attention scratch buffer and the ones it outgrew.
 type AttentionScratch = (Option<CudaSlice<f32>>, Vec<CudaSlice<f32>>);
@@ -1351,6 +1357,52 @@ impl CudaKernels {
             };
             unsafe { args.launch(config) }?;
             terms.push((hi, lo));
+        }
+        Ok(Some((scratch, terms)))
+    }
+
+    /// Splits contiguous f32 inputs into three bfloat16 terms each
+    /// (`tc_split3_kernel`, hi + mid + lo), into the split scratch buffer:
+    /// each input's (hi, mid, lo) addresses, in order, with the scratch
+    /// lock. `None` without Tensor Cores.
+    fn split_bf16_3_all(
+        &self,
+        inputs: &[(&CudaDeviceBuffer, u64)],
+    ) -> Result<Option<SplitTerms3All<'_>>, CudaError> {
+        let Some(func) = self.tensor_function("tc_split3_kernel") else {
+            return Ok(None);
+        };
+        let values: u64 = inputs.iter().map(|(_, len)| len).sum();
+        let Ok(total) = usize::try_from(values * 3) else {
+            return Ok(None);
+        };
+        let mut scratch = self.split_scratch.lock().unwrap();
+        if scratch.0.as_ref().is_none_or(|slice| slice.len() < total) {
+            self.forbid_in_capture("growing the Tensor Core split buffer")?;
+            // SAFETY: `tc_split3_kernel` writes every term of every value
+            // before a Kernel on this same stream reads them.
+            let grown = unsafe { self.stream.alloc::<u16>(total.max(1 << 20)) }?;
+            if let Some(outgrown) = scratch.0.replace(grown) {
+                scratch.1.push(outgrown);
+            }
+        }
+        let buffer = scratch.0.as_mut().expect("allocated above");
+        let mut next = buffer.device_ptr(&self.stream).0;
+        let mut terms = Vec::with_capacity(inputs.len());
+        for &(input, len) in inputs {
+            let hi = next;
+            let mid = hi + len * 2;
+            let lo = mid + len * 2;
+            next = lo + len * 2;
+            let mut args = self.stream.launch_builder(&func);
+            args.arg(&input.slice).arg(&hi).arg(&mid).arg(&lo).arg(&len);
+            let config = LaunchConfig {
+                grid_dim: (len.div_ceil(256).clamp(1, 4096) as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe { args.launch(config) }?;
+            terms.push([hi, mid, lo]);
         }
         Ok(Some((scratch, terms)))
     }
@@ -4619,10 +4671,11 @@ impl CudaKernels {
 
     /// `a x b` (plus `addend`) on Tensor Cores for a contiguous f32 `b` that
     /// is not exactly bfloat16, a dequantized packed weight: `a` and `b`
-    /// are both split into their bfloat16 hi and lo terms and every product
-    /// but the two low terms' is accumulated in f32
-    /// (`matmul_tcp_split_kernel`). `None` without Tensor Cores or with
-    /// rows that do not align.
+    /// are both split into three bfloat16 terms (about 24 significant
+    /// bits) and every product of terms down to 2^-24 of the whole is
+    /// accumulated in f32 (`matmul_tcp_split3_kernel`), as precise as the
+    /// f32 Kernels. `None` without Tensor Cores or with rows that do not
+    /// align.
     fn matmul_split_tcp(
         &self,
         a: &CudaDeviceBuffer,
@@ -4633,13 +4686,22 @@ impl CudaKernels {
         if m == 0 || k % TCP_ALIGN != 0 || n % TCP_ALIGN != 0 {
             return Ok(None);
         }
-        let Some(func) = self.tensor_function("matmul_tcp_split_kernel") else {
+        let Some(func) = self.tensor_function("matmul_tcp_split3_kernel") else {
             return Ok(None);
         };
-        let Some((_split_lock, terms)) = self.split_bf16_all(&[(a, m * k), (b, k * n)])? else {
+        if func
+            .set_attribute(
+                cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                TCP3_SHARED_BYTES as i32,
+            )
+            .is_err()
+        {
+            return Ok(None);
+        }
+        let Some((_split_lock, terms)) = self.split_bf16_3_all(&[(a, m * k), (b, k * n)])? else {
             return Ok(None);
         };
-        let [(a_hi, a_lo), (b_hi, b_lo)] = [terms[0], terms[1]];
+        let [[a_hi, a_mid, a_lo], [b_hi, b_mid, b_lo]] = [terms[0], terms[1]];
         let (addend_buffer, addend_mode) = match addend {
             None => (a, 0i32),
             Some(MatmulAddend::Row(bias)) => (bias, 1),
@@ -4658,13 +4720,15 @@ impl CudaKernels {
                 1,
             ),
             block_dim: (TCP_THREADS, 1, 1),
-            shared_mem_bytes: 0,
+            shared_mem_bytes: TCP3_SHARED_BYTES,
         };
         let mut out_dev = self.alloc_output((m * n) as usize)?;
         let mut args = self.stream.launch_builder(&func);
         args.arg(&a_hi)
+            .arg(&a_mid)
             .arg(&a_lo)
             .arg(&b_hi)
+            .arg(&b_mid)
             .arg(&b_lo)
             .arg(&mut out_dev)
             .arg(&m)

@@ -2787,11 +2787,11 @@ fn q6k_packed_matmul_matches_reference_cpu() {
 
 /// Long prefills against packed weights: more rows than the packed row
 /// Kernels take, so the weight is dequantized for the call and, on a Device
-/// with Tensor Cores, multiplied with both operands split into their
-/// bfloat16 hi and lo terms (`matmul_tcp_split_kernel`); the f32 Kernels
-/// otherwise. With and without a bias or residual, against the Reference
-/// CPU on the dequantized weights, within 1e-5 of the largest output: a
-/// weight rounded to bfloat16 alone would be off by about 5e-4.
+/// with Tensor Cores, multiplied with both operands split into three
+/// bfloat16 terms (`matmul_tcp_split3_kernel`); the f32 Kernels otherwise.
+/// With and without a bias or residual, against the Reference CPU on the
+/// dequantized weights, within 1e-5 of the largest output: a weight rounded
+/// to bfloat16 alone would be off by about 5e-4.
 #[test]
 fn long_prefills_against_packed_weights_match_reference_cpu() {
     let Some(kernels) = kernels_or_skip() else {
