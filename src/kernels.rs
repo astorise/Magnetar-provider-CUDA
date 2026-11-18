@@ -637,6 +637,11 @@ struct MoeScratch {
 /// scratch, so they capture; longer ones (prefill) use temporaries.
 const MOE_PERSISTENT_TOKENS: u64 = 64;
 
+/// Rows of A one launch of `matmul_tcp_split3_kernel` serves: the split
+/// buffer holds their three bfloat16 terms, never every row's, and the
+/// gated form holds their products.
+const SPLIT_TCP_BLOCK_ROWS: u64 = 2048;
+
 /// `MOE_GROUP_ROWS` in `kernels.cu`: the pairs of one expert a block of the
 /// grouped `moe-experts` Kernels serves.
 const MOE_GROUP_ROWS: u64 = 8;
@@ -1527,18 +1532,18 @@ impl CudaKernels {
         Ok(Some((scratch, terms)))
     }
 
-    /// Splits contiguous f32 inputs into three bfloat16 terms each
-    /// (`tc_split3_kernel`, hi + mid + lo), into the split scratch buffer:
-    /// each input's (hi, mid, lo) addresses, in order, with the scratch
-    /// lock. `None` without Tensor Cores.
-    fn split_bf16_3_all(
+    /// Room in the split scratch buffer for three bfloat16 terms of each
+    /// of `regions` values (hi + mid + lo, `tc_split3_kernel`): each
+    /// region's (hi, mid, lo) addresses, in order, with the scratch lock.
+    /// `None` without Tensor Cores.
+    fn split_bf16_3_regions(
         &self,
-        inputs: &[(&CudaDeviceBuffer, u64)],
+        regions: &[u64],
     ) -> Result<Option<SplitTerms3All<'_>>, CudaError> {
-        let Some(func) = self.tensor_function("tc_split3_kernel") else {
+        if self.tensor_function("tc_split3_kernel").is_none() {
             return Ok(None);
-        };
-        let values: u64 = inputs.iter().map(|(_, len)| len).sum();
+        }
+        let values: u64 = regions.iter().sum();
         let Ok(total) = usize::try_from(values * 3) else {
             return Ok(None);
         };
@@ -1554,23 +1559,36 @@ impl CudaKernels {
         }
         let buffer = scratch.0.as_mut().expect("allocated above");
         let mut next = buffer.device_ptr(&self.stream).0;
-        let mut terms = Vec::with_capacity(inputs.len());
-        for &(input, len) in inputs {
+        let mut terms = Vec::with_capacity(regions.len());
+        for &len in regions {
             let hi = next;
             let mid = hi + len * 2;
             let lo = mid + len * 2;
             next = lo + len * 2;
-            let mut args = self.stream.launch_builder(&func);
-            args.arg(&input.slice).arg(&hi).arg(&mid).arg(&lo).arg(&len);
-            let config = LaunchConfig {
-                grid_dim: (len.div_ceil(256).clamp(1, 4096) as u32, 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            unsafe { args.launch(config) }?;
             terms.push([hi, mid, lo]);
         }
         Ok(Some((scratch, terms)))
+    }
+
+    /// `tc_split3_kernel`: the `len` f32 values at `input` into the three
+    /// bfloat16 terms at `terms` (a region of [`Self::split_bf16_3_regions`]).
+    fn split_bf16_3_into(&self, input: u64, len: u64, terms: [u64; 3]) -> Result<(), CudaError> {
+        let Some(func) = self.tensor_function("tc_split3_kernel") else {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                "tc_split3_kernel needs Tensor Cores",
+            ));
+        };
+        let [hi, mid, lo] = terms;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(&input).arg(&hi).arg(&mid).arg(&lo).arg(&len);
+        let config = LaunchConfig {
+            grid_dim: (len.div_ceil(256).clamp(1, 4096) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { args.launch(config) }?;
+        Ok(())
     }
 
     /// A Kernel's registers per thread, local memory per thread and static
@@ -4627,6 +4645,25 @@ impl CudaKernels {
                 tq: None,
             });
         }
+        // A long prefill against packed weights: both expanded to f32 for
+        // this call, the products held a block of rows at a time (what
+        // each projection's packed matmul and `silu_mul` give).
+        if gate.is_q8()
+            && up.is_q8()
+            && !transpose_a
+            && !transpose_b
+            && m > Q8_MATMUL_MAX_ROWS
+            && m >= MATMUL_TILE_MIN_ROWS
+            && k == b_rows
+        {
+            Self::require_f32(&[a], "gated-matmul's input")?;
+            let (dense_gate, dense_up) = (self.dequantize_q8(gate)?, self.dequantize_q8(up)?);
+            if let Some(out) =
+                self.gated_matmul_split_tcp(a, &dense_gate, &dense_up, [m, k, b_cols])?
+            {
+                return Ok(out);
+            }
+        }
         // Other packed weights: each projection through the packed matmul.
         if transpose_b || m > MATMUL_SPLIT_K_MAX_ROWS || k != b_rows || gate.is_q8() || up.is_q8() {
             let gate_out = self.matmul(a, gate, transpose_a, transpose_b)?;
@@ -5165,6 +5202,61 @@ impl CudaKernels {
         [m, k, n]: [u64; 3],
         addend: Option<MatmulAddend<'_>>,
     ) -> Result<Option<CudaDeviceBuffer>, CudaError> {
+        let Some((func, block_rows)) = self.split_tcp_function([m, k, n])? else {
+            return Ok(None);
+        };
+        // B's terms, then room for one block of A rows' terms.
+        let Some((_split_lock, terms)) = self.split_bf16_3_regions(&[k * n, block_rows * k])?
+        else {
+            return Ok(None);
+        };
+        let [b_terms, a_terms] = [terms[0], terms[1]];
+        self.split_bf16_3_into(b.slice.device_ptr(&self.stream).0, k * n, b_terms)?;
+        let out_dev = self.alloc_output((m * n) as usize)?;
+        let out = out_dev.device_ptr(&self.stream).0;
+        let (addend_address, addend_mode) = match addend {
+            None => (0u64, 0i32),
+            Some(MatmulAddend::Row(bias)) => (bias.slice.device_ptr(&self.stream).0, 1),
+            Some(MatmulAddend::Full(residual)) => (residual.slice.device_ptr(&self.stream).0, 2),
+        };
+        let a_address = a.slice.device_ptr(&self.stream).0;
+        let mut first = 0;
+        while first < m {
+            let rows = block_rows.min(m - first);
+            self.split_bf16_3_into(a_address + first * k * 4, rows * k, a_terms)?;
+            // A full addend's rows follow the block's; a bias is every row's.
+            let addend_rows = if addend_mode == 2 {
+                addend_address + first * n * 4
+            } else {
+                addend_address
+            };
+            self.launch_split_tcp(
+                &func,
+                a_terms,
+                b_terms,
+                out + first * n * 4,
+                [rows, k, n],
+                (addend_rows, addend_mode),
+            )?;
+            first += rows;
+        }
+        Ok(Some(CudaDeviceBuffer {
+            slice: out_dev,
+            shape: vec![m, n],
+            bf16: None,
+            q8: None,
+            tq: None,
+        }))
+    }
+
+    /// `matmul_tcp_split3_kernel`, ready to launch for an `[m, k] x [k, n]`
+    /// product, and the rows of A one launch serves
+    /// ([`SPLIT_TCP_BLOCK_ROWS`] at most); `None` without Tensor Cores or
+    /// when K or N do not align.
+    fn split_tcp_function(
+        &self,
+        [m, k, n]: [u64; 3],
+    ) -> Result<Option<(CudaFunction, u64)>, CudaError> {
         if m == 0 || k % TCP_ALIGN != 0 || n % TCP_ALIGN != 0 {
             return Ok(None);
         }
@@ -5180,15 +5272,21 @@ impl CudaKernels {
         {
             return Ok(None);
         }
-        let Some((_split_lock, terms)) = self.split_bf16_3_all(&[(a, m * k), (b, k * n)])? else {
-            return Ok(None);
-        };
-        let [[a_hi, a_mid, a_lo], [b_hi, b_mid, b_lo]] = [terms[0], terms[1]];
-        let (addend_buffer, addend_mode) = match addend {
-            None => (a, 0i32),
-            Some(MatmulAddend::Row(bias)) => (bias, 1),
-            Some(MatmulAddend::Full(residual)) => (residual, 2),
-        };
+        Ok(Some((func, m.min(SPLIT_TCP_BLOCK_ROWS))))
+    }
+
+    /// One launch of `matmul_tcp_split3_kernel` over `m` rows of A (their
+    /// terms at `a_terms`) into the `m` output rows at `out`, plus the
+    /// addend at `addend` (`addend_mode` 1: one row; 2: `m` rows).
+    fn launch_split_tcp(
+        &self,
+        func: &CudaFunction,
+        [a_hi, a_mid, a_lo]: [u64; 3],
+        [b_hi, b_mid, b_lo]: [u64; 3],
+        out: u64,
+        [m, k, n]: [u64; 3],
+        (addend, addend_mode): (u64, i32),
+    ) -> Result<(), CudaError> {
         let overflow = || {
             CudaError::new(
                 CudaErrorCode::ShapeUnsupported,
@@ -5204,21 +5302,83 @@ impl CudaKernels {
             block_dim: (TCP_THREADS, 1, 1),
             shared_mem_bytes: TCP3_SHARED_BYTES,
         };
-        let mut out_dev = self.alloc_output((m * n) as usize)?;
-        let mut args = self.stream.launch_builder(&func);
+        let mut args = self.stream.launch_builder(func);
         args.arg(&a_hi)
             .arg(&a_mid)
             .arg(&a_lo)
             .arg(&b_hi)
             .arg(&b_mid)
             .arg(&b_lo)
-            .arg(&mut out_dev)
+            .arg(&out)
             .arg(&m)
             .arg(&k)
             .arg(&n)
-            .arg(&addend_buffer.slice)
+            .arg(&addend)
             .arg(&addend_mode);
         unsafe { args.launch(config) }?;
+        Ok(())
+    }
+
+    /// `silu(a x gate) * (a x up)` for a long prefill against f32 weights,
+    /// on Tensor Cores ([`Self::matmul_split_tcp`]'s products and
+    /// `silu_mul_kernel`, so its values are theirs), [`SPLIT_TCP_BLOCK_ROWS`]
+    /// rows of A at a time: the gate's and up's products are held for one
+    /// block, never for every row. `None` without Tensor Cores or when K or
+    /// N do not align.
+    fn gated_matmul_split_tcp(
+        &self,
+        a: &CudaDeviceBuffer,
+        gate: &CudaDeviceBuffer,
+        up: &CudaDeviceBuffer,
+        [m, k, n]: [u64; 3],
+    ) -> Result<Option<CudaDeviceBuffer>, CudaError> {
+        let Some((func, block_rows)) = self.split_tcp_function([m, k, n])? else {
+            return Ok(None);
+        };
+        let Some((_split_lock, terms)) =
+            self.split_bf16_3_regions(&[k * n, k * n, block_rows * k])?
+        else {
+            return Ok(None);
+        };
+        let [gate_terms, up_terms, a_terms] = [terms[0], terms[1], terms[2]];
+        self.split_bf16_3_into(gate.slice.device_ptr(&self.stream).0, k * n, gate_terms)?;
+        self.split_bf16_3_into(up.slice.device_ptr(&self.stream).0, k * n, up_terms)?;
+        let silu_mul = self.function("silu_mul_kernel")?;
+        // SAFETY: every element is written by `matmul_tcp_split3_kernel`
+        // before `silu_mul_kernel` reads it, on this one stream.
+        let gate_rows = unsafe { self.stream.alloc::<f32>((block_rows * n) as usize) }?;
+        let up_rows = unsafe { self.stream.alloc::<f32>((block_rows * n) as usize) }?;
+        let (gate_address, up_address) = (
+            gate_rows.device_ptr(&self.stream).0,
+            up_rows.device_ptr(&self.stream).0,
+        );
+        let out_dev = self.alloc_output((m * n) as usize)?;
+        let out = out_dev.device_ptr(&self.stream).0;
+        let a_address = a.slice.device_ptr(&self.stream).0;
+        let mut first = 0;
+        while first < m {
+            let rows = block_rows.min(m - first);
+            self.split_bf16_3_into(a_address + first * k * 4, rows * k, a_terms)?;
+            for (weight_terms, products) in [(gate_terms, gate_address), (up_terms, up_address)] {
+                self.launch_split_tcp(
+                    &func,
+                    a_terms,
+                    weight_terms,
+                    products,
+                    [rows, k, n],
+                    (0, 0),
+                )?;
+            }
+            let count = rows * n;
+            let out_rows = out + first * n * 4;
+            let mut args = self.stream.launch_builder(&silu_mul);
+            args.arg(&gate_address)
+                .arg(&up_address)
+                .arg(&out_rows)
+                .arg(&count);
+            unsafe { args.launch(LaunchConfig::for_num_elems(count as u32)) }?;
+            first += rows;
+        }
         Ok(Some(CudaDeviceBuffer {
             slice: out_dev,
             shape: vec![m, n],

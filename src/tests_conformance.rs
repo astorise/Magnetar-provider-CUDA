@@ -4266,6 +4266,128 @@ fn moe_experts_match_reference_cpu_for_f32_and_packed_experts() {
     assert_eq!(download(&kernels, &captured).data, eager.data);
 }
 
+/// A long prefill's matmul against a packed weight runs on Tensor Cores
+/// 2,048 rows of A at a time (`SPLIT_TCP_BLOCK_ROWS`): each output row is
+/// the one a matmul over fewer rows gives, bit for bit, in the first
+/// block, across a block boundary and in the last; with a full addend
+/// (`matmul-residual`); and `gated-matmul` holds the gate's and up's
+/// products a block at a time, its values `silu_mul` of both matmuls'.
+#[test]
+fn long_prefill_matmuls_run_in_row_blocks() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    if !kernels.has_tensor_cores() {
+        eprintln!("skipped: no Tensor Cores");
+        return;
+    }
+    let (m, k, n) = (4500_u64, 256_u64, 512_u64);
+    let a = activations(m, k, 81);
+    let residual = activations(m, n, 82);
+    let weight = kernels
+        .upload_packed_weight(&packed_q8(n, k, true, 83))
+        .unwrap();
+    let gate = kernels
+        .upload_packed_weight(&packed_q8(n, k, true, 84))
+        .unwrap();
+    let up = kernels
+        .upload_packed_weight(&packed_q8(n, k, true, 85))
+        .unwrap();
+    let rows_of = |tensor: &HostTensor, width: u64, first: u64, count: u64| {
+        HostTensor::new(
+            [count, width],
+            tensor.data[(first * width) as usize..((first + count) * width) as usize].to_vec(),
+        )
+        .unwrap()
+    };
+    let (da, dresidual) = (upload(&kernels, &a), upload(&kernels, &residual));
+    let full = download(
+        &kernels,
+        &kernels.matmul(&da, &weight, false, false).unwrap(),
+    );
+    let full_residual = download(
+        &kernels,
+        &kernels
+            .matmul_residual(&da, &weight, &dresidual, false, false)
+            .unwrap(),
+    );
+    let gated = download(
+        &kernels,
+        &kernels.gated_matmul(&da, &gate, &up, false, false).unwrap(),
+    );
+    let separate = download(
+        &kernels,
+        &kernels
+            .silu_mul(
+                &kernels.matmul(&da, &gate, false, false).unwrap(),
+                &kernels.matmul(&da, &up, false, false).unwrap(),
+            )
+            .unwrap(),
+    );
+    assert_eq!(gated.shape, vec![m, n]);
+    for (index, (g, s)) in gated.data.iter().zip(&separate.data).enumerate() {
+        assert_eq!(
+            g.to_bits(),
+            s.to_bits(),
+            "gated element {index}: {g} against {s}"
+        );
+    }
+    for (first, count) in [(0_u64, 100_u64), (2000, 100), (4400, 100)] {
+        let sub = upload(&kernels, &rows_of(&a, k, first, count));
+        let sub_residual = upload(&kernels, &rows_of(&residual, n, first, count));
+        let checks = [
+            (
+                "matmul",
+                &full,
+                download(
+                    &kernels,
+                    &kernels.matmul(&sub, &weight, false, false).unwrap(),
+                ),
+            ),
+            (
+                "matmul-residual",
+                &full_residual,
+                download(
+                    &kernels,
+                    &kernels
+                        .matmul_residual(&sub, &weight, &sub_residual, false, false)
+                        .unwrap(),
+                ),
+            ),
+            (
+                "gated-matmul",
+                &gated,
+                download(
+                    &kernels,
+                    &kernels
+                        .gated_matmul(&sub, &gate, &up, false, false)
+                        .unwrap(),
+                ),
+            ),
+        ];
+        for (what, whole, part) in checks {
+            let expected = &whole.data[(first * n) as usize..((first + count) * n) as usize];
+            for (index, (p, w)) in part.data.iter().zip(expected).enumerate() {
+                assert_eq!(
+                    p.to_bits(),
+                    w.to_bits(),
+                    "{what}, rows {first}..{}, element {index}: {p} against {w}",
+                    first + count
+                );
+            }
+        }
+    }
+    // Against the Reference CPU's product of the expanded weight.
+    let expected = magnetar_runtime::reference_cpu::matmul(
+        &a,
+        &packed_q8(n, k, true, 83).dequantize(),
+        false,
+        false,
+    )
+    .unwrap();
+    assert_close_relative(&full, &expected);
+}
+
 /// A `moe-experts` prefill over packed `Q8_0` experts, its pairs grouped by
 /// expert (`moe_q8_gated_grouped_kernel`), gives the per-pair Kernels' own
 /// values: for prompts served in one and in several token chunks, a share
