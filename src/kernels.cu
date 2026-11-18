@@ -7010,10 +7010,10 @@ extern "C" __global__ void tq_latent_attention_split_kernel(
     if (tid < (1u << bits)) {
         book[tid] = centroids[tid];
     }
-    // Every query head as it is (the exact keys' scores), and its
+    // Every query head after the signs (group by group), and its
     // `q . offsets`.
     for (unsigned int i = tid; i < group * k_width; i += blockDim.x) {
-        q_rot[i] = q[head0 * k_width + i];
+        q_rot[i] = q[(head0 + i / k_width) * k_width + i % k_width] * signs[i % dim];
     }
     for (unsigned int g = warp; g < group; g += warps) {
         const float* q_row = q + (head0 + g) * k_width;
@@ -7029,44 +7029,7 @@ extern "C" __global__ void tq_latent_attention_split_kernel(
         }
     }
     __syncthreads();
-
-    // Exact keys (`keep-turboquant-kv-head-exact`): one thread per key,
-    // every query head, from float4s of the key's row and of the queries,
-    // before the queries are rotated.
-    for (unsigned int j = tid; j < exact_count; j += blockDim.x) {
-        const float4* exact_row = (const float4*)(exact + (first + j) * k_width);
-        float dot[TQ_MAX_GROUP];
-#pragma unroll
-        for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
-            dot[g] = 0.0f;
-        }
-        for (unsigned int c = 0; c < k_width / 4; c++) {
-            float4 key = exact_row[c];
-#pragma unroll
-            for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
-                if (g < group) {
-                    float4 query = ((const float4*)(q_rot + g * k_width))[c];
-                    dot[g] = fmaf(query.x, key.x, dot[g]);
-                    dot[g] = fmaf(query.y, key.y, dot[g]);
-                    dot[g] = fmaf(query.z, key.z, dot[g]);
-                    dot[g] = fmaf(query.w, key.w, dot[g]);
-                }
-            }
-        }
-#pragma unroll
-        for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
-            if (g < group) {
-                scores[j][g] = dot[g] * scale;
-            }
-        }
-    }
-    __syncthreads();
-    // Every query head after the signs (group by group), then the
-    // Walsh-Hadamard transform of every group of every head at once.
-    for (unsigned int i = tid; i < group * k_width; i += blockDim.x) {
-        q_rot[i] *= signs[i % dim];
-    }
-    __syncthreads();
+    // The Walsh-Hadamard transform of every group of every head at once.
     unsigned int transforms = group * (unsigned int)k_groups;
     for (unsigned int half = 1; half < dim; half <<= 1) {
         for (unsigned int t = tid; t < transforms * (dim / 2); t += blockDim.x) {
@@ -7096,7 +7059,29 @@ extern "C" __global__ void tq_latent_attention_split_kernel(
             dot[g] = 0.0f;
         }
         if (j < exact_count) {
-            // Scored above, against the queries as they are.
+            // An exact key against every query head as it is, from float4s
+            // of its row and of the queries (every thread reads the same
+            // query values, which the cache serves).
+            const float4* exact_row = (const float4*)(exact + row * k_width);
+            for (unsigned int c = 0; c < k_width / 4; c++) {
+                float4 key = exact_row[c];
+#pragma unroll
+                for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
+                    if (g < group) {
+                        float4 query = ((const float4*)(q + (head0 + g) * k_width))[c];
+                        dot[g] = fmaf(query.x, key.x, dot[g]);
+                        dot[g] = fmaf(query.y, key.y, dot[g]);
+                        dot[g] = fmaf(query.z, key.z, dot[g]);
+                        dot[g] = fmaf(query.w, key.w, dot[g]);
+                    }
+                }
+            }
+#pragma unroll
+            for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
+                if (g < group) {
+                    scores[j][g] = dot[g] * scale;
+                }
+            }
             continue;
         }
         for (unsigned int kg = 0; kg < (unsigned int)k_groups; kg++) {
