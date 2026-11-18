@@ -288,6 +288,18 @@ pub struct CudaTqStore {
     pub(crate) signs: CudaSlice<f32>,
     pub(crate) centroids: CudaSlice<f32>,
     pub(crate) boundaries: CudaSlice<f32>,
+    /// The store's first rows, kept exact as an f32 `[exact_rows, width]`
+    /// buffer (`keep-turboquant-kv-head-exact`); `None` without a head.
+    pub(crate) exact: Option<Box<CudaDeviceBuffer>>,
+    /// The rows `exact` holds: the requested head, at most the capacity.
+    pub(crate) exact_rows: u64,
+}
+
+impl CudaTqStore {
+    /// The exact head, when it holds the first `rows` rows.
+    fn head_covering(&self, rows: u64) -> Option<&CudaDeviceBuffer> {
+        self.exact.as_deref().filter(|_| rows <= self.exact_rows)
+    }
 }
 
 /// A `Q8_0` matrix on the device: its signed 8-bit quants in stored
@@ -2168,6 +2180,11 @@ impl CudaKernels {
                     signs: self.stream.clone_dtod(&tq.signs)?,
                     centroids: self.stream.clone_dtod(&tq.centroids)?,
                     boundaries: self.stream.clone_dtod(&tq.boundaries)?,
+                    exact: match &tq.exact {
+                        Some(exact) => Some(Box::new(self.clone_buffer(exact)?)),
+                        None => None,
+                    },
+                    exact_rows: tq.exact_rows,
                 }),
             });
         }
@@ -2199,6 +2216,20 @@ impl CudaKernels {
         precision: KvStorePrecision,
         head_dimension: u64,
     ) -> Result<CudaDeviceBuffer, CudaError> {
+        self.tq_zeros_with_exact_head(shape, precision, head_dimension, 0)
+    }
+
+    /// [`Self::tq_zeros`] whose first `exact_rows` rows (at most the
+    /// capacity) are kept exact in an f32 head
+    /// (`keep-turboquant-kv-head-exact`): `kv-write` copies them there,
+    /// and every read takes them from there.
+    pub fn tq_zeros_with_exact_head(
+        &self,
+        shape: &[u64],
+        precision: KvStorePrecision,
+        head_dimension: u64,
+        exact_rows: u64,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
         self.forbid_in_capture("a device allocation")?;
         let unsupported = |reason: String| CudaError::new(CudaErrorCode::ShapeUnsupported, reason);
         let bits = precision.bits().ok_or_else(|| {
@@ -2226,6 +2257,11 @@ impl CudaKernels {
             .map_err(|_| unsupported("the KV store does not fit in memory".into()))?;
         let code_bytes = (head_dimension * u64::from(bits) / 8) as usize;
         let codebook = turboquant_codebook(head_dimension, bits);
+        let exact_rows = exact_rows.min(capacity);
+        let exact = match exact_rows {
+            0 => None,
+            rows => Some(Box::new(self.zeros(&[rows, width])?)),
+        };
         Ok(CudaDeviceBuffer {
             slice: self.stream.alloc_zeros::<f32>(1)?,
             shape: shape.to_vec(),
@@ -2242,6 +2278,8 @@ impl CudaKernels {
                 signs: self.stream.clone_htod(&turboquant_signs(head_dimension))?,
                 centroids: self.stream.clone_htod(&codebook.centroids)?,
                 boundaries: self.stream.clone_htod(&codebook.boundaries)?,
+                exact,
+                exact_rows,
             }),
         })
     }
@@ -2299,6 +2337,7 @@ impl CudaKernels {
             unsafe { args.launch(LaunchConfig::for_num_elems(width as u32)) }?;
         }
         let func = self.function("tq_kv_write_kernel")?;
+        let no_head = 0u64;
         let mut args = self.stream.launch_builder(&func);
         args.arg(&rows.slice)
             .arg(&tq.offsets)
@@ -2311,6 +2350,11 @@ impl CudaKernels {
             .arg(&tq.bits)
             .arg(&row_offset)
             .arg(&step_offset);
+        match tq.exact.as_mut() {
+            Some(exact) => args.arg(&mut exact.slice),
+            None => args.arg(&no_head),
+        };
+        args.arg(&tq.exact_rows);
         let config = LaunchConfig {
             grid_dim: (count as u32, tq.heads as u32, 1),
             block_dim: (tq_threads(tq.head_dimension), 1, 1),
@@ -2336,6 +2380,7 @@ impl CudaKernels {
             return Ok(());
         }
         let func = self.function("tq_dequantize_kernel")?;
+        let no_head = 0u64;
         let mut args = self.stream.launch_builder(&func);
         args.arg(&tq.codes)
             .arg(&tq.norms)
@@ -2348,6 +2393,11 @@ impl CudaKernels {
             .arg(&tq.bits)
             .arg(&rows)
             .arg(&step_offset);
+        match tq.exact.as_ref() {
+            Some(exact) => args.arg(&exact.slice),
+            None => args.arg(&no_head),
+        };
+        args.arg(&tq.exact_rows);
         let config = LaunchConfig {
             grid_dim: (capacity as u32, tq.heads as u32, 1),
             block_dim: (tq_threads(tq.head_dimension), 1, 1),
@@ -2402,6 +2452,7 @@ impl CudaKernels {
             && kt.heads == kv_heads
             && vt.heads == kv_heads
             && v.shape.first() == Some(&kv_rows)
+            && kt.exact_rows == vt.exact_rows
             && kv_heads > 0
             && head_count.is_multiple_of(kv_heads)
             && head_count * head_dimension == q_width
@@ -2415,6 +2466,26 @@ impl CudaKernels {
                     CudaErrorCode::ShapeUnsupported,
                     format!("key_count {kv_seq_len} must lie in 1..={kv_rows}"),
                 ));
+            }
+            // A history the exact heads hold decodes as f32 stores do, on
+            // the heads (`keep-turboquant-kv-head-exact`): a captured step
+            // replays only while its history stays in them.
+            if let (Some(k_head), Some(v_head)) =
+                (kt.head_covering(kv_seq_len), vt.head_covering(kv_seq_len))
+            {
+                return self.attention_valued(
+                    q,
+                    k_head,
+                    v_head,
+                    head_count,
+                    head_dimension,
+                    value_dimension,
+                    kv_head_count,
+                    window_size,
+                    causal,
+                    key_count,
+                    scale,
+                );
             }
             let step_offset = match key_count {
                 Some(_) => self.advancing_offset("key_count", kv_rows - kv_seq_len),
@@ -2437,8 +2508,26 @@ impl CudaKernels {
                 scale.unwrap_or(0.0),
             );
         }
-        // Read through dequantized scratch: the rows attention may read.
+        // Read through dequantized scratch: the rows attention may read; on
+        // the exact heads directly while they hold those rows.
         let rows = key_count.unwrap_or(kv_rows);
+        if let (Some(kt), Some(vt)) = (&k.tq, &v.tq)
+            && let (Some(k_head), Some(v_head)) = (kt.head_covering(rows), vt.head_covering(rows))
+        {
+            return self.attention_valued(
+                q,
+                k_head,
+                v_head,
+                head_count,
+                head_dimension,
+                value_dimension,
+                kv_head_count,
+                window_size,
+                causal,
+                key_count,
+                scale,
+            );
+        }
         let step_offset = match key_count {
             Some(_) => self.advancing_offset("key_count", kv_rows.saturating_sub(rows)),
             None => 0,
@@ -2575,6 +2664,20 @@ impl CudaKernels {
             .arg(&step_offset)
             .arg(&score_scale)
             .arg(&value_dimension);
+        // Keys below the exact heads' rows are read from them
+        // (`keep-turboquant-kv-head-exact`).
+        let no_head = 0u64;
+        let exact_rows = match (k.exact.as_ref(), v.exact.as_ref()) {
+            (Some(k_exact), Some(v_exact)) => {
+                args.arg(&k_exact.slice).arg(&v_exact.slice);
+                k.exact_rows.min(v.exact_rows)
+            }
+            _ => {
+                args.arg(&no_head).arg(&no_head);
+                0
+            }
+        };
+        args.arg(&exact_rows).arg(&v.signs).arg(&v.offsets);
         let config = LaunchConfig {
             grid_dim: (
                 u32::try_from(chunks).map_err(|_| overflow())?,
@@ -5227,6 +5330,27 @@ impl CudaKernels {
         if k.is_tq() || v.is_tq() {
             let kv_rows = k.shape.first().copied().unwrap_or(0);
             let rows = key_count.unwrap_or(kv_rows);
+            // On the exact heads directly while they hold the rows read
+            // (`keep-turboquant-kv-head-exact`).
+            if let (Some(kt), Some(vt)) = (&k.tq, &v.tq)
+                && let (Some(k_head), Some(v_head)) =
+                    (kt.head_covering(rows), vt.head_covering(rows))
+            {
+                return self.attention_strided_values(
+                    q,
+                    k_head,
+                    v_head,
+                    head_count,
+                    head_dimension,
+                    value_dimension,
+                    value_stride,
+                    kv_head_count,
+                    window_size,
+                    causal,
+                    key_count,
+                    scale,
+                );
+            }
             let step_offset = match key_count {
                 Some(_) => self.advancing_offset("key_count", kv_rows.saturating_sub(rows)),
                 None => 0,

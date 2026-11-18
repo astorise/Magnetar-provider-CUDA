@@ -557,9 +557,26 @@ impl CudaExecutor {
         precision: KvStorePrecision,
         head_dimension: u64,
     ) -> Result<bool, ProviderExecutionError> {
+        self.write_zeroed_kv_store_with_exact_head(id, shape, precision, head_dimension, 0)
+    }
+
+    /// See [`ProviderExecutionApi::write_zeroed_kv_store_with_exact_head`]:
+    /// [`Self::write_zeroed_kv_store`] whose first `exact_rows` rows are
+    /// kept exact in an f32 head (`keep-turboquant-kv-head-exact`).
+    pub fn write_zeroed_kv_store_with_exact_head(
+        &self,
+        id: &TensorResourceId,
+        shape: &[u64],
+        precision: KvStorePrecision,
+        head_dimension: u64,
+        exact_rows: u64,
+    ) -> Result<bool, ProviderExecutionError> {
         let buffer = match precision {
             KvStorePrecision::F32 => self.kernels.zeros(shape),
-            _ => self.kernels.tq_zeros(shape, precision, head_dimension),
+            _ => {
+                self.kernels
+                    .tq_zeros_with_exact_head(shape, precision, head_dimension, exact_rows)
+            }
         }
         .map_err(|error| {
             ProviderExecutionError::new(
@@ -2406,6 +2423,24 @@ impl ProviderExecutionApi for CudaExecutor {
         head_dimension: u64,
     ) -> Result<bool, ProviderExecutionError> {
         CudaExecutor::write_zeroed_kv_store(self, id, shape, precision, head_dimension)
+    }
+
+    fn write_zeroed_kv_store_with_exact_head(
+        &self,
+        id: &TensorResourceId,
+        shape: &[u64],
+        precision: KvStorePrecision,
+        head_dimension: u64,
+        exact_rows: u64,
+    ) -> Result<bool, ProviderExecutionError> {
+        CudaExecutor::write_zeroed_kv_store_with_exact_head(
+            self,
+            id,
+            shape,
+            precision,
+            head_dimension,
+            exact_rows,
+        )
     }
 
     fn write_tensor_value_admitted(

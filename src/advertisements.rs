@@ -17,7 +17,10 @@ pub const KEY_COUNT_FEATURE: &str = "key-count";
 use magnetar_core::ComputeDType;
 use magnetar_core::capability::CapabilityVersion;
 use magnetar_core::device::DeviceId;
-use magnetar_core::operator::{ATTENTION_TURBOQUANT_KV_FEATURE, KV_WRITE_TURBOQUANT_FEATURE};
+use magnetar_core::operator::{
+    ATTENTION_TURBOQUANT_KV_FEATURE, KV_WRITE_TURBOQUANT_EXACT_HEAD_FEATURE,
+    KV_WRITE_TURBOQUANT_FEATURE,
+};
 use magnetar_core::{DeviceBinding, ProviderBinding};
 use magnetar_core::{
     operator::ATTENTION_SCALE_FEATURE, operator::ATTENTION_VALUE_HEAD_DIMENSION_FEATURE,
@@ -259,13 +262,17 @@ pub fn cuda_kernel_advertisements(
             provider_name,
             &[CONCAT_HEADS_FEATURE],
         ),
-        // Creates and writes TurboQuant stores (`turboquant-kv-history`).
+        // Creates and writes TurboQuant stores (`turboquant-kv-history`),
+        // with an exact head (`keep-turboquant-kv-head-exact`).
         advertisement_with_features(
             "kv-write",
             OperatorFamily::Tensor,
             device_id,
             provider_name,
-            &[KV_WRITE_TURBOQUANT_FEATURE],
+            &[
+                KV_WRITE_TURBOQUANT_FEATURE,
+                KV_WRITE_TURBOQUANT_EXACT_HEAD_FEATURE,
+            ],
         ),
         baseline_advertisement(
             "residual-add",
