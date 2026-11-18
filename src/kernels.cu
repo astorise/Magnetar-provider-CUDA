@@ -1756,9 +1756,12 @@ extern "C" __global__ void attention_block_kernel(
 // softmax mass. The mean never leaves the V rows' range (large finite values
 // stay finite). A query's 4 partial dot products are added with a fixed
 // butterfly and its keys are visited in order: deterministic.
+// V rows may be narrower than K's (`value_head_dimension`,
+// `express-latent-attention-forms`): a thread then owns VPART value
+// dimensions, and V rows and the output are `4 * VPART` wide per head.
 #define ATTENTION_TILE_QUERIES 64
 #define ATTENTION_SUB_KEYS 16
-template <int PART>
+template <int PART, int VPART>
 __device__ __forceinline__ void attention_tiled(
     const float* q,
     const float* k,
@@ -1778,6 +1781,7 @@ __device__ __forceinline__ void attention_tiled(
 ) {
     extern __shared__ float tiles[];
     const unsigned int head_dimension = 4 * PART;
+    const unsigned int value_dimension = 4 * VPART;
     float* k_tile = tiles;
     float* v_tile = tiles + key_tile * head_dimension;
     unsigned int tid = threadIdx.x;
@@ -1789,6 +1793,12 @@ __device__ __forceinline__ void attention_tiled(
     unsigned long long group_size = head_count / kv_head_count;
     unsigned long long q_offset = head * head_dimension;
     unsigned long long kv_offset = (head / group_size) * head_dimension;
+    // V rows hold kv_head_count heads of value_dimension, output rows
+    // head_count of them (q_model_dim and kv_model_dim when they match).
+    unsigned long long v_model_dim = kv_head_count * value_dimension;
+    unsigned long long v_offset = (head / group_size) * value_dimension;
+    unsigned long long out_model_dim = head_count * value_dimension;
+    unsigned long long out_offset = head * value_dimension;
     // The factor on QK^T: `score_scale` when the node sets one
     // (`attention.scale`), else 1/sqrt(head_dimension).
     float scale = score_scale > 0.0f ? score_scale : 1.0f / sqrtf((float)head_dimension);
@@ -1814,10 +1824,13 @@ __device__ __forceinline__ void attention_tiled(
     }
 
     float q_part[PART];
-    float acc[PART];
+    float acc[VPART];
 #pragma unroll
     for (int i = 0; i < PART; i++) {
         q_part[i] = active ? q[query_index * q_model_dim + q_offset + part + 4 * i] * scale : 0.0f;
+    }
+#pragma unroll
+    for (int i = 0; i < VPART; i++) {
         acc[i] = 0.0f;
     }
     float max_value = neg_inf();
@@ -1826,11 +1839,15 @@ __device__ __forceinline__ void attention_tiled(
     for (unsigned long long tile = tile_lower; tile < tile_upper; tile += key_tile) {
         unsigned int tile_keys = (unsigned int)(tile_upper - tile < key_tile ? tile_upper - tile : key_tile);
         __syncthreads();
-        for (unsigned int row = tid / head_dimension; row < tile_keys; row += blockDim.x / head_dimension) {
-            unsigned int d = tid % head_dimension;
-            const unsigned long long source = (tile + row) * kv_model_dim + kv_offset + d;
-            k_tile[row * head_dimension + d] = k[source];
-            v_tile[row * head_dimension + d] = v[source];
+        for (unsigned int index = tid; index < tile_keys * head_dimension; index += blockDim.x) {
+            unsigned int row = index / head_dimension;
+            unsigned int d = index % head_dimension;
+            k_tile[index] = k[(tile + row) * kv_model_dim + kv_offset + d];
+        }
+        for (unsigned int index = tid; index < tile_keys * value_dimension; index += blockDim.x) {
+            unsigned int row = index / value_dimension;
+            unsigned int d = index % value_dimension;
+            v_tile[index] = v[(tile + row) * v_model_dim + v_offset + d];
         }
         __syncthreads();
         for (unsigned int sub = 0; sub < tile_keys; sub += ATTENTION_SUB_KEYS) {
@@ -1863,18 +1880,18 @@ __device__ __forceinline__ void attention_tiled(
                 scores[j] = expf(scores[j] - sub_max);
                 sub_sum += scores[j];
             }
-            float sub_mean[PART];
+            float sub_mean[VPART];
 #pragma unroll
-            for (int i = 0; i < PART; i++) {
+            for (int i = 0; i < VPART; i++) {
                 sub_mean[i] = 0.0f;
             }
 #pragma unroll
             for (int j = 0; j < ATTENTION_SUB_KEYS; j++) {
                 float weight = scores[j] / sub_sum;
                 if (weight != 0.0f) {
-                    const float* v_row = v_tile + (sub + j) * head_dimension + part;
+                    const float* v_row = v_tile + (sub + j) * value_dimension + part;
 #pragma unroll
-                    for (int i = 0; i < PART; i++) {
+                    for (int i = 0; i < VPART; i++) {
                         sub_mean[i] += weight * v_row[4 * i];
                     }
                 }
@@ -1886,7 +1903,7 @@ __device__ __forceinline__ void attention_tiled(
             float keep = kept / sum;
             float take = added / sum;
 #pragma unroll
-            for (int i = 0; i < PART; i++) {
+            for (int i = 0; i < VPART; i++) {
                 acc[i] = acc[i] * keep + sub_mean[i] * take;
             }
             max_value = new_max;
@@ -1895,14 +1912,15 @@ __device__ __forceinline__ void attention_tiled(
     if (active) {
         // No key admitted (an empty window) leaves the output zero.
 #pragma unroll
-        for (int i = 0; i < PART; i++) {
-            out[query_index * q_model_dim + q_offset + part + 4 * i] = sum > 0.0f ? acc[i] : 0.0f;
+        for (int i = 0; i < VPART; i++) {
+            out[query_index * out_model_dim + out_offset + part + 4 * i] = sum > 0.0f ? acc[i] : 0.0f;
         }
     }
 }
 
-#define ATTENTION_TILED_KERNEL(PART)                                              \
-extern "C" __global__ void attention_tiled_##PART##_kernel(                       \
+#define ATTENTION_TILED_KERNEL(PART) ATTENTION_TILED_VALUED_KERNEL(PART, PART, PART)
+#define ATTENTION_TILED_VALUED_KERNEL(NAME, PART, VPART)                          \
+extern "C" __global__ void attention_tiled_##NAME##_kernel(                       \
     const float* q, const float* k, const float* v, float* out,                   \
     unsigned long long seq_len, unsigned long long kv_seq_len,                    \
     unsigned long long head_count, unsigned long long kv_head_count,              \
@@ -1910,7 +1928,7 @@ extern "C" __global__ void attention_tiled_##PART##_kernel(                     
     int causal, long long window_size,                                            \
     unsigned long long query_position_offset, unsigned int key_tile,             \
     float score_scale) {                                                          \
-    attention_tiled<PART>(q, k, v, out, seq_len, kv_seq_len, head_count,          \
+    attention_tiled<PART, VPART>(q, k, v, out, seq_len, kv_seq_len, head_count,   \
         kv_head_count, q_model_dim, kv_model_dim, causal, window_size,            \
         query_position_offset, key_tile, score_scale);                            \
 }
@@ -1921,6 +1939,8 @@ ATTENTION_TILED_KERNEL(8)
 ATTENTION_TILED_KERNEL(16)
 ATTENTION_TILED_KERNEL(24)
 ATTENTION_TILED_KERNEL(32)
+// 192-dimension keys, 128-dimension values (an expanded latent attention).
+ATTENTION_TILED_VALUED_KERNEL(48_32, 48, 32)
 
 // Split-key attention for one query row (a decode step). The keys a query
 // admits are cut into chunks of ATTENTION_CHUNK_KEYS from its first admitted

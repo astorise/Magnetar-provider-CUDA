@@ -6234,17 +6234,21 @@ impl CudaKernels {
                 tq: None,
             });
         }
-        let tiled = match head_dimension {
-            4 => Some("attention_tiled_1_kernel"),
-            8 => Some("attention_tiled_2_kernel"),
-            16 => Some("attention_tiled_4_kernel"),
-            32 => Some("attention_tiled_8_kernel"),
-            64 => Some("attention_tiled_16_kernel"),
-            96 => Some("attention_tiled_24_kernel"),
-            128 => Some("attention_tiled_32_kernel"),
+        // The tiled Kernel compiled for the head (and value) dimension:
+        // equal widths, or an expanded latent attention's 192-dimension
+        // keys and 128-dimension values.
+        let tiled = match (head_dimension, value_dimension) {
+            (4, 4) => Some("attention_tiled_1_kernel"),
+            (8, 8) => Some("attention_tiled_2_kernel"),
+            (16, 16) => Some("attention_tiled_4_kernel"),
+            (32, 32) => Some("attention_tiled_8_kernel"),
+            (64, 64) => Some("attention_tiled_16_kernel"),
+            (96, 96) => Some("attention_tiled_24_kernel"),
+            (128, 128) => Some("attention_tiled_32_kernel"),
+            (192, 128) => Some("attention_tiled_48_32_kernel"),
             _ => None,
         };
-        if let Some(tiled) = tiled.filter(|_| seq_len > 1 && same_width) {
+        if let Some(tiled) = tiled.filter(|_| seq_len > 1) {
             let overflow = || {
                 CudaError::new(
                     CudaErrorCode::ShapeUnsupported,
@@ -6252,7 +6256,7 @@ impl CudaKernels {
                 )
             };
             let key_tile: u32 = if head_dimension <= 64 { 64 } else { 32 };
-            let mut out_dev = self.alloc_output(q.slice.len())?;
+            let mut out_dev = self.alloc_output(out_len)?;
             let func = self.function(tiled)?;
             let mut args = self.stream.launch_builder(&func);
             args.arg(&q.slice)
@@ -6278,13 +6282,15 @@ impl CudaKernels {
                     1,
                 ),
                 block_dim: (4 * ATTENTION_TILE_QUERIES as u32, 1, 1),
-                shared_mem_bytes: u32::try_from(2 * u64::from(key_tile) * head_dimension * 4)
-                    .map_err(|_| overflow())?,
+                shared_mem_bytes: u32::try_from(
+                    u64::from(key_tile) * (head_dimension + value_dimension) * 4,
+                )
+                .map_err(|_| overflow())?,
             };
             unsafe { args.launch(config) }?;
             return Ok(CudaDeviceBuffer {
                 slice: out_dev,
-                shape: q.shape.clone(),
+                shape: out_shape,
                 bf16: None,
                 q8: None,
                 tq: None,

@@ -4942,9 +4942,11 @@ fn yarn_rope_matches_reference_cpu() {
 
 /// Attention with V rows narrower than Q and K (`value_head_dimension`,
 /// `express-latent-attention-forms`) in the Kernels that serve it: split-key
-/// decode (one chunk and several), the block Kernel and the one-thread
-/// Kernel (a history too long for the block Kernel's shared memory); equal
-/// widths unchanged.
+/// decode (one chunk and several), the tiled prefill Kernel (192-dimension
+/// keys, 128-dimension values: several query tiles, a window, grouped
+/// heads, queries after a longer history), the block Kernel and the
+/// one-thread Kernel (a history too long for the block Kernel's shared
+/// memory); equal widths unchanged.
 #[test]
 fn attention_with_a_value_width_matches_reference_cpu() {
     use magnetar_runtime::reference_cpu::attention_with_value_width;
@@ -4958,6 +4960,9 @@ fn attention_with_a_value_width_matches_reference_cpu() {
         (1, 300, 2, 2, 192, 128, None),
         (1, 300, 4, 2, 24, 16, Some(64_u64)),
         (7, 7, 2, 2, 192, 128, None),
+        (130, 130, 3, 3, 192, 128, None),
+        (70, 300, 4, 2, 192, 128, None),
+        (100, 100, 2, 1, 192, 128, Some(40)),
         (24, 24, 4, 1, 12, 20, Some(8)),
         (3, 13_000, 1, 1, 16, 8, None),
         (6, 9, 2, 2, 64, 64, None),
