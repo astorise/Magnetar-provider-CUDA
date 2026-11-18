@@ -2604,7 +2604,7 @@ fn decode_attention_times() {
                 f32_bytes / f32_us / 1e3
             );
             // Every schedule of the code Kernels on codes alone
-            // (`speed-up-decode-attention-on-codes`), and the split one
+            // (`speed-up-decode-attention-on-codes`), and the default one
             // with an exact head.
             for (precision, bits) in [(KvStorePrecision::Tq4, 4), (KvStorePrecision::Tq3, 3)] {
                 for (schedule, exact, name) in [
@@ -2616,9 +2616,9 @@ fn decode_attention_times() {
                     ),
                     (TqDecodeSchedule::Split, 0, "staged and split"),
                     (
-                        TqDecodeSchedule::Split,
+                        TqDecodeSchedule::Unstaged,
                         1024,
-                        "staged and split, a 1,024-row head",
+                        "unstaged, a 1,024-row head",
                     ),
                 ] {
                     kernels.set_tq_decode_schedule(schedule);
