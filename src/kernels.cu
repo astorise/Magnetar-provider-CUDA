@@ -7415,9 +7415,14 @@ extern "C" __global__ void tq_latent_attention_split_kernel(
     }
     __syncthreads();
 
-    // Scores: one thread per key, every query head, a group at a time.
+    // Scores: four threads per key (LATENT_THREADS = 4 *
+    // ATTENTION_CHUNK_KEYS), thread `part` of a key taking its groups part,
+    // part + 4, ... (an exact key: its float4s part, part + 4, ...) against
+    // every query head; the four sums are added by a fixed butterfly.
     unsigned int code_bytes = dim * bits / 8u;
-    for (unsigned int j = tid; j < count; j += blockDim.x) {
+    {
+        unsigned int j = tid >> 2;
+        unsigned int part = tid & 3u;
         unsigned long long row = first + j;
         float dot[TQ_MAX_GROUP];
 #pragma unroll
@@ -7429,7 +7434,7 @@ extern "C" __global__ void tq_latent_attention_split_kernel(
             // of its row and of the queries (every thread reads the same
             // query values, which the cache serves).
             const float4* exact_row = (const float4*)(exact + row * k_width);
-            for (unsigned int c = 0; c < k_width / 4; c++) {
+            for (unsigned int c = part; c < k_width / 4; c += 4) {
                 float4 key = exact_row[c];
 #pragma unroll
                 for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
@@ -7442,48 +7447,51 @@ extern "C" __global__ void tq_latent_attention_split_kernel(
                     }
                 }
             }
+        } else if (j < count) {
+            for (unsigned int kg = part; kg < (unsigned int)k_groups; kg += 4) {
+                unsigned long long cell = row * k_groups + kg;
+                const unsigned char* row_codes = codes + cell * code_bytes;
+                float code_part[TQ_MAX_GROUP];
 #pragma unroll
-            for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
-                if (g < group) {
-                    scores[j][g] = dot[g] * scale;
+                for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
+                    code_part[g] = 0.0f;
                 }
-            }
-            continue;
-        }
-        for (unsigned int kg = 0; kg < (unsigned int)k_groups; kg++) {
-            unsigned long long cell = row * k_groups + kg;
-            const unsigned char* row_codes = codes + cell * code_bytes;
-            float part[TQ_MAX_GROUP];
+                for (unsigned int e8 = 0; e8 < dim; e8 += 8) {
+                    float centroid[8];
+                    if (bits == 4u) {
+                        unsigned int word = ((const unsigned int*)row_codes)[e8 >> 3];
 #pragma unroll
-            for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
-                part[g] = 0.0f;
-            }
-            for (unsigned int e8 = 0; e8 < dim; e8 += 8) {
-                float centroid[8];
-                if (bits == 4u) {
-                    unsigned int word = ((const unsigned int*)row_codes)[e8 >> 3];
+                        for (unsigned int e = 0; e < 8; e++) {
+                            centroid[e] = book[(word >> (4u * e)) & 15u];
+                        }
+                    } else {
 #pragma unroll
-                    for (unsigned int e = 0; e < 8; e++) {
-                        centroid[e] = book[(word >> (4u * e)) & 15u];
+                        for (unsigned int e = 0; e < 8; e++) {
+                            centroid[e] = book[tq_code(row_codes, bits, e8 + e)];
+                        }
                     }
-                } else {
-#pragma unroll
-                    for (unsigned int e = 0; e < 8; e++) {
-                        centroid[e] = book[tq_code(row_codes, bits, e8 + e)];
-                    }
+                    tq_dot8(code_part, q_rot, group, k_width, kg * dim + e8, centroid);
                 }
-                tq_dot8(part, q_rot, group, k_width, kg * dim + e8, centroid);
-            }
-            float norm = norms[cell];
+                float norm = norms[cell];
 #pragma unroll
-            for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
-                dot[g] = fmaf(norm, part[g], dot[g]);
+                for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
+                    dot[g] = fmaf(norm, code_part[g], dot[g]);
+                }
             }
         }
 #pragma unroll
         for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
-            if (g < group) {
-                scores[j][g] = (q_offsets[g] + dot[g]) * scale;
+            dot[g] += __shfl_xor_sync(0xffffffffu, dot[g], 1);
+            dot[g] += __shfl_xor_sync(0xffffffffu, dot[g], 2);
+        }
+        if (j < count && part == 0) {
+            // An exact key's score has no offsets term.
+            bool exact_key = j < exact_count;
+#pragma unroll
+            for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
+                if (g < group) {
+                    scores[j][g] = exact_key ? dot[g] * scale : (q_offsets[g] + dot[g]) * scale;
+                }
             }
         }
     }
@@ -7548,6 +7556,7 @@ extern "C" __global__ void tq_latent_attention_split_kernel(
         for (unsigned int a = 0; a < TQ_MAX_GROUP; a++) {
             acc[a] = 0.0f;
         }
+#pragma unroll 4
         for (unsigned int j = exact_count; j < count; j++) {
             unsigned long long cell = (first + j) * k_groups + vg;
             const unsigned char* row_codes = codes + cell * code_bytes;
@@ -7722,32 +7731,45 @@ extern "C" __global__ void latent_attention_split_kernel(
     }
     __syncthreads();
 
-    // Scores: one thread per key, every query head, in the order of the
-    // dimensions.
-    for (unsigned int j = tid; j < count; j += blockDim.x) {
-        const float4* row = (const float4*)(kv + (first + j) * k_width);
+    // Scores: four threads per key (LATENT_THREADS = 4 *
+    // ATTENTION_CHUNK_KEYS), thread `part` of a key taking its float4s part,
+    // part + 4, ..., against every query head; the four sums are added by
+    // a fixed butterfly.
+    {
+        unsigned int j = tid >> 2;
+        unsigned int part = tid & 3u;
         float dot[TQ_MAX_GROUP];
 #pragma unroll
         for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
             dot[g] = 0.0f;
         }
-        for (unsigned int c = 0; c < width / 4; c++) {
-            float4 key = row[c];
+        if (j < count) {
+            const float4* row = (const float4*)(kv + (first + j) * k_width);
+            for (unsigned int c = part; c < width / 4; c += 4) {
+                float4 key = row[c];
 #pragma unroll
-            for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
-                if (g < group) {
-                    float4 query = ((const float4*)(latent_queries + g * width))[c];
-                    dot[g] = fmaf(query.x, key.x, dot[g]);
-                    dot[g] = fmaf(query.y, key.y, dot[g]);
-                    dot[g] = fmaf(query.z, key.z, dot[g]);
-                    dot[g] = fmaf(query.w, key.w, dot[g]);
+                for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
+                    if (g < group) {
+                        float4 query = ((const float4*)(latent_queries + g * width))[c];
+                        dot[g] = fmaf(query.x, key.x, dot[g]);
+                        dot[g] = fmaf(query.y, key.y, dot[g]);
+                        dot[g] = fmaf(query.z, key.z, dot[g]);
+                        dot[g] = fmaf(query.w, key.w, dot[g]);
+                    }
                 }
             }
         }
 #pragma unroll
         for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
-            if (g < group) {
-                scores[j][g] = dot[g] * scale;
+            dot[g] += __shfl_xor_sync(0xffffffffu, dot[g], 1);
+            dot[g] += __shfl_xor_sync(0xffffffffu, dot[g], 2);
+        }
+        if (j < count && part == 0) {
+#pragma unroll
+            for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
+                if (g < group) {
+                    scores[j][g] = dot[g] * scale;
+                }
             }
         }
     }
@@ -7789,6 +7811,7 @@ extern "C" __global__ void latent_attention_split_kernel(
         for (unsigned int a = 0; a < TQ_MAX_GROUP; a++) {
             acc[a] = 0.0f;
         }
+#pragma unroll 4
         for (unsigned int j = 0; j < count; j++) {
             tq_weigh8(acc, scores[j], 0u, heads, kv[(first + j) * k_width + i]);
         }

@@ -144,6 +144,11 @@ const ATTENTION_THREADS: u32 = 128;
 const ATTENTION_CHUNK_KEYS: u64 = 128;
 /// `ATTENTION_SPLIT_THREADS` in `kernels.cu`.
 const ATTENTION_SPLIT_THREADS: u32 = 128;
+
+/// Threads per block of the latent decode Kernels
+/// (`latent_attention_split_kernel`, `tq_latent_attention_split_kernel`):
+/// four per key of a chunk of `ATTENTION_CHUNK_KEYS`.
+const LATENT_SPLIT_THREADS: u32 = 4 * ATTENTION_CHUNK_KEYS as u32;
 /// `ATTENTION_GQA_MAX_GROUP` / `ATTENTION_GQA_THREADS` in `kernels.cu`:
 /// the grouped-query split decode attention, which serves 64- and
 /// 128-dimension heads with at most 8 query heads per KV head.
@@ -6170,7 +6175,7 @@ impl CudaKernels {
                 u32::try_from(head_count.div_ceil(TQ_MAX_GROUP)).map_err(|_| overflow())?,
                 1,
             ),
-            block_dim: (ATTENTION_SPLIT_THREADS, 1, 1),
+            block_dim: (LATENT_SPLIT_THREADS, 1, 1),
             // The rotated queries of up to `TQ_MAX_GROUP` heads.
             shared_mem_bytes: u32::try_from(4 * head_count.min(TQ_MAX_GROUP) * k_width)
                 .map_err(|_| overflow())?,
@@ -6266,7 +6271,7 @@ impl CudaKernels {
                 u32::try_from(head_count.div_ceil(TQ_MAX_GROUP)).map_err(|_| overflow())?,
                 1,
             ),
-            block_dim: (ATTENTION_SPLIT_THREADS, 1, 1),
+            block_dim: (LATENT_SPLIT_THREADS, 1, 1),
             // The queries of up to `TQ_MAX_GROUP` heads.
             shared_mem_bytes: u32::try_from(4 * head_count.min(TQ_MAX_GROUP) * k_width)
                 .map_err(|_| overflow())?,

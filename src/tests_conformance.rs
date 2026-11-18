@@ -2829,6 +2829,16 @@ fn latent_decode_attention_times() {
         end.record(kernels.stream()).unwrap();
         start.elapsed_ms(&end).unwrap() * 1e3 / repeats as f32
     };
+    for name in [
+        "latent_attention_split_kernel",
+        "tq_latent_attention_split_kernel",
+    ] {
+        let [registers, local, shared] = kernels.kernel_resources(name).unwrap();
+        eprintln!(
+            "{name}: {registers} registers, {local} bytes of local memory per thread, \
+             {shared} bytes of static shared memory"
+        );
+    }
     let (heads, width, latent, group) = (16u64, 576u64, 512u64, 64u64);
     let q = upload(
         &kernels,
