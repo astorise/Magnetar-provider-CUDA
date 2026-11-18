@@ -2319,8 +2319,8 @@ fn long_context_kernel_times() {
 }
 
 /// Device time of one decode step's attention -- a query row over a
-/// history of each length -- in f32 stores and in `tq4` stores with every
-/// row on codes and with an exact head of 1,024 rows
+/// history of each length -- in f32 stores and in `tq4` and `tq3` stores
+/// with every row on codes and with an exact head of 1,024 rows
 /// (`keep-turboquant-kv-head-exact`), for Qwen2.5-0.5B's heads (14 query,
 /// 2 KV, 64 wide) and Mistral 7B's (32, 8, 128), with the bandwidth each
 /// reaches on the bytes it must read. Not a conformance check: run it with
@@ -2348,6 +2348,21 @@ fn decode_attention_times() {
         end.record(kernels.stream()).unwrap();
         start.elapsed_ms(&end).unwrap() * 1e3 / repeats as f32
     };
+    // Local memory per thread means an array left the registers.
+    for name in [
+        "attention_split_gqa_kernel",
+        "attention_split_gqa128_kernel",
+        "attention_combine_kernel",
+        "tq_attention_split_grouped_kernel",
+        "tq_attention_split_kernel",
+        "tq_rotate_back_kernel",
+    ] {
+        let [registers, local, shared] = kernels.kernel_resources(name).unwrap();
+        eprintln!(
+            "{name}: {registers} registers, {local} bytes of local memory per thread, \
+             {shared} bytes of static shared memory"
+        );
+    }
     for (label, heads, kv_heads, dim) in [
         ("Qwen2.5-0.5B", 14u64, 2u64, 64u64),
         ("Mistral 7B", 32, 8, 128),
@@ -2383,10 +2398,10 @@ fn decode_attention_times() {
                 })
             };
             let f32_us = attend(&upload(&kernels, &k_rows), &upload(&kernels, &v_rows));
-            let tq = |exact: u64| {
+            let tq = |precision: KvStorePrecision, exact: u64| {
                 let store = |tensor: &HostTensor| {
                     let mut store = kernels
-                        .tq_zeros_with_exact_head(&[keys, width], KvStorePrecision::Tq4, dim, exact)
+                        .tq_zeros_with_exact_head(&[keys, width], precision, dim, exact)
                         .unwrap();
                     kernels
                         .kv_write(&mut store, &upload(&kernels, tensor), 0)
@@ -2395,23 +2410,34 @@ fn decode_attention_times() {
                 };
                 attend(&store(&k_rows), &store(&v_rows))
             };
-            let (codes_us, head_us) = (tq(0), tq(1024));
             // The bytes read: K and V rows in f32; codes and a norm per
-            // head row in tq4, with the head's rows in f32.
+            // head row in TurboQuant, with the head's rows in f32.
             let f32_bytes = (2 * keys * width * 4) as f32;
-            let tq_bytes = |exact: u64| {
+            let tq_bytes = |bits: u64, exact: u64| {
                 let exact = exact.min(keys);
-                let codes = (keys - exact) * kv_heads * (dim / 2 + 4);
+                let codes = (keys - exact) * kv_heads * (dim * bits / 8 + 4);
                 (2 * (codes + exact * width * 4)) as f32
             };
-            eprintln!(
-                "decode attention, {label}, {keys} keys: f32 {f32_us:.1} us ({:.0} GB/s), \
-                 tq4 {codes_us:.1} us ({:.0} GB/s), tq4 with a 1,024-row head {head_us:.1} us \
-                 ({:.0} GB/s)",
-                f32_bytes / f32_us / 1e3,
-                tq_bytes(0) / codes_us / 1e3,
-                tq_bytes(1024) / head_us / 1e3,
+            let mut line = format!(
+                "decode attention, {label}, {keys} keys: f32 {f32_us:.1} us ({:.0} GB/s)",
+                f32_bytes / f32_us / 1e3
             );
+            for (precision, bits) in [(KvStorePrecision::Tq4, 4), (KvStorePrecision::Tq3, 3)] {
+                for exact in [0u64, 1024] {
+                    let us = tq(precision, exact);
+                    line.push_str(&format!(
+                        ", {}{} {us:.1} us ({:.0} GB/s)",
+                        precision.as_str(),
+                        if exact > 0 {
+                            " with a 1,024-row head"
+                        } else {
+                            ""
+                        },
+                        tq_bytes(bits, exact) / us / 1e3
+                    ));
+                }
+            }
+            eprintln!("{line}");
         }
     }
 }

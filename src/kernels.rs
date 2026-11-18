@@ -1419,6 +1419,19 @@ impl CudaKernels {
         Ok(Some((scratch, terms)))
     }
 
+    /// A Kernel's registers per thread, local memory per thread and static
+    /// shared memory per block, in bytes, as compiled for this Device
+    /// (diagnostics).
+    #[cfg(test)]
+    pub(crate) fn kernel_resources(&self, name: &'static str) -> Result<[i32; 3], CudaError> {
+        let function = self.function(name)?;
+        Ok([
+            function.num_regs()?,
+            function.local_size_bytes()?,
+            function.shared_size_bytes()?,
+        ])
+    }
+
     fn function(&self, name: &'static str) -> Result<CudaFunction, CudaError> {
         let mut functions = self.functions.lock().unwrap();
         if let Some(function) = functions.get(name) {

@@ -6296,8 +6296,13 @@ extern "C" __global__ void tq_attention_split_grouped_kernel(
                 }
             }
             float offset = v_offsets[kv_head * value_dimension + d];
-            for (unsigned int g = 0; g < group; g++) {
-                q_shared[g * v_dim + d] = (acc[g] - exact_sum[g] * offset) * v_signs[d];
+            // Constant indices into `acc`: indexed at run time, the array
+            // would leave the registers for local memory, in every loop.
+#pragma unroll
+            for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
+                if (g < group) {
+                    q_shared[g * v_dim + d] = (acc[g] - exact_sum[g] * offset) * v_signs[d];
+                }
             }
         }
     }
