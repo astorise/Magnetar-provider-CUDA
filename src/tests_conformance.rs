@@ -1288,7 +1288,7 @@ fn turboquant_kv_stores_round_trip_and_attend_like_the_cpu() {
                         .unwrap();
                     assert_close(&download(&kernels, &actual), &expected);
                 }
-                kernels.set_tq_decode_schedule(TqDecodeSchedule::Split);
+                kernels.set_tq_decode_schedule(TqDecodeSchedule::Unstaged);
             }
         }
     }
@@ -1416,7 +1416,7 @@ fn turboquant_exact_heads_attend_like_the_cpu() {
                         .unwrap();
                     assert_close(&download(&kernels, &actual), &expected);
                 }
-                kernels.set_tq_decode_schedule(TqDecodeSchedule::Split);
+                kernels.set_tq_decode_schedule(TqDecodeSchedule::Unstaged);
             }
         }
     }
@@ -2630,7 +2630,7 @@ fn decode_attention_times() {
                     ));
                 }
             }
-            kernels.set_tq_decode_schedule(TqDecodeSchedule::Split);
+            kernels.set_tq_decode_schedule(TqDecodeSchedule::Unstaged);
             eprintln!("{line}");
         }
     }

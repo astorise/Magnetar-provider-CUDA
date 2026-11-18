@@ -402,8 +402,10 @@ const TQ_STAGED_MAX_DIMENSION: u64 = 128;
 const TQ_MAX_SPLITS: u64 = 32;
 
 /// How decode attention over TurboQuant stores is scheduled
-/// (`speed-up-decode-attention-on-codes`). Only the conformance and timing
-/// tests pick anything but [`TqDecodeSchedule::Split`].
+/// (`speed-up-decode-attention-on-codes`). [`TqDecodeSchedule::Unstaged`]
+/// unless a conformance or timing test picks another: staging the codes
+/// and splitting the history did not make the Kernel faster (run
+/// 44299614540).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TqDecodeSchedule {
     /// The staged Kernel, its history split over a bounded number of
@@ -803,7 +805,7 @@ impl CudaKernels {
             multiprocessors: context
                 .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
                 .map_or(1, |count| count.max(1) as u64),
-            tq_decode_schedule: std::sync::atomic::AtomicU8::new(TqDecodeSchedule::Split as u8),
+            tq_decode_schedule: std::sync::atomic::AtomicU8::new(TqDecodeSchedule::Unstaged as u8),
             tq_staged_occupancy: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         })
     }
@@ -821,9 +823,9 @@ impl CudaKernels {
             .tq_decode_schedule
             .load(std::sync::atomic::Ordering::Relaxed)
         {
+            0 => TqDecodeSchedule::Split,
             1 => TqDecodeSchedule::ChunkPerBlock,
-            2 => TqDecodeSchedule::Unstaged,
-            _ => TqDecodeSchedule::Split,
+            _ => TqDecodeSchedule::Unstaged,
         }
     }
 
