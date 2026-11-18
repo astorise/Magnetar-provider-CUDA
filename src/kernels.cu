@@ -2103,12 +2103,15 @@ __device__ __forceinline__ void attention_split_gqa_body(
     const unsigned long long* step_offset,
     float score_scale
 ) {
-    // K rows padded to D + 1 floats: a warp scoring 32 consecutive keys
-    // reads 32 distinct banks.
-    __shared__ float k_s[KEYS][D + 1];
-    __shared__ float v_s[KEYS][D];
-    __shared__ float q_s[ATTENTION_GQA_MAX_GROUP][D];
-    __shared__ float p_s[ATTENTION_GQA_MAX_GROUP][KEYS];
+    // K rows padded to D + 4 floats: whole float4s, and the eight threads
+    // of each quarter-warp phase of a float4 load read distinct banks.
+    // The weights are key-major, the group's heads contiguous, so a thread
+    // loads four heads' weights of a key at once
+    // (`speed-up-decode-attention-on-codes`, decision 5).
+    __shared__ __align__(16) float k_s[KEYS][D + 4];
+    __shared__ __align__(16) float v_s[KEYS][D];
+    __shared__ __align__(16) float q_s[ATTENTION_GQA_MAX_GROUP][D];
+    __shared__ __align__(16) float p_s[KEYS][ATTENTION_GQA_MAX_GROUP];
     __shared__ float stats[ATTENTION_GQA_MAX_GROUP][2];
     if (step_offset) {
         kv_seq_len += *step_offset;
@@ -2174,17 +2177,40 @@ __device__ __forceinline__ void attention_split_gqa_body(
     }
     __syncthreads();
 
-    // Scores: pair (g, j) for key j of head g; a warp takes 32 keys of one
-    // head.
-    for (unsigned int pair = tid; pair < group * KEYS; pair += ATTENTION_GQA_THREADS) {
-        unsigned int g = pair / KEYS;
-        unsigned int j = pair % KEYS;
-        float dot = 0.0f;
-#pragma unroll 16
-        for (unsigned int d = 0; d < D; d++) {
-            dot += q_s[g][d] * k_s[j][d];
+    // Scores: thread (j, h) takes key j against SCORE_HEADS heads from
+    // h * SCORE_HEADS on, each float4 of the key's row feeding every head
+    // (a warp's threads share their heads, so the queries' loads are
+    // broadcasts). Each dot product is summed in the order of the
+    // dimensions, as one thread per (head, key) did.
+    constexpr int SCORE_HEADS = ATTENTION_GQA_MAX_GROUP * KEYS / ATTENTION_GQA_THREADS;
+    {
+        unsigned int j = tid % KEYS;
+        unsigned int first_score_head = (tid / KEYS) * SCORE_HEADS;
+        float dot[SCORE_HEADS];
+#pragma unroll
+        for (int h = 0; h < SCORE_HEADS; h++) {
+            dot[h] = 0.0f;
         }
-        p_s[g][j] = j < count ? dot * scale : neg_inf();
+        const float4* k_row = (const float4*)k_s[j];
+#pragma unroll 4
+        for (int c = 0; c < D / 4; c++) {
+            float4 key = k_row[c];
+#pragma unroll
+            for (int h = 0; h < SCORE_HEADS; h++) {
+                float4 query = ((const float4*)q_s[first_score_head + h])[c];
+                dot[h] = fmaf(query.x, key.x, dot[h]);
+                dot[h] = fmaf(query.y, key.y, dot[h]);
+                dot[h] = fmaf(query.z, key.z, dot[h]);
+                dot[h] = fmaf(query.w, key.w, dot[h]);
+            }
+        }
+#pragma unroll
+        for (int h = 0; h < SCORE_HEADS; h++) {
+            unsigned int g = first_score_head + h;
+            if (g < group) {
+                p_s[j][g] = j < count ? dot[h] * scale : neg_inf();
+            }
+        }
     }
     __syncthreads();
 
@@ -2194,7 +2220,7 @@ __device__ __forceinline__ void attention_split_gqa_body(
         float max_value = neg_inf();
 #pragma unroll
         for (int i = 0; i < KEYS / 32; i++) {
-            score[i] = p_s[g][lane + 32 * i];
+            score[i] = p_s[lane + 32 * i][g];
             max_value = fmaxf(max_value, score[i]);
         }
         for (int offset = 16; offset > 0; offset >>= 1) {
@@ -2211,7 +2237,7 @@ __device__ __forceinline__ void attention_split_gqa_body(
         }
 #pragma unroll
         for (int i = 0; i < KEYS / 32; i++) {
-            p_s[g][lane + 32 * i] = score[i] / sum;
+            p_s[lane + 32 * i][g] = score[i] / sum;
         }
         if (lane == 0) {
             stats[g][0] = max_value;
@@ -2220,21 +2246,42 @@ __device__ __forceinline__ void attention_split_gqa_body(
     }
     __syncthreads();
 
-    // Weighted sums of V: output (g, d), a warp covering 32 dimensions of
-    // one head.
-    for (unsigned int e = tid; e < group * D; e += ATTENTION_GQA_THREADS) {
-        unsigned int g = e / D;
-        unsigned int d = e % D;
-        float acc = 0.0f;
-#pragma unroll 16
-        for (unsigned int j = 0; j < KEYS; j++) {
-            acc += p_s[g][j] * v_s[j][d];
+    // Weighted sums of V: thread (d, h) takes coordinate d of VALUE_HEADS
+    // heads from h * VALUE_HEADS on, each V value feeding every head and
+    // each float4 of weights four heads. Summed in key order, as one thread
+    // per (head, coordinate) did.
+    constexpr int VALUE_HEADS = ATTENTION_GQA_MAX_GROUP * D / ATTENTION_GQA_THREADS;
+    {
+        unsigned int d = tid % D;
+        unsigned int first_value_head = (tid / D) * VALUE_HEADS;
+        float acc[VALUE_HEADS];
+#pragma unroll
+        for (int h = 0; h < VALUE_HEADS; h++) {
+            acc[h] = 0.0f;
         }
-        float* out = partial + ((first_head + g) * chunks + chunk) * (D + 2);
-        out[d] = acc;
-        if (d == 0) {
-            out[D] = stats[g][0];
-            out[D + 1] = stats[g][1];
+#pragma unroll 8
+        for (int j = 0; j < KEYS; j++) {
+            float value = v_s[j][d];
+#pragma unroll
+            for (int h4 = 0; h4 < VALUE_HEADS / 4; h4++) {
+                float4 weight = ((const float4*)p_s[j])[first_value_head / 4 + h4];
+                acc[4 * h4] = fmaf(weight.x, value, acc[4 * h4]);
+                acc[4 * h4 + 1] = fmaf(weight.y, value, acc[4 * h4 + 1]);
+                acc[4 * h4 + 2] = fmaf(weight.z, value, acc[4 * h4 + 2]);
+                acc[4 * h4 + 3] = fmaf(weight.w, value, acc[4 * h4 + 3]);
+            }
+        }
+#pragma unroll
+        for (int h = 0; h < VALUE_HEADS; h++) {
+            unsigned int g = first_value_head + h;
+            if (g < group) {
+                float* out = partial + ((first_head + g) * chunks + chunk) * (D + 2);
+                out[d] = acc[h];
+                if (d == 0) {
+                    out[D] = stats[g][0];
+                    out[D + 1] = stats[g][1];
+                }
+            }
         }
     }
 }
