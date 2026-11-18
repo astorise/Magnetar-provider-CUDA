@@ -45,7 +45,7 @@ use magnetar_kernel::{
     kernel::KernelObservation, kernel::KernelObservationKind, kernel::KernelResult,
     kernel::KernelResultStatus,
 };
-use magnetar_provider_api::{ExecutionPlanId, HostTensor};
+use magnetar_provider_api::{ExecutionPlanId, HostTensor, KvStorePrecision};
 use magnetar_provider_api::{
     ProviderCancellationOutcome, ProviderExecutionHandle, ProviderExecutionId,
     ProviderExecutionRequest, ProviderExecutionResult, ProviderExecutionStatus, SchedulingState,
@@ -547,6 +547,36 @@ impl CudaExecutor {
 
     /// See [`ProviderExecutionApi::write_zeroed_tensor`]: the zeros are set
     /// on the Device, replacing whatever this Provider held for `id`.
+    /// See [`ProviderExecutionApi::write_zeroed_kv_store`]: a TurboQuant
+    /// store of codes and norms (`turboquant-kv-history`); an f32 one for
+    /// `KvStorePrecision::F32`.
+    pub fn write_zeroed_kv_store(
+        &self,
+        id: &TensorResourceId,
+        shape: &[u64],
+        precision: KvStorePrecision,
+        head_dimension: u64,
+    ) -> Result<bool, ProviderExecutionError> {
+        let buffer = match precision {
+            KvStorePrecision::F32 => self.kernels.zeros(shape),
+            _ => self.kernels.tq_zeros(shape, precision, head_dimension),
+        }
+        .map_err(|error| {
+            ProviderExecutionError::new(
+                ProviderExecutionErrorCode::MaterializationFailed,
+                ProviderExecutionPhase::Submit,
+                self.provider_binding(),
+                Some(self.device_binding()),
+                format!(
+                    "CUDA {} KV store allocation failed: {error}",
+                    precision.as_str()
+                ),
+            )
+        })?;
+        self.storage.lock().unwrap().insert(id.clone(), buffer);
+        Ok(true)
+    }
+
     pub fn write_zeroed_tensor(
         &self,
         id: &TensorResourceId,
@@ -1250,6 +1280,7 @@ impl CudaExecutor {
                     shape,
                     bf16: None,
                     q8: None,
+                    tq: None,
                 },
             );
         }
@@ -1271,6 +1302,11 @@ impl CudaExecutor {
             // other compact ones expanded per call.
             "moe-experts" => index >= 2,
             "embedding" => index == 0,
+            // TurboQuant KV stores (`turboquant-kv-history`): `kv-write`
+            // writes its store's codes and attention reads K and V codes
+            // or dequantizes them for the call; neither is expanded for good.
+            "kv-write" => index == 0,
+            "attention" => index == 1 || index == 2,
             _ => false,
         };
         let mut storage = self.storage.lock().unwrap();
@@ -1650,8 +1686,37 @@ impl CudaExecutor {
                             });
                         }
                     };
-                    self.kernels
-                        .attention_valued(
+                    // `cache-latent-attention-history`: V heads wider than
+                    // the value.
+                    let value_stride = match invocation.attributes.get("value_head_stride") {
+                        None => None,
+                        Some(OperatorAttributeValue::Integer(stride)) if *stride > 0 => {
+                            Some(*stride as u64)
+                        }
+                        Some(other) => {
+                            return Err(KernelError::KernelAttributeUnsupported {
+                                attribute: format!(
+                                    "value_head_stride {other:?} must be a positive integer"
+                                ),
+                            });
+                        }
+                    };
+                    match value_stride {
+                        Some(stride) => self.kernels.attention_strided_values(
+                            q,
+                            k,
+                            v,
+                            head_count,
+                            head_dimension,
+                            value_dimension,
+                            stride,
+                            kv_head_count,
+                            window_size,
+                            causal,
+                            key_count,
+                            scale,
+                        ),
+                        None => self.kernels.attention_valued(
                             q,
                             k,
                             v,
@@ -1663,7 +1728,21 @@ impl CudaExecutor {
                             causal,
                             key_count,
                             scale,
-                        )
+                        ),
+                    }
+                    .map_err(KernelError::from)?
+                }
+                // `cache-latent-attention-history`.
+                "batched-matmul" => {
+                    let groups = Self::attribute_integer(&invocation.attributes, "group_count")
+                        .filter(|groups| *groups > 0)
+                        .ok_or_else(|| KernelError::KernelAttributeUnsupported {
+                            attribute: "group_count".into(),
+                        })?;
+                    let transpose_b =
+                        Self::attribute_bool(&invocation.attributes, "transpose_b", false);
+                    self.kernels
+                        .batched_matmul(get(0)?, get(1)?, groups, transpose_b)
                         .map_err(KernelError::from)?
                 }
                 "softmax" => {
@@ -2317,6 +2396,16 @@ impl ProviderExecutionApi for CudaExecutor {
         shape: &[u64],
     ) -> Result<bool, ProviderExecutionError> {
         CudaExecutor::write_zeroed_tensor(self, id, shape).map(|()| true)
+    }
+
+    fn write_zeroed_kv_store(
+        &self,
+        id: &TensorResourceId,
+        shape: &[u64],
+        precision: KvStorePrecision,
+        head_dimension: u64,
+    ) -> Result<bool, ProviderExecutionError> {
+        CudaExecutor::write_zeroed_kv_store(self, id, shape, precision, head_dimension)
     }
 
     fn write_tensor_value_admitted(

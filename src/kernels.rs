@@ -25,6 +25,7 @@ use cudarc::driver::{
 use cudarc::nvrtc::compile_ptx;
 use magnetar_core::operator::{RopeBandedFrequencyScaling, RopeYarnFrequencyScaling};
 use magnetar_provider_api::HostTensor;
+use magnetar_provider_api::{KvStorePrecision, turboquant_codebook, turboquant_signs};
 use magnetar_provider_api::{packed_weight::PackedWeight, packed_weight::PackedWeightFormat};
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -259,6 +260,30 @@ pub struct CudaDeviceBuffer {
     /// A packed `Q8_0` weight (`execute-direct-quantized-weights`), stored
     /// as the checkpoint stored it: no Kernel reads `slice` then either.
     pub(crate) q8: Option<CudaQ8Weight>,
+    /// A TurboQuant KV store (`turboquant-kv-history`): no Kernel reads
+    /// `slice`; `kv-write` and attention read the codes, every other read
+    /// dequantizes them.
+    pub(crate) tq: Option<CudaTqStore>,
+}
+
+/// A TurboQuant KV store's device form: per row and head, the packed
+/// centroid indices and the f32 norm of `magnetar_provider_api::turboquant`,
+/// with the signs and the codebook of its head width and precision.
+pub struct CudaTqStore {
+    /// `[capacity][heads][head_dimension * bits / 8]` bytes.
+    pub(crate) codes: CudaSlice<u8>,
+    /// `[capacity][heads]` norms.
+    pub(crate) norms: CudaSlice<f32>,
+    /// `[heads][head_dimension]`: the offsets the write at row 0 sets
+    /// (`tq_offsets_kernel`), zeros before it.
+    pub(crate) offsets: CudaSlice<f32>,
+    pub(crate) precision: KvStorePrecision,
+    pub(crate) bits: u32,
+    pub(crate) head_dimension: u64,
+    pub(crate) heads: u64,
+    pub(crate) signs: CudaSlice<f32>,
+    pub(crate) centroids: CudaSlice<f32>,
+    pub(crate) boundaries: CudaSlice<f32>,
 }
 
 /// A `Q8_0` matrix on the device: its signed 8-bit quants in stored
@@ -295,6 +320,9 @@ struct PackedRows {
 impl CudaDeviceBuffer {
     /// Elements, compact or not.
     pub fn len(&self) -> usize {
+        if self.tq.is_some() {
+            return self.shape.iter().product::<u64>() as usize;
+        }
         match (&self.bf16, &self.q8) {
             (Some(bf16), _) => bf16.len(),
             (None, Some(q8)) => (q8.stored_rows * q8.stored_cols) as usize,
@@ -310,7 +338,17 @@ impl CudaDeviceBuffer {
     /// packed `Q8_0` weight. Only Kernels that read a compact operand
     /// accept one.
     pub fn is_compact(&self) -> bool {
-        self.bf16.is_some() || self.q8.is_some()
+        self.bf16.is_some() || self.q8.is_some() || self.tq.is_some()
+    }
+
+    /// Whether this is a TurboQuant KV store (`turboquant-kv-history`).
+    pub fn is_tq(&self) -> bool {
+        self.tq.is_some()
+    }
+
+    /// The precision of a TurboQuant KV store.
+    pub fn kv_store_precision(&self) -> Option<KvStorePrecision> {
+        self.tq.as_ref().map(|tq| tq.precision)
     }
 
     /// Whether the values are a packed `Q8_0` weight.
@@ -328,6 +366,22 @@ const Q8_MATMUL_MAX_ROWS: u64 = 64;
 /// rows a replayed bucketed prefill skips in the packed row matmuls
 /// (`replay-bucketed-prefill`): their outputs are never read.
 pub const PADDING_ROWS_ATTRIBUTE: &str = "padding_rows";
+
+/// Dequantized TurboQuant K and V scratch, by role (0 K, 1 V) and shape.
+type TqScratch = std::collections::BTreeMap<(u8, Vec<u64>), CudaSlice<f32>>;
+
+/// `TQ_MAX_GROUP` in `kernels.cu`: the most query heads one block of the
+/// grouped TurboQuant decode attention serves.
+const TQ_MAX_GROUP: u64 = 8;
+
+/// `TQ_MAX_DIM` in `kernels.cu`: the widest TurboQuant head.
+const TQ_MAX_DIMENSION: u64 = 512;
+
+/// Threads of a TurboQuant block over a `head_dimension`-wide head: a power
+/// of two, at most `TQ_MAX_THREADS` (256) in `kernels.cu`.
+fn tq_threads(head_dimension: u64) -> u32 {
+    head_dimension.clamp(32, 256) as u32
+}
 /// Output columns per warp of `q4k_matmul_rows_kernel` (`Q4K_COLS`) and
 /// `q6k_matmul_rows_kernel` (`Q6K_COLS`).
 const Q4K_MATMUL_COLS: u64 = 2;
@@ -454,6 +508,10 @@ pub struct CudaKernels {
     /// then every buffer it outgrew. A captured step may still read an
     /// outgrown one, so none is freed before this Provider.
     attention_scratch: std::sync::Mutex<AttentionScratch>,
+    /// Dequantized TurboQuant K and V (`turboquant-kv-history`) for
+    /// attention that does not read codes, by role (0 K, 1 V) and store
+    /// shape: allocated outside capture, then reused.
+    tq_scratch: std::sync::Mutex<TqScratch>,
     /// The bfloat16 hi and lo terms of a pipelined Tensor Core matmul's
     /// `a`: the current buffer, then every buffer it outgrew (kept until
     /// this Provider drops, like the attention scratch).
@@ -669,6 +727,7 @@ impl CudaKernels {
             peer_access: std::sync::atomic::AtomicBool::new(false),
             embedding_flag: std::sync::Mutex::new(None),
             attention_scratch: std::sync::Mutex::new((None, Vec::new())),
+            tq_scratch: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             split_scratch: std::sync::Mutex::new((None, Vec::new())),
             moe_scratch: std::sync::Mutex::new((None, Vec::new())),
             int8_activations: std::sync::atomic::AtomicBool::new(
@@ -1319,6 +1378,7 @@ impl CudaKernels {
             shape: tensor.shape.clone(),
             bf16: None,
             q8: None,
+            tq: None,
         })
     }
 
@@ -1342,6 +1402,7 @@ impl CudaKernels {
             shape: shape.to_vec(),
             bf16: None,
             q8: None,
+            tq: None,
         })
     }
 
@@ -1386,12 +1447,16 @@ impl CudaKernels {
             shape: tensor.shape.clone(),
             bf16: Some(bf16),
             q8: None,
+            tq: None,
         })
     }
 
     /// The same values as a compact `buffer`, stored as f32: for a Kernel
     /// that only reads f32 operands.
     pub fn expand(&self, buffer: &CudaDeviceBuffer) -> Result<CudaDeviceBuffer, CudaError> {
+        if buffer.is_tq() {
+            return self.tq_expand(buffer);
+        }
         if buffer.is_q8() {
             return self.dequantize_q8(buffer);
         }
@@ -1450,6 +1515,7 @@ impl CudaKernels {
                     stored_cols: weight.stored_cols(),
                     transposed: weight.transposed(),
                 }),
+                tq: None,
             });
         }
         if matches!(
@@ -1475,6 +1541,7 @@ impl CudaKernels {
                     stored_cols: weight.stored_cols(),
                     transposed: weight.transposed(),
                 }),
+                tq: None,
             });
         }
         let blocks = weight.bytes().as_chunks::<34>().0;
@@ -1503,6 +1570,7 @@ impl CudaKernels {
                 stored_cols: weight.stored_cols(),
                 transposed: weight.transposed(),
             }),
+            tq: None,
         })
     }
 
@@ -1550,6 +1618,7 @@ impl CudaKernels {
                 stored_cols: weight.stored_cols(),
                 transposed: weight.transposed(),
             }),
+            tq: None,
         })
     }
 
@@ -1594,6 +1663,7 @@ impl CudaKernels {
                 stored_cols: weight.stored_cols(),
                 transposed: weight.transposed(),
             }),
+            tq: None,
         })
     }
 
@@ -1628,6 +1698,7 @@ impl CudaKernels {
                 stored_cols: weight.stored_cols(),
                 transposed: weight.transposed(),
             }),
+            tq: None,
         })
     }
 
@@ -1777,6 +1848,7 @@ impl CudaKernels {
             shape,
             bf16: None,
             q8: None,
+            tq: None,
         })
     }
 
@@ -1787,6 +1859,9 @@ impl CudaKernels {
     /// as an automatic step of every Kernel invocation.
     pub fn download(&self, buffer: &CudaDeviceBuffer) -> Result<HostTensor, CudaError> {
         self.forbid_in_capture("a device-to-host download")?;
+        if buffer.is_tq() {
+            return self.download(&self.tq_expand(buffer)?);
+        }
         if buffer.is_q8() {
             return self.download(&self.dequantize_q8(buffer)?);
         }
@@ -1948,6 +2023,9 @@ impl CudaKernels {
         rows: &CudaDeviceBuffer,
         row_offset: u64,
     ) -> Result<(), CudaError> {
+        if store.is_tq() {
+            return self.tq_kv_write(store, rows, row_offset);
+        }
         Self::require_f32(&[&*store, rows], "kv-write")?;
         let (capacity, width) = rows_cols_buf(store)?;
         let (count, row_width) = rows_cols_buf(rows)?;
@@ -2021,6 +2099,26 @@ impl CudaKernels {
     pub fn clone_buffer(&self, buffer: &CudaDeviceBuffer) -> Result<CudaDeviceBuffer, CudaError> {
         self.forbid_in_capture("a buffer copy")?;
         let slice = self.stream.clone_dtod(&buffer.slice)?;
+        if let Some(tq) = &buffer.tq {
+            return Ok(CudaDeviceBuffer {
+                slice,
+                shape: buffer.shape.clone(),
+                bf16: None,
+                q8: None,
+                tq: Some(CudaTqStore {
+                    codes: self.stream.clone_dtod(&tq.codes)?,
+                    norms: self.stream.clone_dtod(&tq.norms)?,
+                    offsets: self.stream.clone_dtod(&tq.offsets)?,
+                    precision: tq.precision,
+                    bits: tq.bits,
+                    head_dimension: tq.head_dimension,
+                    heads: tq.heads,
+                    signs: self.stream.clone_dtod(&tq.signs)?,
+                    centroids: self.stream.clone_dtod(&tq.centroids)?,
+                    boundaries: self.stream.clone_dtod(&tq.boundaries)?,
+                }),
+            });
+        }
         if buffer.is_q8() {
             return Err(CudaError::new(
                 CudaErrorCode::DTypeUnsupported,
@@ -2036,6 +2134,433 @@ impl CudaKernels {
             shape: buffer.shape.clone(),
             bf16,
             q8: None,
+            tq: None,
+        })
+    }
+
+    /// A zeroed TurboQuant KV store of `shape` (`[capacity, heads *
+    /// head_dimension]`) in `precision` (`turboquant-kv-history`): zero
+    /// norms, so every row reads back as zeros until `kv-write` writes it.
+    pub fn tq_zeros(
+        &self,
+        shape: &[u64],
+        precision: KvStorePrecision,
+        head_dimension: u64,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        self.forbid_in_capture("a device allocation")?;
+        let unsupported = |reason: String| CudaError::new(CudaErrorCode::ShapeUnsupported, reason);
+        let bits = precision.bits().ok_or_else(|| {
+            unsupported(format!(
+                "{} is not a TurboQuant precision",
+                precision.as_str()
+            ))
+        })?;
+        let &[capacity, width] = shape else {
+            return Err(unsupported(format!(
+                "a KV store is [capacity, width], not {shape:?}"
+            )));
+        };
+        if !precision.supports_head_dimension(head_dimension)
+            || head_dimension > TQ_MAX_DIMENSION
+            || !width.is_multiple_of(head_dimension)
+        {
+            return Err(unsupported(format!(
+                "a {} store of {width}-wide rows cannot hold {head_dimension}-wide heads",
+                precision.as_str()
+            )));
+        }
+        let heads = width / head_dimension;
+        let cells = usize::try_from(capacity * heads)
+            .map_err(|_| unsupported("the KV store does not fit in memory".into()))?;
+        let code_bytes = (head_dimension * u64::from(bits) / 8) as usize;
+        let codebook = turboquant_codebook(head_dimension, bits);
+        Ok(CudaDeviceBuffer {
+            slice: self.stream.alloc_zeros::<f32>(1)?,
+            shape: shape.to_vec(),
+            bf16: None,
+            q8: None,
+            tq: Some(CudaTqStore {
+                codes: self.stream.alloc_zeros::<u8>(cells * code_bytes)?,
+                norms: self.stream.alloc_zeros::<f32>(cells)?,
+                offsets: self.stream.alloc_zeros::<f32>(width as usize)?,
+                precision,
+                bits,
+                head_dimension,
+                heads,
+                signs: self.stream.clone_htod(&turboquant_signs(head_dimension))?,
+                centroids: self.stream.clone_htod(&codebook.centroids)?,
+                boundaries: self.stream.clone_htod(&codebook.boundaries)?,
+            }),
+        })
+    }
+
+    /// `kv-write` into a TurboQuant store: each head of each row quantized
+    /// in the kernel that writes it, at the captured step's advancing
+    /// offset (`turboquant-kv-history`).
+    fn tq_kv_write(
+        &self,
+        store: &mut CudaDeviceBuffer,
+        rows: &CudaDeviceBuffer,
+        row_offset: u64,
+    ) -> Result<(), CudaError> {
+        Self::require_f32(&[rows], "kv-write rows")?;
+        let (count, row_width) = rows_cols_buf(rows)?;
+        let &[capacity, width] = store.shape.as_slice() else {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!("a KV store is [capacity, width], not {:?}", store.shape),
+            ));
+        };
+        if row_width != width {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!("kv-write rows have width {row_width}, the store {width}"),
+            ));
+        }
+        if row_offset
+            .checked_add(count)
+            .is_none_or(|end| end > capacity)
+        {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!(
+                    "kv-write of {count} rows at {row_offset} exceeds the store's {capacity} rows"
+                ),
+            ));
+        }
+        let step_offset = self.advancing_offset("row_offset", capacity - (row_offset + count));
+        if count == 0 {
+            return Ok(());
+        }
+        let tq = store.tq.as_mut().expect("a TurboQuant store");
+        // The write at row 0 starts the history: it sets the offsets from
+        // the rows it computes (`tq_offsets_kernel`).
+        if row_offset == 0 && step_offset == 0 {
+            let padding = self.padding_rows(count);
+            let func = self.function("tq_offsets_kernel")?;
+            let mut args = self.stream.launch_builder(&func);
+            args.arg(&rows.slice)
+                .arg(&mut tq.offsets)
+                .arg(&width)
+                .arg(&count)
+                .arg(&padding);
+            unsafe { args.launch(LaunchConfig::for_num_elems(width as u32)) }?;
+        }
+        let func = self.function("tq_kv_write_kernel")?;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(&rows.slice)
+            .arg(&tq.offsets)
+            .arg(&mut tq.codes)
+            .arg(&mut tq.norms)
+            .arg(&tq.signs)
+            .arg(&tq.boundaries)
+            .arg(&tq.heads)
+            .arg(&tq.head_dimension)
+            .arg(&tq.bits)
+            .arg(&row_offset)
+            .arg(&step_offset);
+        let config = LaunchConfig {
+            grid_dim: (count as u32, tq.heads as u32, 1),
+            block_dim: (tq_threads(tq.head_dimension), 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { args.launch(config) }?;
+        Ok(())
+    }
+
+    /// Writes the values of `store`'s first `rows` rows, plus the captured
+    /// step's `step_offset` (a device address, or 0), into `out` as
+    /// `[capacity, width]` f32.
+    fn tq_dequantize_into(
+        &self,
+        store: &CudaDeviceBuffer,
+        out: &mut CudaSlice<f32>,
+        rows: u64,
+        step_offset: u64,
+    ) -> Result<(), CudaError> {
+        let tq = store.tq.as_ref().expect("a TurboQuant store");
+        let capacity = store.shape[0];
+        if capacity == 0 {
+            return Ok(());
+        }
+        let func = self.function("tq_dequantize_kernel")?;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(&tq.codes)
+            .arg(&tq.norms)
+            .arg(&tq.signs)
+            .arg(&tq.centroids)
+            .arg(&tq.offsets)
+            .arg(out)
+            .arg(&tq.heads)
+            .arg(&tq.head_dimension)
+            .arg(&tq.bits)
+            .arg(&rows)
+            .arg(&step_offset);
+        let config = LaunchConfig {
+            grid_dim: (capacity as u32, tq.heads as u32, 1),
+            block_dim: (tq_threads(tq.head_dimension), 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { args.launch(config) }?;
+        Ok(())
+    }
+
+    /// A TurboQuant store's values as an f32 buffer of its shape.
+    pub fn tq_expand(&self, store: &CudaDeviceBuffer) -> Result<CudaDeviceBuffer, CudaError> {
+        self.forbid_in_capture("a device allocation")?;
+        let len = store.shape.iter().product::<u64>() as usize;
+        let mut out = self.stream.alloc_zeros::<f32>(len.max(1))?;
+        self.tq_dequantize_into(store, &mut out, store.shape[0], 0)?;
+        Ok(CudaDeviceBuffer {
+            slice: out,
+            shape: store.shape.clone(),
+            bf16: None,
+            q8: None,
+            tq: None,
+        })
+    }
+
+    /// Attention reading TurboQuant K and/or V (`turboquant-kv-history`): a
+    /// decode step over two TurboQuant stores computes on the codes; any
+    /// other call reads the stores' first `key_count` rows dequantized into
+    /// scratch buffers kept per role and shape, so a captured step
+    /// allocates nothing, and runs the f32 attention.
+    #[allow(clippy::too_many_arguments)]
+    fn tq_attention(
+        &self,
+        q: &CudaDeviceBuffer,
+        k: &CudaDeviceBuffer,
+        v: &CudaDeviceBuffer,
+        [head_count, head_dimension]: [u64; 2],
+        value_dimension: Option<u64>,
+        kv_head_count: Option<u64>,
+        window_size: Option<u64>,
+        causal: bool,
+        key_count: Option<u64>,
+        scale: Option<f32>,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        Self::require_f32(&[q], "attention query")?;
+        let value_width = value_dimension.unwrap_or(head_dimension);
+        let kv_heads = kv_head_count.unwrap_or(head_count);
+        let (seq_len, q_width) = rows_cols_buf(q)?;
+        let kv_rows = k.shape.first().copied().unwrap_or(0);
+        if let (1, Some(kt), Some(vt)) = (seq_len, &k.tq, &v.tq)
+            && kt.head_dimension == head_dimension
+            && vt.head_dimension == value_width
+            && kt.heads == kv_heads
+            && vt.heads == kv_heads
+            && v.shape.first() == Some(&kv_rows)
+            && kv_heads > 0
+            && head_count.is_multiple_of(kv_heads)
+            && head_count * head_dimension == q_width
+            && window_size != Some(0)
+            && (window_size.is_none() || causal)
+            && scale.is_none_or(|scale| scale.is_finite() && scale > 0.0)
+        {
+            let kv_seq_len = key_count.unwrap_or(kv_rows);
+            if kv_seq_len == 0 || kv_seq_len > kv_rows {
+                return Err(CudaError::new(
+                    CudaErrorCode::ShapeUnsupported,
+                    format!("key_count {kv_seq_len} must lie in 1..={kv_rows}"),
+                ));
+            }
+            let step_offset = match key_count {
+                Some(_) => self.advancing_offset("key_count", kv_rows - kv_seq_len),
+                None => 0,
+            };
+            return self.tq_attention_decode(
+                q,
+                [kt, vt],
+                [
+                    kv_seq_len,
+                    head_count,
+                    kv_heads,
+                    head_dimension,
+                    value_width,
+                    kv_rows,
+                ],
+                causal,
+                window_size,
+                step_offset,
+                scale.unwrap_or(0.0),
+            );
+        }
+        // Read through dequantized scratch: the rows attention may read.
+        let rows = key_count.unwrap_or(kv_rows);
+        let step_offset = match key_count {
+            Some(_) => self.advancing_offset("key_count", kv_rows.saturating_sub(rows)),
+            None => 0,
+        };
+        let mut scratch = self.tq_scratch.lock().unwrap();
+        let mut take =
+            |role: u8, store: &CudaDeviceBuffer| -> Result<Option<CudaDeviceBuffer>, CudaError> {
+                if !store.is_tq() {
+                    return Ok(None);
+                }
+                let key = (role, store.shape.clone());
+                let mut slice = match scratch.remove(&key) {
+                    Some(slice) => slice,
+                    None => {
+                        self.forbid_in_capture("allocating a TurboQuant attention scratch buffer")?;
+                        let len = store.shape.iter().product::<u64>() as usize;
+                        self.stream.alloc_zeros::<f32>(len.max(1))?
+                    }
+                };
+                self.tq_dequantize_into(store, &mut slice, rows, step_offset)?;
+                Ok(Some(CudaDeviceBuffer {
+                    slice,
+                    shape: store.shape.clone(),
+                    bf16: None,
+                    q8: None,
+                    tq: None,
+                }))
+            };
+        let k_values = take(0, k)?;
+        let v_values = take(1, v)?;
+        drop(take);
+        let result = self.attention_valued(
+            q,
+            k_values.as_ref().unwrap_or(k),
+            v_values.as_ref().unwrap_or(v),
+            head_count,
+            head_dimension,
+            value_dimension,
+            kv_head_count,
+            window_size,
+            causal,
+            key_count,
+            scale,
+        );
+        for (role, values) in [(0u8, k_values), (1, v_values)] {
+            if let Some(values) = values {
+                scratch.insert((role, values.shape), values.slice);
+            }
+        }
+        result
+    }
+
+    /// Decode attention on the codes of TurboQuant K and V stores, one query
+    /// row: `tq_attention_split_kernel`, `attention_combine_kernel`, then
+    /// `tq_rotate_back_kernel`.
+    #[allow(clippy::too_many_arguments)]
+    fn tq_attention_decode(
+        &self,
+        q: &CudaDeviceBuffer,
+        [k, v]: [&CudaTqStore; 2],
+        [
+            kv_seq_len,
+            head_count,
+            kv_head_count,
+            head_dimension,
+            value_dimension,
+            kv_rows,
+        ]: [u64; 6],
+        causal: bool,
+        window_size: Option<u64>,
+        step_offset: u64,
+        score_scale: f32,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        let overflow = || {
+            CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                "attention launch size overflows a grid dimension",
+            )
+        };
+        let chunks = kv_rows.div_ceil(ATTENTION_CHUNK_KEYS).max(1);
+        let partial_len =
+            usize::try_from(head_count * chunks * (value_dimension + 2)).map_err(|_| overflow())?;
+        let mut scratch = self.attention_scratch.lock().unwrap();
+        if scratch
+            .0
+            .as_ref()
+            .is_none_or(|slice| slice.len() < partial_len)
+        {
+            self.forbid_in_capture("growing the attention scratch buffer")?;
+            // SAFETY: the split Kernel writes every partial of this launch
+            // before the combine Kernel reads it, on this same stream.
+            let grown = unsafe { self.stream.alloc::<f32>(partial_len.max(1 << 16)) }?;
+            if let Some(outgrown) = scratch.0.replace(grown) {
+                scratch.1.push(outgrown);
+            }
+        }
+        let partial = scratch.0.as_mut().expect("allocated above");
+        let mut out_dev = self
+            .alloc_output(usize::try_from(head_count * value_dimension).map_err(|_| overflow())?)?;
+        let causal_flag: i32 = if causal { 1 } else { 0 };
+        let window_arg: i64 = window_size.map(|w| w as i64).unwrap_or(-1);
+        let query_position_offset = kv_seq_len - 1;
+        // A block per KV head serves its grouped query heads when they are
+        // few enough (`TQ_MAX_GROUP`): every code is decoded once for them
+        // all. Otherwise a block per query head.
+        let group = head_count / kv_head_count;
+        let grouped = group <= TQ_MAX_GROUP;
+        let split = self.function(if grouped {
+            "tq_attention_split_grouped_kernel"
+        } else {
+            "tq_attention_split_kernel"
+        })?;
+        let mut args = self.stream.launch_builder(&split);
+        args.arg(&q.slice)
+            .arg(&k.codes)
+            .arg(&k.norms)
+            .arg(&k.centroids)
+            .arg(&k.signs)
+            .arg(&k.offsets)
+            .arg(&k.bits)
+            .arg(&v.codes)
+            .arg(&v.norms)
+            .arg(&v.centroids)
+            .arg(&v.bits)
+            .arg(&mut *partial)
+            .arg(&kv_seq_len)
+            .arg(&head_count)
+            .arg(&kv_head_count)
+            .arg(&head_dimension)
+            .arg(&causal_flag)
+            .arg(&window_arg)
+            .arg(&query_position_offset)
+            .arg(&chunks)
+            .arg(&step_offset)
+            .arg(&score_scale)
+            .arg(&value_dimension);
+        let config = LaunchConfig {
+            grid_dim: (
+                u32::try_from(chunks).map_err(|_| overflow())?,
+                u32::try_from(if grouped { kv_head_count } else { head_count })
+                    .map_err(|_| overflow())?,
+                1,
+            ),
+            block_dim: (ATTENTION_SPLIT_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { args.launch(config) }?;
+        self.combine_attention_partials(
+            &*partial,
+            &mut out_dev,
+            head_count,
+            value_dimension,
+            chunks,
+        )?;
+        let rotate = self.function("tq_rotate_back_kernel")?;
+        let mut args = self.stream.launch_builder(&rotate);
+        let group_size = head_count / kv_head_count;
+        args.arg(&mut out_dev)
+            .arg(&v.signs)
+            .arg(&v.offsets)
+            .arg(&value_dimension)
+            .arg(&group_size);
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(head_count).map_err(|_| overflow())?, 1, 1),
+            block_dim: (tq_threads(value_dimension), 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { args.launch(config) }?;
+        Ok(CudaDeviceBuffer {
+            slice: out_dev,
+            shape: vec![1, head_count * value_dimension],
+            bf16: None,
+            q8: None,
+            tq: None,
         })
     }
 
@@ -2063,6 +2588,7 @@ impl CudaKernels {
                 shape: a.shape.clone(),
                 bf16: None,
                 q8: None,
+                tq: None,
             });
         }
         let cols = *a.shape.last().ok_or_else(|| {
@@ -2101,6 +2627,7 @@ impl CudaKernels {
             shape: a.shape.clone(),
             bf16: None,
             q8: None,
+            tq: None,
         })
     }
 
@@ -2122,6 +2649,7 @@ impl CudaKernels {
             shape: a.shape.clone(),
             bf16: None,
             q8: None,
+            tq: None,
         })
     }
 
@@ -2185,6 +2713,7 @@ impl CudaKernels {
             shape,
             bf16: None,
             q8: None,
+            tq: None,
         })
     }
 
@@ -2201,6 +2730,7 @@ impl CudaKernels {
             shape: input.shape.clone(),
             bf16: None,
             q8: None,
+            tq: None,
         })
     }
 
@@ -2218,6 +2748,7 @@ impl CudaKernels {
             shape: input.shape.clone(),
             bf16: None,
             q8: None,
+            tq: None,
         })
     }
 
@@ -2245,6 +2776,7 @@ impl CudaKernels {
             shape: input.shape.clone(),
             bf16: None,
             q8: None,
+            tq: None,
         })
     }
 
@@ -2332,6 +2864,7 @@ impl CudaKernels {
             shape: a.shape.clone(),
             bf16: None,
             q8: None,
+            tq: None,
         })
     }
 
@@ -2367,6 +2900,7 @@ impl CudaKernels {
             shape: x.shape.clone(),
             bf16: None,
             q8: None,
+            tq: None,
         })
     }
 
@@ -2600,6 +3134,7 @@ impl CudaKernels {
             shape: vec![tokens, hidden],
             bf16: None,
             q8: None,
+            tq: None,
         })
     }
 
@@ -2739,6 +3274,7 @@ impl CudaKernels {
                 shape: vec![num_ids, dim],
                 bf16: None,
                 q8: None,
+                tq: None,
             });
         }
         // Data-dependent failure (an out-of-range or non-integer token id)
@@ -2760,6 +3296,7 @@ impl CudaKernels {
             shape: vec![num_ids, dim],
             bf16: None,
             q8: None,
+            tq: None,
         })
     }
 
@@ -2883,6 +3420,7 @@ impl CudaKernels {
             shape: input.shape.clone(),
             bf16: None,
             q8: None,
+            tq: None,
         })
     }
 
@@ -3133,6 +3671,7 @@ impl CudaKernels {
             shape: input.shape.clone(),
             bf16: None,
             q8: None,
+            tq: None,
         })
     }
 
@@ -3163,6 +3702,7 @@ impl CudaKernels {
             shape: input.shape.clone(),
             bf16: None,
             q8: None,
+            tq: None,
         })
     }
 
@@ -3299,6 +3839,7 @@ impl CudaKernels {
             shape: gate.shape.clone(),
             bf16: None,
             q8: None,
+            tq: None,
         })
     }
 
@@ -3390,6 +3931,7 @@ impl CudaKernels {
                     shape: vec![m, b_cols],
                     bf16: None,
                     q8: None,
+                    tq: None,
                 });
             }
         }
@@ -3445,6 +3987,7 @@ impl CudaKernels {
                     shape: vec![m, b_cols],
                     bf16: None,
                     q8: None,
+                    tq: None,
                 });
             }
         }
@@ -3496,6 +4039,7 @@ impl CudaKernels {
                     shape: vec![m, b_cols],
                     bf16: None,
                     q8: None,
+                    tq: None,
                 });
             }
         }
@@ -3546,6 +4090,7 @@ impl CudaKernels {
                 shape: vec![m, b_cols],
                 bf16: None,
                 q8: None,
+                tq: None,
             });
         }
         // Other packed weights: each projection through the packed matmul.
@@ -3599,6 +4144,7 @@ impl CudaKernels {
                 shape: vec![m, n],
                 bf16: None,
                 q8: None,
+                tq: None,
             });
         }
         if m >= MATMUL_TILE_MIN_ROWS
@@ -3631,6 +4177,7 @@ impl CudaKernels {
                 shape: vec![m, n],
                 bf16: None,
                 q8: None,
+                tq: None,
             });
         }
         let (name, grid_dim) = split_k_rows(
@@ -3667,6 +4214,7 @@ impl CudaKernels {
             shape: vec![m, n],
             bf16: None,
             q8: None,
+            tq: None,
         })
     }
 
@@ -3724,6 +4272,7 @@ impl CudaKernels {
             shape: vec![m, n],
             bf16: None,
             q8: None,
+            tq: None,
         })
     }
 
@@ -3783,6 +4332,7 @@ impl CudaKernels {
             shape: vec![m, n],
             bf16: None,
             q8: None,
+            tq: None,
         })
     }
 
@@ -3838,6 +4388,7 @@ impl CudaKernels {
             shape: vec![m, n],
             bf16: None,
             q8: None,
+            tq: None,
         }))
     }
 
@@ -3895,6 +4446,7 @@ impl CudaKernels {
             shape: vec![m, n],
             bf16: None,
             q8: None,
+            tq: None,
         }))
     }
 
@@ -3950,6 +4502,7 @@ impl CudaKernels {
             shape: vec![m, n],
             bf16: None,
             q8: None,
+            tq: None,
         }))
     }
 
@@ -4007,6 +4560,7 @@ impl CudaKernels {
             shape: vec![m, n],
             bf16: None,
             q8: None,
+            tq: None,
         })
     }
 
@@ -4059,6 +4613,7 @@ impl CudaKernels {
             shape: vec![m, n],
             bf16: None,
             q8: None,
+            tq: None,
         })
     }
 
@@ -4216,6 +4771,7 @@ impl CudaKernels {
                 shape: vec![m, n],
                 bf16: None,
                 q8: None,
+                tq: None,
             });
         }
         if m >= MATMUL_TILE_MIN_ROWS
@@ -4250,6 +4806,7 @@ impl CudaKernels {
                 shape: vec![m, n],
                 bf16: None,
                 q8: None,
+                tq: None,
             });
         }
         if b_col_stride == 1 && m <= MATMUL_SPLIT_K_MAX_ROWS {
@@ -4292,6 +4849,7 @@ impl CudaKernels {
                 shape: vec![m, n],
                 bf16: None,
                 q8: None,
+                tq: None,
             });
         }
         let func = self.function("matmul_kernel")?;
@@ -4313,6 +4871,7 @@ impl CudaKernels {
             shape: vec![m, n],
             bf16: None,
             q8: None,
+            tq: None,
         };
         match addend {
             Some(MatmulAddend::Row(addend) | MatmulAddend::Full(addend)) => {
@@ -4408,6 +4967,254 @@ impl CudaKernels {
         )
     }
 
+    /// `batched-matmul` (`cache-latent-attention-history`): `a [rows,
+    /// groups * k]` times `b` group by group, each group's block `[k, n]`
+    /// (`b [groups * k, n]`) or, with `transpose_b`, `[n, k]` used
+    /// transposed (`b [groups * n, k]`), giving `[rows, groups * n]`. f32
+    /// operands.
+    pub fn batched_matmul(
+        &self,
+        a: &CudaDeviceBuffer,
+        b: &CudaDeviceBuffer,
+        groups: u64,
+        transpose_b: bool,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        Self::require_f32(&[a, b], "batched-matmul")?;
+        if a.is_q8() || b.is_q8() || a.is_tq() || b.is_tq() {
+            return Err(CudaError::new(
+                CudaErrorCode::DTypeUnsupported,
+                "batched-matmul reads f32 operands",
+            ));
+        }
+        let (rows, a_cols) = rows_cols_buf(a)?;
+        let (b_rows, b_cols) = rows_cols_buf(b)?;
+        let fits = groups > 0
+            && a_cols.is_multiple_of(groups)
+            && b_rows.is_multiple_of(groups)
+            && if transpose_b {
+                b_cols == a_cols / groups
+            } else {
+                b_rows == a_cols
+            };
+        if !fits {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!(
+                    "batched-matmul of {groups} groups (transpose_b {transpose_b}) cannot take {:?} and {:?}",
+                    a.shape, b.shape
+                ),
+            ));
+        }
+        let k = a_cols / groups;
+        let n = if transpose_b { b_rows / groups } else { b_cols };
+        let len = rows * groups * n;
+
+        let mut out = self.alloc_output(len as usize)?;
+        if len > 0 && transpose_b {
+            // One warp per output value: each reads a weight row.
+            let func = self.function("batched_matmul_t_kernel")?;
+            let mut args = self.stream.launch_builder(&func);
+            args.arg(&a.slice)
+                .arg(&b.slice)
+                .arg(&mut out)
+                .arg(&rows)
+                .arg(&groups)
+                .arg(&k)
+                .arg(&n);
+            let warps_per_block = 4u64;
+            let config = LaunchConfig {
+                grid_dim: (
+                    u32::try_from(len.div_ceil(warps_per_block)).map_err(|_| {
+                        CudaError::new(
+                            CudaErrorCode::ShapeUnsupported,
+                            "batched-matmul launch size overflows a grid dimension",
+                        )
+                    })?,
+                    1,
+                    1,
+                ),
+                block_dim: (32 * warps_per_block as u32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe { args.launch(config) }?;
+        } else if len > 0 {
+            // One thread per output value: a warp reads a weight row's
+            // consecutive values.
+            let func = self.function("batched_matmul_kernel")?;
+            let mut args = self.stream.launch_builder(&func);
+            let transposed = 0i32;
+            args.arg(&a.slice)
+                .arg(&b.slice)
+                .arg(&mut out)
+                .arg(&rows)
+                .arg(&groups)
+                .arg(&k)
+                .arg(&n)
+                .arg(&transposed);
+            unsafe { args.launch(LaunchConfig::for_num_elems(len as u32)) }?;
+        }
+        Ok(CudaDeviceBuffer {
+            slice: out,
+            shape: vec![rows, groups * n],
+            bf16: None,
+            q8: None,
+            tq: None,
+        })
+    }
+
+    /// Attention whose V heads are `value_stride` wide, the value being
+    /// each head's leading `value_dimension` (`attention.value_head_stride`,
+    /// `cache-latent-attention-history`): V may be the key history. The
+    /// values are gathered into a scratch buffer kept per shape, so a
+    /// captured step allocates nothing, and the attention reads them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_strided_values(
+        &self,
+        q: &CudaDeviceBuffer,
+        k: &CudaDeviceBuffer,
+        v: &CudaDeviceBuffer,
+        head_count: u64,
+        head_dimension: u64,
+        value_dimension: Option<u64>,
+        value_stride: u64,
+        kv_head_count: Option<u64>,
+        window_size: Option<u64>,
+        causal: bool,
+        key_count: Option<u64>,
+        scale: Option<f32>,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        // TurboQuant stores (`turboquant-kv-history`): the rows attention
+        // may read, dequantized into scratch buffers kept per role and
+        // shape; a store read as both K and V once.
+        if k.is_tq() || v.is_tq() {
+            let kv_rows = k.shape.first().copied().unwrap_or(0);
+            let rows = key_count.unwrap_or(kv_rows);
+            let step_offset = match key_count {
+                Some(_) => self.advancing_offset("key_count", kv_rows.saturating_sub(rows)),
+                None => 0,
+            };
+            let take = |role: u8,
+                        store: &CudaDeviceBuffer|
+             -> Result<Option<CudaDeviceBuffer>, CudaError> {
+                if !store.is_tq() {
+                    return Ok(None);
+                }
+                let key = (role, store.shape.clone());
+                let reused = self.tq_scratch.lock().unwrap().remove(&key);
+                let mut slice = match reused {
+                    Some(slice) => slice,
+                    None => {
+                        self.forbid_in_capture("allocating a TurboQuant attention scratch buffer")?;
+                        let len = store.shape.iter().product::<u64>() as usize;
+                        self.stream.alloc_zeros::<f32>(len.max(1))?
+                    }
+                };
+                self.tq_dequantize_into(store, &mut slice, rows, step_offset)?;
+                Ok(Some(CudaDeviceBuffer {
+                    slice,
+                    shape: store.shape.clone(),
+                    bf16: None,
+                    q8: None,
+                    tq: None,
+                }))
+            };
+            let same = std::ptr::eq(k, v);
+            let k_values = take(3, k)?;
+            let v_values = if same { None } else { take(4, v)? };
+            let k_read = k_values.as_ref().unwrap_or(k);
+            let v_read = if same {
+                k_read
+            } else {
+                v_values.as_ref().unwrap_or(v)
+            };
+            let result = self.attention_strided_values(
+                q,
+                k_read,
+                v_read,
+                head_count,
+                head_dimension,
+                value_dimension,
+                value_stride,
+                kv_head_count,
+                window_size,
+                causal,
+                key_count,
+                scale,
+            );
+            let mut scratch = self.tq_scratch.lock().unwrap();
+            for (role, values) in [(3u8, k_values), (4, v_values)] {
+                if let Some(values) = values {
+                    scratch.insert((role, values.shape), values.slice);
+                }
+            }
+            return result;
+        }
+        Self::require_f32(&[v], "attention's strided values")?;
+        if v.is_q8() {
+            return Err(CudaError::new(
+                CudaErrorCode::DTypeUnsupported,
+                "attention reads strided values from f32 rows only",
+            ));
+        }
+        let heads = kv_head_count.unwrap_or(head_count);
+        let width = value_dimension.unwrap_or(head_dimension);
+        let (rows, cols) = rows_cols_buf(v)?;
+        if heads == 0 || width > value_stride || cols != heads * value_stride {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!(
+                    "V rows of {cols} values cannot hold {heads} heads of {value_stride} values \
+                     with {width}-value values"
+                ),
+            ));
+        }
+        let shape = vec![rows, heads * width];
+        let len = rows * heads * width;
+        let mut scratch = self.tq_scratch.lock().unwrap();
+        let key = (2u8, shape.clone());
+        let mut slice = match scratch.remove(&key) {
+            Some(slice) => slice,
+            None => {
+                self.forbid_in_capture("allocating a strided-values scratch buffer")?;
+                self.stream.alloc_zeros::<f32>((len as usize).max(1))?
+            }
+        };
+        if len > 0 {
+            let func = self.function("value_heads_kernel")?;
+            let mut args = self.stream.launch_builder(&func);
+            args.arg(&v.slice)
+                .arg(&mut slice)
+                .arg(&rows)
+                .arg(&heads)
+                .arg(&value_stride)
+                .arg(&width);
+            unsafe { args.launch(LaunchConfig::for_num_elems(len as u32)) }?;
+        }
+        let values = CudaDeviceBuffer {
+            slice,
+            shape,
+            bf16: None,
+            q8: None,
+            tq: None,
+        };
+        drop(scratch);
+        let result = self.attention_valued(
+            q,
+            k,
+            &values,
+            head_count,
+            head_dimension,
+            Some(width),
+            kv_head_count,
+            window_size,
+            causal,
+            key_count,
+            scale,
+        );
+        self.tq_scratch.lock().unwrap().insert(key, values.slice);
+        result
+    }
+
     /// [`Self::attention_scaled`] with V rows `value_dimension` wide per
     /// head (`attention.value_head_dimension`,
     /// `express-latent-attention-forms`): Q and K rows stay `head_dimension`
@@ -4430,6 +5237,20 @@ impl CudaKernels {
         key_count: Option<u64>,
         scale: Option<f32>,
     ) -> Result<CudaDeviceBuffer, CudaError> {
+        if k.is_tq() || v.is_tq() {
+            return self.tq_attention(
+                q,
+                k,
+                v,
+                [head_count, head_dimension],
+                value_dimension,
+                kv_head_count,
+                window_size,
+                causal,
+                key_count,
+                scale,
+            );
+        }
         Self::require_f32(&[q, k, v], "attention")?;
         let value_dimension = value_dimension.unwrap_or(head_dimension);
         let same_width = value_dimension == head_dimension;
@@ -4624,6 +5445,7 @@ impl CudaKernels {
                 shape: q.shape.clone(),
                 bf16: None,
                 q8: None,
+                tq: None,
             });
         }
         let tiled = match head_dimension {
@@ -4679,6 +5501,7 @@ impl CudaKernels {
                 shape: q.shape.clone(),
                 bf16: None,
                 q8: None,
+                tq: None,
             });
         }
 
@@ -4738,6 +5561,7 @@ impl CudaKernels {
                 shape: out_shape,
                 bf16: None,
                 q8: None,
+                tq: None,
             });
         }
         if self.is_capturing() {
@@ -4770,11 +5594,63 @@ impl CudaKernels {
             shape: out_shape,
             bf16: None,
             q8: None,
+            tq: None,
         })
     }
 }
 
 impl CudaKernels {
+    /// Merges each head's per-chunk partials (`value_dimension + 2` floats
+    /// per chunk) into `out_dev` with `attention_combine_kernel`.
+    fn combine_attention_partials(
+        &self,
+        partial: &CudaSlice<f32>,
+        out_dev: &mut CudaSlice<f32>,
+        head_count: u64,
+        value_dimension: u64,
+        chunks: u64,
+    ) -> Result<(), CudaError> {
+        let overflow = || {
+            CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                "attention launch size overflows a grid dimension",
+            )
+        };
+        let combine = self.function("attention_combine_kernel")?;
+        let weight_bytes = u32::try_from(chunks * 4).unwrap_or(u32::MAX);
+        let cache_weights = i32::from(weight_bytes <= ATTENTION_COMBINE_MAX_DYNAMIC_SHARED);
+        let mut args = self.stream.launch_builder(&combine);
+        // The partials and the output are V-wide: the combine Kernel's
+        // width is the value width.
+        args.arg(partial)
+            .arg(out_dev)
+            .arg(&head_count)
+            .arg(&value_dimension)
+            .arg(&chunks)
+            .arg(&cache_weights);
+        let config = LaunchConfig {
+            grid_dim: (u32::try_from(head_count).map_err(|_| overflow())?, 1, 1),
+            // Lanes of chunks per output dimension: up to 8, within 256
+            // threads for small heads, one lane past 1024 dimensions.
+            block_dim: (
+                u32::try_from(if value_dimension > 1024 {
+                    1024
+                } else {
+                    value_dimension * (256 / value_dimension).clamp(1, 8)
+                })
+                .map_err(|_| overflow())?,
+                1,
+                1,
+            ),
+            // One weight per chunk while they fit in shared memory (48 KB
+            // less the 4 KB static reduction scratch); past that the
+            // Kernel recomputes each weight from its partial.
+            shared_mem_bytes: if cache_weights == 1 { weight_bytes } else { 0 },
+        };
+        unsafe { args.launch(config) }?;
+        Ok(())
+    }
+
     /// One query row's attention (a decode step), its keys split into
     /// chunks of [`ATTENTION_CHUNK_KEYS`] scored by separate blocks, then
     /// merged in chunk order (`attention_split_kernel`,
@@ -4900,43 +5776,19 @@ impl CudaKernels {
             };
             unsafe { args.launch(config) }?;
         }
-        let combine = self.function("attention_combine_kernel")?;
-        let weight_bytes = u32::try_from(chunks * 4).unwrap_or(u32::MAX);
-        let cache_weights = i32::from(weight_bytes <= ATTENTION_COMBINE_MAX_DYNAMIC_SHARED);
-        let mut args = self.stream.launch_builder(&combine);
-        // The partials and the output are V-wide: the combine Kernel's
-        // width is the value width.
-        args.arg(&*partial)
-            .arg(&mut out_dev)
-            .arg(&head_count)
-            .arg(&value_dimension)
-            .arg(&chunks)
-            .arg(&cache_weights);
-        let config = LaunchConfig {
-            grid_dim: (u32::try_from(head_count).map_err(|_| overflow())?, 1, 1),
-            // Lanes of chunks per output dimension: up to 8, within 256
-            // threads for small heads, one lane past 1024 dimensions.
-            block_dim: (
-                u32::try_from(if value_dimension > 1024 {
-                    1024
-                } else {
-                    value_dimension * (256 / value_dimension).clamp(1, 8)
-                })
-                .map_err(|_| overflow())?,
-                1,
-                1,
-            ),
-            // One weight per chunk while they fit in shared memory (48 KB
-            // less the 4 KB static reduction scratch); past that the
-            // Kernel recomputes each weight from its partial.
-            shared_mem_bytes: if cache_weights == 1 { weight_bytes } else { 0 },
-        };
-        unsafe { args.launch(config) }?;
+        self.combine_attention_partials(
+            &*partial,
+            &mut out_dev,
+            head_count,
+            value_dimension,
+            chunks,
+        )?;
         Ok(CudaDeviceBuffer {
             slice: out_dev,
             shape: vec![1, head_count * value_dimension],
             bf16: None,
             q8: None,
+            tq: None,
         })
     }
 
@@ -4989,6 +5841,7 @@ impl CudaKernels {
             shape: vec![rows, head_count * (a_width + b_width)],
             bf16: None,
             q8: None,
+            tq: None,
         })
     }
 }

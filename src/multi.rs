@@ -766,6 +766,40 @@ impl ProviderExecutionApi for CudaMultiExecutor {
         Ok(written)
     }
 
+    fn write_zeroed_kv_store(
+        &self,
+        id: &TensorResourceId,
+        shape: &[u64],
+        precision: magnetar_provider_api::KvStorePrecision,
+        head_dimension: u64,
+    ) -> Result<bool, ProviderExecutionError> {
+        if self.tensor_parallel_active() {
+            let mut written = true;
+            for member in &self.members {
+                written &= ProviderExecutionApi::write_zeroed_kv_store(
+                    &**member,
+                    id,
+                    shape,
+                    precision,
+                    head_dimension,
+                )?;
+            }
+            return Ok(written);
+        }
+        let member = self.write_member(id);
+        let written = ProviderExecutionApi::write_zeroed_kv_store(
+            &*self.members[member],
+            id,
+            shape,
+            precision,
+            head_dimension,
+        )?;
+        if written {
+            self.record_produced(id, member, None);
+        }
+        Ok(written)
+    }
+
     fn write_tensor_value_admitted(
         &self,
         memory: &mut MemoryManager,

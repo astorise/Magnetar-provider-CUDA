@@ -1129,6 +1129,344 @@ fn kv_write_and_key_count_attention_ignore_the_store_tail() {
     }
 }
 
+/// `turboquant-kv-history`: `kv-write` into a TurboQuant store keeps each
+/// row as the CPU's store does (`TurboQuantStoreState`: offsets set by the
+/// write at row 0, each row's difference from them quantized), and
+/// attention over the store -- a decode step on the codes, a prefill
+/// through dequantized scratch -- matches the CPU reference over those
+/// values, for 4- and 3-bit codes, grouped-query heads 64 to 512 wide (one
+/// block per KV head for up to 8 query heads, one per query head beyond)
+/// and a sliding window.
+#[test]
+fn turboquant_kv_stores_round_trip_and_attend_like_the_cpu() {
+    use magnetar_provider_api::{KvStorePrecision, TurboQuantStoreState};
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    for precision in [KvStorePrecision::Tq4, KvStorePrecision::Tq3] {
+        for (case, (history, heads, kv_heads, dim, window)) in [
+            (37u64, 8u64, 2u64, 64u64, None),
+            (300, 4, 1, 128, None),
+            (129, 8, 1, 256, Some(64u64)),
+            (5, 2, 2, 512, None),
+            // More query heads per KV head than one grouped block serves:
+            // a block per query head.
+            (70, 16, 1, 64, None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let label = format!("{} case {case}", precision.as_str());
+            let width = kv_heads * dim;
+            let capacity = history + 3;
+            // Rows sharing a large per-column component, as keys with a
+            // bias do: the store's offsets hold it. Hashed values: the
+            // arithmetic sequence of `attention_values` puts rotated
+            // coordinates exactly on codebook boundaries once the offsets
+            // are subtracted, where any rounding difference picks the other
+            // centroid.
+            let values = |seed: usize| {
+                let common = hashed_values(width as usize, 10 * case + seed + 5);
+                let data: Vec<f32> = hashed_values((history * width) as usize, 10 * case + seed)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, value)| value + 8.0 * common[i % width as usize])
+                    .collect();
+                HostTensor::new([history, width], data).unwrap()
+            };
+            let (k, v) = (values(2), values(3));
+            // Written as a prefill and then one appended row.
+            let store_of = |tensor: &HostTensor| {
+                let mut store = kernels
+                    .tq_zeros(&[capacity, width], precision, dim)
+                    .unwrap();
+                let split = ((history - 1) * width) as usize;
+                let prefix =
+                    HostTensor::new([history - 1, width], tensor.data[..split].to_vec()).unwrap();
+                let last = HostTensor::new([1, width], tensor.data[split..].to_vec()).unwrap();
+                kernels
+                    .kv_write(&mut store, &upload(&kernels, &prefix), 0)
+                    .unwrap();
+                kernels
+                    .kv_write(&mut store, &upload(&kernels, &last), history - 1)
+                    .unwrap();
+                store
+            };
+            let (k_store, v_store) = (store_of(&k), store_of(&v));
+            // The same writes into the CPU's store: offsets from the
+            // prefill's rows.
+            let round_trip = |tensor: &HostTensor| {
+                let mut store = TurboQuantStoreState::new(precision, dim, width);
+                let split = ((history - 1) * width) as usize;
+                let mut data = store.write(&tensor.data[..split], 0).unwrap();
+                data.extend(store.write(&tensor.data[split..], history - 1).unwrap());
+                HostTensor::new([history, width], data).unwrap()
+            };
+            let (k_values, v_values) = (round_trip(&k), round_trip(&v));
+
+            // Each head row reads back as its round trip: the offsets are
+            // summed in the same order, but the norms in another, so a
+            // coordinate on a centroid boundary may rarely take the other
+            // centroid.
+            let stored = download(&kernels, &k_store);
+            assert_eq!(stored.shape, vec![capacity, width], "{label}");
+            let head_rows = (history * kv_heads) as usize;
+            let mut exact = 0;
+            for (read, expected) in stored.data[..(history * width) as usize]
+                .chunks(dim as usize)
+                .zip(k_values.data.chunks(dim as usize))
+            {
+                let difference = read
+                    .iter()
+                    .zip(expected)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0_f32, f32::max);
+                assert!(difference < 0.05, "{label}: {difference}");
+                if difference < 1e-4 {
+                    exact += 1;
+                }
+            }
+            assert!(
+                exact * 100 >= head_rows * 99,
+                "{label}: {exact}/{head_rows}"
+            );
+            // Unwritten rows read back as the offsets.
+            let offsets = magnetar_provider_api::turboquant_store_offsets(
+                &k.data[..((history - 1) * width) as usize],
+                width as usize,
+            );
+            assert!(
+                stored.data[(history * width) as usize..]
+                    .chunks(width as usize)
+                    .all(|row| row == offsets.as_slice()),
+                "{label}: unwritten rows read back as the offsets"
+            );
+
+            // A decode step on the codes, and a four-query prefill.
+            for queries in [1u64, 4] {
+                let q = HostTensor::new(
+                    [queries, heads * dim],
+                    attention_values((queries * heads * dim) as usize, 10 * case + 1),
+                )
+                .unwrap();
+                let expected = magnetar_provider_cpu::attention(
+                    &q,
+                    &k_values,
+                    &v_values,
+                    heads,
+                    dim,
+                    Some(kv_heads),
+                    window,
+                    true,
+                )
+                .unwrap();
+                let actual = kernels
+                    .attention_valued(
+                        &upload(&kernels, &q),
+                        &k_store,
+                        &v_store,
+                        heads,
+                        dim,
+                        None,
+                        Some(kv_heads),
+                        window,
+                        true,
+                        Some(history),
+                        None,
+                    )
+                    .unwrap();
+                assert_close(&download(&kernels, &actual), &expected);
+            }
+        }
+    }
+}
+
+/// `cache-latent-attention-history`: `batched-matmul` matches the CPU's,
+/// and attention over a latent history read as its own V
+/// (`value_head_stride`) matches the CPU's attention over the extracted
+/// values, for a decode step over a store and a prefill.
+#[test]
+fn batched_matmul_and_strided_values_match_the_cpu() {
+    use magnetar_provider_api::{batched_matmul, value_heads};
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let (heads, nope, latent, rope) = (16u64, 128u64, 512u64, 64u64);
+    for rows in [1u64, 5] {
+        let a = HostTensor::new(
+            [rows, heads * nope],
+            attention_values((rows * heads * nope) as usize, 3),
+        )
+        .unwrap();
+        let b = HostTensor::new(
+            [heads * nope, latent],
+            attention_values((heads * nope * latent) as usize, 4),
+        )
+        .unwrap();
+        let actual = kernels
+            .batched_matmul(&upload(&kernels, &a), &upload(&kernels, &b), heads, false)
+            .unwrap();
+        assert_close(
+            &download(&kernels, &actual),
+            &batched_matmul(&a, &b, heads, false).unwrap(),
+        );
+        // `transpose_b`: per-head `[n, k]` blocks, as the value rows of the
+        // latent up-projection are stored.
+        let latent_rows = HostTensor::new(
+            [rows, heads * latent],
+            attention_values((rows * heads * latent) as usize, 7),
+        )
+        .unwrap();
+        let values = HostTensor::new(
+            [heads * nope, latent],
+            attention_values((heads * nope * latent) as usize, 8),
+        )
+        .unwrap();
+        let actual = kernels
+            .batched_matmul(
+                &upload(&kernels, &latent_rows),
+                &upload(&kernels, &values),
+                heads,
+                true,
+            )
+            .unwrap();
+        assert_close(
+            &download(&kernels, &actual),
+            &batched_matmul(&latent_rows, &values, heads, true).unwrap(),
+        );
+    }
+    let width = latent + rope;
+    let (capacity, keys) = (40u64, 33u64);
+    let history = HostTensor::new(
+        [capacity, width],
+        attention_values((capacity * width) as usize, 5),
+    )
+    .unwrap();
+    let values = value_heads(&history, 1, width, latent).unwrap();
+    let leading = |tensor: &HostTensor, rows: u64| {
+        HostTensor::new(
+            [rows, tensor.shape[1]],
+            tensor.data[..(rows * tensor.shape[1]) as usize].to_vec(),
+        )
+        .unwrap()
+    };
+    for queries in [1u64, 4] {
+        let q = HostTensor::new(
+            [queries, heads * width],
+            attention_values((queries * heads * width) as usize, 6),
+        )
+        .unwrap();
+        let expected = magnetar_provider_cpu::attention_with_value_width(
+            &q,
+            &leading(&history, keys),
+            &leading(&values, keys),
+            heads,
+            width,
+            latent,
+            Some(1),
+            None,
+            true,
+            Some(0.1),
+        )
+        .unwrap();
+        let store = upload(&kernels, &history);
+        let actual = kernels
+            .attention_strided_values(
+                &upload(&kernels, &q),
+                &store,
+                &store,
+                heads,
+                width,
+                Some(latent),
+                width,
+                Some(1),
+                None,
+                true,
+                Some(keys),
+                Some(0.1),
+            )
+            .unwrap();
+        assert_close(&download(&kernels, &actual), &expected);
+    }
+
+    // `turboquant-kv-history` on the latent history: a tq4 store of
+    // 576-value rows in groups of 64, read as both K and V, against the
+    // CPU's attention over the same rounded rows.
+    use magnetar_provider_api::{KvStorePrecision, TurboQuantStoreState};
+    let group = 64u64;
+    // Hashed rows: no rotated coordinate on a codebook boundary.
+    let latent_rows = hashed_values((keys * width) as usize, 11);
+    let mut store = kernels
+        .tq_zeros(&[capacity, width], KvStorePrecision::Tq4, group)
+        .unwrap();
+    kernels
+        .kv_write(
+            &mut store,
+            &upload(
+                &kernels,
+                &HostTensor::new([keys, width], latent_rows.clone()).unwrap(),
+            ),
+            0,
+        )
+        .unwrap();
+    let mut rounded = TurboQuantStoreState::new(KvStorePrecision::Tq4, group, width);
+    let rounded = HostTensor::new([keys, width], rounded.write(&latent_rows, 0).unwrap()).unwrap();
+    let rounded_values = value_heads(&rounded, 1, width, latent).unwrap();
+    for queries in [1u64, 4] {
+        let q = HostTensor::new(
+            [queries, heads * width],
+            attention_values((queries * heads * width) as usize, 9),
+        )
+        .unwrap();
+        let expected = magnetar_provider_cpu::attention_with_value_width(
+            &q,
+            &rounded,
+            &rounded_values,
+            heads,
+            width,
+            latent,
+            Some(1),
+            None,
+            true,
+            Some(0.1),
+        )
+        .unwrap();
+        let actual = kernels
+            .attention_strided_values(
+                &upload(&kernels, &q),
+                &store,
+                &store,
+                heads,
+                width,
+                Some(latent),
+                width,
+                Some(1),
+                None,
+                true,
+                Some(keys),
+                Some(0.1),
+            )
+            .unwrap();
+        assert_close(&download(&kernels, &actual), &expected);
+    }
+}
+
+/// Pseudo-random values in [-0.5, 0.5) from splitmix64: no arithmetic
+/// structure for a rotation to line up.
+fn hashed_values(len: usize, seed: usize) -> Vec<f32> {
+    let mut state = 0x9e37_79b9_7f4a_7c15u64 ^ (seed as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    (0..len)
+        .map(|_| {
+            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^= z >> 31;
+            (z >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+        })
+        .collect()
+}
+
 /// Deterministic pseudo-random values in [-0.5, 0.5).
 fn attention_values(len: usize, seed: usize) -> Vec<f32> {
     (0..len)
