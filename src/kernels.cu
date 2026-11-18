@@ -7416,9 +7416,11 @@ extern "C" __global__ void tq_latent_attention_split_kernel(
     __syncthreads();
 
     // Scores: four threads per key (LATENT_THREADS = 4 *
-    // ATTENTION_CHUNK_KEYS), thread `part` of a key taking its groups part,
-    // part + 4, ... (an exact key: its float4s part, part + 4, ...) against
-    // every query head; the four sums are added by a fixed butterfly.
+    // ATTENTION_CHUNK_KEYS), thread `part` of a key taking the eight-value
+    // blocks part, part + 4, ... of every group (an exact key: its float4s
+    // part, part + 4, ...) against every query head, so the four read
+    // rotated queries in different shared-memory banks; the four sums are
+    // added by a fixed butterfly.
     unsigned int code_bytes = dim * bits / 8u;
     {
         unsigned int j = tid >> 2;
@@ -7448,7 +7450,7 @@ extern "C" __global__ void tq_latent_attention_split_kernel(
                 }
             }
         } else if (j < count) {
-            for (unsigned int kg = part; kg < (unsigned int)k_groups; kg += 4) {
+            for (unsigned int kg = 0; kg < (unsigned int)k_groups; kg++) {
                 unsigned long long cell = row * k_groups + kg;
                 const unsigned char* row_codes = codes + cell * code_bytes;
                 float code_part[TQ_MAX_GROUP];
@@ -7456,7 +7458,7 @@ extern "C" __global__ void tq_latent_attention_split_kernel(
                 for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
                     code_part[g] = 0.0f;
                 }
-                for (unsigned int e8 = 0; e8 < dim; e8 += 8) {
+                for (unsigned int e8 = 8u * part; e8 < dim; e8 += 32u) {
                     float centroid[8];
                     if (bits == 4u) {
                         unsigned int word = ((const unsigned int*)row_codes)[e8 >> 3];
