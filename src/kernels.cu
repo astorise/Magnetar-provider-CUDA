@@ -6228,35 +6228,53 @@ extern "C" __global__ void tq_attention_split_grouped_kernel(
     }
     __syncthreads();
 
-    // Scores: one thread per key, every query head.
-    unsigned int k_code_bytes = dim * k_bits / 8u;
-    for (unsigned int j = tid; j < count; j += blockDim.x) {
-        unsigned long long cell = (first + j) * kv_head_count + kv_head;
-        const unsigned char* k_row = k_codes + cell * k_code_bytes;
+    // Exact keys (`keep-turboquant-kv-head-exact`): a warp per key, its
+    // lanes over the dimensions (the key's row and the queries read
+    // coalesced), the products of every query head summed across the warp.
+    for (unsigned int j = warp; j < exact_count; j += warps) {
+        const float* exact_row =
+            k_exact + ((first + j) * kv_head_count + kv_head) * head_dimension;
         float dot[TQ_MAX_GROUP];
 #pragma unroll
         for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
             dot[g] = 0.0f;
         }
-        if (j < exact_count) {
-            // An exact key against every query head as it is.
-            const float* exact_row = k_exact + cell * head_dimension;
-            for (unsigned int d = 0; d < dim; d++) {
-                float key = exact_row[d];
+        for (unsigned int d = lane; d < dim; d += 32) {
+            float key = exact_row[d];
 #pragma unroll
-                for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
-                    if (g < group) {
-                        dot[g] += q[(head0 + g) * head_dimension + d] * key;
-                    }
+            for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
+                if (g < group) {
+                    dot[g] = fmaf(q[(head0 + g) * head_dimension + d], key, dot[g]);
                 }
             }
+        }
+#pragma unroll
+        for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
+            if (g < group) {
+                for (int offset = 16; offset > 0; offset >>= 1) {
+                    dot[g] += __shfl_xor_sync(0xffffffffu, dot[g], offset);
+                }
+            }
+        }
+        if (lane == 0) {
 #pragma unroll
             for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
                 if (g < group) {
                     scores[j][g] = dot[g] * scale;
                 }
             }
-            continue;
+        }
+    }
+
+    // Keys on codes: one thread per key, every query head.
+    unsigned int k_code_bytes = dim * k_bits / 8u;
+    for (unsigned int j = exact_count + tid; j < count; j += blockDim.x) {
+        unsigned long long cell = (first + j) * kv_head_count + kv_head;
+        const unsigned char* k_row = k_codes + cell * k_code_bytes;
+        float dot[TQ_MAX_GROUP];
+#pragma unroll
+        for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
+            dot[g] = 0.0f;
         }
         if (k_bits == 4u) {
             const unsigned int* words = (const unsigned int*)k_row;
