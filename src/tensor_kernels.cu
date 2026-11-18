@@ -536,7 +536,8 @@ extern "C" __global__ void matmul_tcp_kernel(
 // hi + mid + lo keeps about 24 significant bits), plus `addend[col]` (mode
 // 1) or `addend[row * n + col]` (mode 2). Every product of terms down to
 // 2^-24 of the whole is accumulated in f32, smallest first: lo.hi, mid.mid,
-// hi.lo, mid.hi, hi.mid, hi.hi. The tiles and pipeline are
+// hi.lo, mid.hi, hi.mid, hi.hi, into a partial per 16-inner tile that an
+// f32 add (round to nearest) takes into the output. The tiles and pipeline are
 // `tcp_matmul`'s; the six terms' two stages take 2 * TCP3_STAGE halves
 // (50,688 bytes) of dynamic shared memory.
 #define TCP3_A_TILE (TCP_BLOCK_M * TCP_A_PITCH)
@@ -622,6 +623,17 @@ extern "C" __global__ void matmul_tcp_split3_kernel(
         }
         __syncthreads();
         unsigned short* base = tcp3_shared + stage * TCP3_STAGE;
+        // This tile's products start from zero and are added to `acc` with
+        // an f32 add (round to nearest): the Tensor Cores' accumulation
+        // truncates relative to the largest term, which in one chain over
+        // every tile would be the running sum.
+        float part[2][4][4];
+#pragma unroll
+        for (int mt = 0; mt < 2; mt++)
+#pragma unroll
+            for (int nt = 0; nt < 4; nt++)
+#pragma unroll
+                for (int i = 0; i < 4; i++) part[mt][nt][i] = 0.0f;
         unsigned int af[3][2][4];
 #pragma unroll
         for (int t = 0; t < 3; t++) {
@@ -648,20 +660,26 @@ extern "C" __global__ void matmul_tcp_split3_kernel(
 #pragma unroll
             for (int mt = 0; mt < 2; mt++) {
                 // Smallest first: lo.hi, mid.mid, hi.lo, mid.hi, hi.mid, hi.hi.
-                tc_mma(acc[mt][2 * np], af[2][mt], bf[0][0], bf[0][1]);
-                tc_mma(acc[mt][2 * np + 1], af[2][mt], bf[0][2], bf[0][3]);
-                tc_mma(acc[mt][2 * np], af[1][mt], bf[1][0], bf[1][1]);
-                tc_mma(acc[mt][2 * np + 1], af[1][mt], bf[1][2], bf[1][3]);
-                tc_mma(acc[mt][2 * np], af[0][mt], bf[2][0], bf[2][1]);
-                tc_mma(acc[mt][2 * np + 1], af[0][mt], bf[2][2], bf[2][3]);
-                tc_mma(acc[mt][2 * np], af[1][mt], bf[0][0], bf[0][1]);
-                tc_mma(acc[mt][2 * np + 1], af[1][mt], bf[0][2], bf[0][3]);
-                tc_mma(acc[mt][2 * np], af[0][mt], bf[1][0], bf[1][1]);
-                tc_mma(acc[mt][2 * np + 1], af[0][mt], bf[1][2], bf[1][3]);
-                tc_mma(acc[mt][2 * np], af[0][mt], bf[0][0], bf[0][1]);
-                tc_mma(acc[mt][2 * np + 1], af[0][mt], bf[0][2], bf[0][3]);
+                tc_mma(part[mt][2 * np], af[2][mt], bf[0][0], bf[0][1]);
+                tc_mma(part[mt][2 * np + 1], af[2][mt], bf[0][2], bf[0][3]);
+                tc_mma(part[mt][2 * np], af[1][mt], bf[1][0], bf[1][1]);
+                tc_mma(part[mt][2 * np + 1], af[1][mt], bf[1][2], bf[1][3]);
+                tc_mma(part[mt][2 * np], af[0][mt], bf[2][0], bf[2][1]);
+                tc_mma(part[mt][2 * np + 1], af[0][mt], bf[2][2], bf[2][3]);
+                tc_mma(part[mt][2 * np], af[1][mt], bf[0][0], bf[0][1]);
+                tc_mma(part[mt][2 * np + 1], af[1][mt], bf[0][2], bf[0][3]);
+                tc_mma(part[mt][2 * np], af[0][mt], bf[1][0], bf[1][1]);
+                tc_mma(part[mt][2 * np + 1], af[0][mt], bf[1][2], bf[1][3]);
+                tc_mma(part[mt][2 * np], af[0][mt], bf[0][0], bf[0][1]);
+                tc_mma(part[mt][2 * np + 1], af[0][mt], bf[0][2], bf[0][3]);
             }
         }
+#pragma unroll
+        for (int mt = 0; mt < 2; mt++)
+#pragma unroll
+            for (int nt = 0; nt < 4; nt++)
+#pragma unroll
+                for (int i = 0; i < 4; i++) acc[mt][nt][i] += part[mt][nt][i];
         __syncthreads();
     }
     unsigned int group = lane >> 2;
