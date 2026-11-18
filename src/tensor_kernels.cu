@@ -396,7 +396,10 @@ __device__ __forceinline__ void tcp_load_stage(
     }
 }
 
-template <int NB>
+// `LO_LAST`: the last weight is the low bfloat16 term of the one before it
+// (a weight split into hi and lo terms): it is multiplied by `a`'s hi term
+// only, the product of both low terms being below the split's rounding.
+template <int NB, bool LO_LAST = false>
 __device__ __forceinline__ void tcp_matmul(
     const unsigned short* a_hi, const unsigned short* a_lo, const unsigned short* const* b16,
     unsigned long long m, unsigned long long k, unsigned long long n,
@@ -453,9 +456,11 @@ __device__ __forceinline__ void tcp_matmul(
                 tcp_ldmatrix_x4_trans(b, &s_b[stage][w][krow][ncol]);
 #pragma unroll
                 for (int mt = 0; mt < 2; mt++) {
-                    tc_mma(acc[w][mt][2 * np], lo[mt], b[0], b[1]);
+                    if (!(LO_LAST && w == NB - 1)) {
+                        tc_mma(acc[w][mt][2 * np], lo[mt], b[0], b[1]);
+                        tc_mma(acc[w][mt][2 * np + 1], lo[mt], b[2], b[3]);
+                    }
                     tc_mma(acc[w][mt][2 * np], hi[mt], b[0], b[1]);
-                    tc_mma(acc[w][mt][2 * np + 1], lo[mt], b[2], b[3]);
                     tc_mma(acc[w][mt][2 * np + 1], hi[mt], b[2], b[3]);
                 }
             }
@@ -496,6 +501,50 @@ extern "C" __global__ void matmul_tcp_kernel(
                 unsigned long long col = n0 + (warp & 1) * 32 + nt * 8 + 2 * pair + (i & 1);
                 if (row < m && col < n) {
                     float value = acc[0][mt][nt][i];
+                    if (addend_mode == 1) {
+                        value += addend[col];
+                    } else if (addend_mode == 2) {
+                        value += addend[row * n + col];
+                    }
+                    out[row * n + col] = value;
+                }
+            }
+}
+
+// `a x (b_hi + b_lo)` (both given as their hi/lo bfloat16 terms: a weight
+// that is not exactly bfloat16, a dequantized packed one), plus
+// `addend[col]` (mode 1) or `addend[row * n + col]` (mode 2).
+extern "C" __global__ void matmul_tcp_split_kernel(
+    const unsigned short* a_hi,
+    const unsigned short* a_lo,
+    const unsigned short* b_hi,
+    const unsigned short* b_lo,
+    float* out,
+    unsigned long long m,
+    unsigned long long k,
+    unsigned long long n,
+    const float* addend,
+    int addend_mode
+) {
+    const unsigned short* weights[2] = {b_hi, b_lo};
+    float acc[2][2][4][4];
+    tcp_matmul<2, true>(a_hi, a_lo, weights, m, k, n, acc);
+    unsigned long long m0 = (unsigned long long)blockIdx.y * TCP_BLOCK_M;
+    unsigned long long n0 = (unsigned long long)blockIdx.x * TCP_BLOCK_N;
+    unsigned int warp = threadIdx.x >> 5;
+    unsigned int lane = threadIdx.x & 31;
+    unsigned int group = lane >> 2;
+    unsigned int pair = lane & 3;
+#pragma unroll
+    for (int mt = 0; mt < 2; mt++)
+#pragma unroll
+        for (int nt = 0; nt < 4; nt++)
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                unsigned long long row = m0 + (warp >> 1) * 32 + mt * 16 + group + (i >= 2 ? 8 : 0);
+                unsigned long long col = n0 + (warp & 1) * 32 + nt * 8 + 2 * pair + (i & 1);
+                if (row < m && col < n) {
+                    float value = acc[0][mt][nt][i] + acc[1][mt][nt][i];
                     if (addend_mode == 1) {
                         value += addend[col];
                     } else if (addend_mode == 2) {

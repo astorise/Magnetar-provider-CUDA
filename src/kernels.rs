@@ -4617,6 +4617,71 @@ impl CudaKernels {
         })
     }
 
+    /// `a x b` (plus `addend`) on Tensor Cores for a contiguous f32 `b` that
+    /// is not exactly bfloat16, a dequantized packed weight: `a` and `b`
+    /// are both split into their bfloat16 hi and lo terms and every product
+    /// but the two low terms' is accumulated in f32
+    /// (`matmul_tcp_split_kernel`). `None` without Tensor Cores or with
+    /// rows that do not align.
+    fn matmul_split_tcp(
+        &self,
+        a: &CudaDeviceBuffer,
+        b: &CudaDeviceBuffer,
+        [m, k, n]: [u64; 3],
+        addend: Option<MatmulAddend<'_>>,
+    ) -> Result<Option<CudaDeviceBuffer>, CudaError> {
+        if m == 0 || k % TCP_ALIGN != 0 || n % TCP_ALIGN != 0 {
+            return Ok(None);
+        }
+        let Some(func) = self.tensor_function("matmul_tcp_split_kernel") else {
+            return Ok(None);
+        };
+        let Some((_split_lock, terms)) = self.split_bf16_all(&[(a, m * k), (b, k * n)])? else {
+            return Ok(None);
+        };
+        let [(a_hi, a_lo), (b_hi, b_lo)] = [terms[0], terms[1]];
+        let (addend_buffer, addend_mode) = match addend {
+            None => (a, 0i32),
+            Some(MatmulAddend::Row(bias)) => (bias, 1),
+            Some(MatmulAddend::Full(residual)) => (residual, 2),
+        };
+        let overflow = || {
+            CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                "matmul launch size overflows a grid dimension",
+            )
+        };
+        let config = LaunchConfig {
+            grid_dim: (
+                u32::try_from(n.div_ceil(TCP_BLOCK_N)).map_err(|_| overflow())?,
+                u32::try_from(m.div_ceil(TCP_BLOCK_M)).map_err(|_| overflow())?,
+                1,
+            ),
+            block_dim: (TCP_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut out_dev = self.alloc_output((m * n) as usize)?;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(&a_hi)
+            .arg(&a_lo)
+            .arg(&b_hi)
+            .arg(&b_lo)
+            .arg(&mut out_dev)
+            .arg(&m)
+            .arg(&k)
+            .arg(&n)
+            .arg(&addend_buffer.slice)
+            .arg(&addend_mode);
+        unsafe { args.launch(config) }?;
+        Ok(Some(CudaDeviceBuffer {
+            slice: out_dev,
+            shape: vec![m, n],
+            bf16: None,
+            q8: None,
+            tq: None,
+        }))
+    }
+
     fn matmul_with_addend(
         &self,
         a: &CudaDeviceBuffer,
@@ -4724,8 +4789,17 @@ impl CudaKernels {
                     }
                 };
             }
-            // Otherwise against the f32 weight, for this call only.
+            // Otherwise against the f32 weight, for this call only: a long
+            // prefill on Tensor Cores, the weight split into its bfloat16
+            // hi and lo terms like the activations.
             let dense = self.dequantize_q8(b)?;
+            if m >= MATMUL_TILE_MIN_ROWS
+                && !transpose_a
+                && !transpose_b
+                && let Some(out) = self.matmul_split_tcp(a, &dense, [m, k, n], addend)?
+            {
+                return Ok(out);
+            }
             return self.matmul_with_addend(a, &dense, addend, transpose_a, transpose_b);
         }
         let b16 = self.bf16_address(b);

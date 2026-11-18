@@ -2785,6 +2785,51 @@ fn q6k_packed_matmul_matches_reference_cpu() {
     }
 }
 
+/// Long prefills against packed weights: more rows than the packed row
+/// Kernels take, so the weight is dequantized for the call and, on a Device
+/// with Tensor Cores, multiplied with both operands split into their
+/// bfloat16 hi and lo terms (`matmul_tcp_split_kernel`); the f32 Kernels
+/// otherwise. With and without a bias or residual, against the Reference
+/// CPU on the dequantized weights, within 1e-5 of the largest output: a
+/// weight rounded to bfloat16 alone would be off by about 5e-4.
+#[test]
+fn long_prefills_against_packed_weights_match_reference_cpu() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    // 136 columns and 300 rows leave partial Tensor Core tiles.
+    let (k, n) = (512_u64, 136_u64);
+    let weights = [
+        ("Q8_0", packed_q8(n, k, true, 61)),
+        ("Q4_K", packed_q4k(n, k, true, 62)),
+        ("Q6_K", packed_q6k(n, k, true, 63)),
+    ];
+    let bias = HostTensor::new([n], (0..n).map(|i| i as f32 * 0.01).collect::<Vec<_>>()).unwrap();
+    for (label, packed) in weights {
+        let dense = packed.dequantize();
+        let weight = kernels.upload_packed_weight(&packed).unwrap();
+        for m in [64_u64, 200, 300] {
+            let a = activations(m, k, m as u32 + 70);
+            let expected = magnetar_provider_cpu::matmul(&a, &dense, false, false).unwrap();
+            let a_dev = upload(&kernels, &a);
+            let actual = kernels.matmul(&a_dev, &weight, false, false).unwrap();
+            assert_eq!(actual.shape, vec![m, n], "{label} m={m}");
+            assert_close_relative(&download(&kernels, &actual), &expected);
+            let with_bias = kernels
+                .matmul_bias(&a_dev, &weight, &upload(&kernels, &bias), false, false)
+                .unwrap();
+            let expected_bias = magnetar_provider_cpu::add(&expected, &bias).unwrap();
+            assert_close_relative(&download(&kernels, &with_bias), &expected_bias);
+            let residual = activations(m, n, 96);
+            let with_residual = kernels
+                .matmul_residual(&a_dev, &weight, &upload(&kernels, &residual), false, false)
+                .unwrap();
+            let expected_residual = magnetar_provider_cpu::add(&expected, &residual).unwrap();
+            assert_close_relative(&download(&kernels, &with_residual), &expected_residual);
+        }
+    }
+}
+
 /// A deterministic packed `Q2_K` or `Q3_K` matrix of `stored_rows` x
 /// `stored_cols` super-blocks: random quants, masks and scales, small
 /// positive f16 `d` (and `dmin`).
