@@ -2636,6 +2636,91 @@ fn decode_attention_times() {
     }
 }
 
+/// Device time of DeepSeek-V2-Lite's absorbed decode attention
+/// (`cache-latent-attention-history`): 16 query heads over one latent
+/// history of 576-value rows (512 latent values and 64 rope ones), the
+/// values each row's leading 512, scale 0.1; in an f32 store and in `tq4`
+/// stores (groups of 64) without and with a 1,024-row exact head, over
+/// 1,024 to 32,768 keys. Not a conformance check: run it with `--ignored
+/// --nocapture` on a GPU.
+#[test]
+#[ignore = "GPU timing diagnostic"]
+fn latent_decode_attention_times() {
+    use magnetar_provider_api::KvStorePrecision;
+    if cfg!(debug_assertions) {
+        return;
+    }
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let context = kernels.stream().context().clone();
+    let timing = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
+    let time_us = |repeats: usize, run: &dyn Fn()| -> f32 {
+        run();
+        let start = context.new_event(timing).unwrap();
+        let end = context.new_event(timing).unwrap();
+        start.record(kernels.stream()).unwrap();
+        for _ in 0..repeats {
+            run();
+        }
+        end.record(kernels.stream()).unwrap();
+        start.elapsed_ms(&end).unwrap() * 1e3 / repeats as f32
+    };
+    let (heads, width, latent, group) = (16u64, 576u64, 512u64, 64u64);
+    let q = upload(
+        &kernels,
+        &HostTensor::new(
+            [1, heads * width],
+            hashed_values((heads * width) as usize, 11),
+        )
+        .unwrap(),
+    );
+    for keys in [1024u64, 4096, 16384, 32768] {
+        let rows =
+            HostTensor::new([keys, width], hashed_values((keys * width) as usize, 7)).unwrap();
+        let attend = |store: &CudaDeviceBuffer| {
+            time_us(20, &|| {
+                kernels
+                    .attention_strided_values(
+                        &q,
+                        store,
+                        store,
+                        heads,
+                        width,
+                        Some(latent),
+                        width,
+                        Some(1),
+                        None,
+                        true,
+                        Some(keys),
+                        Some(0.1),
+                    )
+                    .unwrap();
+            })
+        };
+        let f32_us = attend(&upload(&kernels, &rows));
+        let tq = |exact: u64| {
+            let mut store = kernels
+                .tq_zeros_with_exact_head(&[keys, width], KvStorePrecision::Tq4, group, exact)
+                .unwrap();
+            kernels
+                .kv_write(&mut store, &upload(&kernels, &rows), 0)
+                .unwrap();
+            attend(&store)
+        };
+        let (codes_us, head_us) = (tq(0), tq(1024));
+        let f32_bytes = (keys * width * 4) as f32;
+        let tq_bytes = (keys * (width / group) * (group / 2 + 4)) as f32;
+        eprintln!(
+            "latent decode attention, DeepSeek-V2-Lite, {keys} keys: f32 {f32_us:.1} us \
+             ({:.0} GB/s), tq4 {codes_us:.1} us ({:.0} GB/s), tq4 with a 1,024-row head \
+             {head_us:.1} us",
+            f32_bytes / f32_us / 1e3,
+            tq_bytes / codes_us / 1e3,
+        );
+    }
+}
+
 /// Diagnostic, not a gate: the Device time of one decode-step matmul of
 /// each Qwen2.5-0.5B projection shape, f32 and compact, and the bandwidth
 /// it reaches. 200 back-to-back launches are timed, so a shape whose

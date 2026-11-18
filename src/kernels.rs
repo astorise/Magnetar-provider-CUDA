@@ -5585,6 +5585,22 @@ impl CudaKernels {
                 ),
             ));
         }
+        // A decode step reads the values in place: the split Kernel takes
+        // the V row width apart from each head's value width
+        // (`speed-up-decode-attention-on-codes`), where gathering them
+        // would copy every row of the history at every step.
+        if let Some(result) = self.attention_strided_decode(
+            q,
+            k,
+            v,
+            [head_count, head_dimension, width, heads],
+            window_size,
+            causal,
+            key_count,
+            scale,
+        ) {
+            return result;
+        }
         let shape = vec![rows, heads * width];
         let len = rows * heads * width;
         let mut scratch = self.tq_scratch.lock().unwrap();
@@ -5630,6 +5646,76 @@ impl CudaKernels {
         );
         self.tq_scratch.lock().unwrap().insert(key, values.slice);
         result
+    }
+
+    /// [`Self::attention_strided_values`] for one query row: the split
+    /// Kernel reads each head's leading `width` values from V rows of
+    /// `heads * value_stride` values in place. `None` for several query
+    /// rows or shapes it does not serve, which gather the values instead.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_strided_decode(
+        &self,
+        q: &CudaDeviceBuffer,
+        k: &CudaDeviceBuffer,
+        v: &CudaDeviceBuffer,
+        [head_count, head_dimension, width, heads]: [u64; 4],
+        window_size: Option<u64>,
+        causal: bool,
+        key_count: Option<u64>,
+        scale: Option<f32>,
+    ) -> Option<Result<CudaDeviceBuffer, CudaError>> {
+        let (seq_len, q_model_dim) = rows_cols_buf(q).ok()?;
+        let (kv_rows, kv_model_dim) = rows_cols_buf(k).ok()?;
+        let (v_rows, v_model_dim) = rows_cols_buf(v).ok()?;
+        let kv_seq_len = key_count.unwrap_or(kv_rows);
+        let score_scale = match scale {
+            None => 0.0_f32,
+            Some(scale) if scale.is_finite() && scale > 0.0 => scale,
+            Some(_) => return None,
+        };
+        if seq_len != 1
+            || k.is_compact()
+            || v.is_compact()
+            || q.is_compact()
+            || heads == 0
+            || !head_count.is_multiple_of(heads)
+            || head_count * head_dimension != q_model_dim
+            || heads * head_dimension != kv_model_dim
+            || v_rows != kv_rows
+            || kv_seq_len == 0
+            || kv_seq_len > kv_rows
+            || window_size == Some(0)
+            || (window_size.is_some() && !causal)
+            // The grouped Kernels, for equal widths, read V at K's stride.
+            || (width == head_dimension && v_model_dim != kv_model_dim)
+        {
+            return None;
+        }
+        let step_offset = match key_count {
+            Some(_) => self.advancing_offset("key_count", kv_rows - kv_seq_len),
+            None => 0,
+        };
+        Some(self.attention_split(
+            q,
+            k,
+            v,
+            [
+                kv_seq_len,
+                head_count,
+                heads,
+                head_dimension,
+                q_model_dim,
+                kv_model_dim,
+                kv_seq_len - 1,
+                kv_rows,
+                width,
+                v_model_dim,
+            ],
+            if causal { 1 } else { 0 },
+            window_size.map(|w| w as i64).unwrap_or(-1),
+            step_offset,
+            score_scale,
+        ))
     }
 
     /// [`Self::attention_scaled`] with V rows `value_dimension` wide per
