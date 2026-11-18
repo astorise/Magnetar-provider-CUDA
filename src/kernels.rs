@@ -393,6 +393,47 @@ const TQ_MAX_GROUP: u64 = 8;
 /// `TQ_MAX_DIM` in `kernels.cu`: the widest TurboQuant head.
 const TQ_MAX_DIMENSION: u64 = 512;
 
+/// The widest K and V heads `tq_attention_split_staged_kernel` serves
+/// (`speed-up-decode-attention-on-codes`): a value coordinate per thread.
+const TQ_STAGED_MAX_DIMENSION: u64 = 128;
+
+/// The most blocks per KV head a TurboQuant decode step splits its history
+/// over (`speed-up-decode-attention-on-codes`, decision 4).
+const TQ_MAX_SPLITS: u64 = 32;
+
+/// How decode attention over TurboQuant stores is scheduled
+/// (`speed-up-decode-attention-on-codes`). Only the conformance and timing
+/// tests pick anything but [`TqDecodeSchedule::Split`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TqDecodeSchedule {
+    /// The staged Kernel, its history split over a bounded number of
+    /// blocks per KV head.
+    Split = 0,
+    /// The staged Kernel, one chunk per block.
+    ChunkPerBlock = 1,
+    /// The Kernels before staging: a chunk per block, codes read from
+    /// global memory.
+    Unstaged = 2,
+}
+
+/// Decision 4 of `speed-up-decode-attention-on-codes`: the blocks per KV
+/// head for `target` blocks resident at once over `kv_heads` KV heads and
+/// `chunks` chunks of keys. Enough blocks to fill the target, at least two
+/// chunks per block and at most [`TQ_MAX_SPLITS`]; fewer when the last wave
+/// of `target` blocks would be less than three quarters full.
+pub(crate) fn tq_split_count(target: u64, kv_heads: u64, chunks: u64) -> u64 {
+    let mut splits = target
+        .div_ceil(kv_heads)
+        .min((chunks / 2).max(1))
+        .clamp(1, TQ_MAX_SPLITS);
+    let blocks = splits * kv_heads;
+    let waves = blocks.div_ceil(target);
+    if waves > 1 && blocks * 4 < waves * target * 3 {
+        splits = ((waves - 1) * target / kv_heads).max(1);
+    }
+    splits
+}
+
 /// Threads of a TurboQuant block over a `head_dimension`-wide head: a power
 /// of two, at most `TQ_MAX_THREADS` (256) in `kernels.cu`.
 fn tq_threads(head_dimension: u64) -> u32 {
@@ -544,6 +585,13 @@ pub struct CudaKernels {
     /// block scales, allocated once at [`INT8_SCRATCH_VALUES`] (never
     /// reallocated, so a captured step's addresses stay valid).
     int8_scratch: std::sync::Mutex<Option<Int8Scratch>>,
+    /// The Device's multiprocessors.
+    multiprocessors: u64,
+    /// See [`TqDecodeSchedule`], as its discriminant.
+    tq_decode_schedule: std::sync::atomic::AtomicU8,
+    /// Blocks of the staged TurboQuant decode Kernel a multiprocessor
+    /// holds, by dynamic shared memory bytes.
+    tq_staged_occupancy: std::sync::Mutex<std::collections::BTreeMap<usize, u64>>,
 }
 
 /// Int8 activations: [`INT8_SCRATCH_VALUES`] signed bytes and one f32 scale
@@ -752,7 +800,65 @@ impl CudaKernels {
                 std::env::var(INT8_ACTIVATIONS_ENV).as_deref() != Ok("0"),
             ),
             int8_scratch: std::sync::Mutex::new(None),
+            multiprocessors: context
+                .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+                .map_or(1, |count| count.max(1) as u64),
+            tq_decode_schedule: std::sync::atomic::AtomicU8::new(TqDecodeSchedule::Split as u8),
+            tq_staged_occupancy: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         })
+    }
+
+    /// Schedules decode attention over TurboQuant stores
+    /// (conformance and timing tests).
+    #[cfg(test)]
+    pub(crate) fn set_tq_decode_schedule(&self, schedule: TqDecodeSchedule) {
+        self.tq_decode_schedule
+            .store(schedule as u8, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn tq_decode_schedule(&self) -> TqDecodeSchedule {
+        match self
+            .tq_decode_schedule
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            1 => TqDecodeSchedule::ChunkPerBlock,
+            2 => TqDecodeSchedule::Unstaged,
+            _ => TqDecodeSchedule::Split,
+        }
+    }
+
+    /// The blocks per KV head a staged TurboQuant decode step splits `keys`
+    /// admitted keys over (`speed-up-decode-attention-on-codes`, decision
+    /// 4): enough to give every multiprocessor as many blocks as it holds
+    /// (at most four), at least two chunks per block, at most
+    /// [`TQ_MAX_SPLITS`]; fewer when the last wave of blocks would be less
+    /// than three quarters full.
+    fn tq_decode_splits(
+        &self,
+        function: &CudaFunction,
+        shared: usize,
+        kv_heads: u64,
+        keys: u64,
+    ) -> u64 {
+        let per_multiprocessor = *self
+            .tq_staged_occupancy
+            .lock()
+            .unwrap()
+            .entry(shared)
+            .or_insert_with(|| {
+                function
+                    .occupancy_max_active_blocks_per_multiprocessor(
+                        ATTENTION_SPLIT_THREADS,
+                        shared,
+                        None,
+                    )
+                    .map_or(1, |blocks| u64::from(blocks).clamp(1, 4))
+            });
+        tq_split_count(
+            self.multiprocessors * per_multiprocessor,
+            kv_heads.max(1),
+            keys.div_ceil(ATTENTION_CHUNK_KEYS).max(1),
+        )
     }
 
     /// See `relaxed_capture`.
@@ -2621,8 +2727,45 @@ impl CudaKernels {
             )
         };
         let chunks = kv_rows.div_ceil(ATTENTION_CHUNK_KEYS).max(1);
+        // A block per KV head serves its grouped query heads when they are
+        // few enough (`TQ_MAX_GROUP`): every code is decoded once for them
+        // all. Otherwise a block per query head. Heads up to 128 wide take
+        // the staged Kernel, its history split over a bounded number of
+        // blocks (`speed-up-decode-attention-on-codes`).
+        let group = head_count / kv_head_count;
+        let grouped = group <= TQ_MAX_GROUP;
+        let schedule = self.tq_decode_schedule();
+        let staged_shared = (grouped
+            && schedule != TqDecodeSchedule::Unstaged
+            && head_dimension <= TQ_STAGED_MAX_DIMENSION
+            && value_dimension <= TQ_STAGED_MAX_DIMENSION)
+            .then(|| {
+                // A row of codes: whole words, plus one against bank
+                // conflicts.
+                let row = |width: u64, bits: u32| (width * u64::from(bits) / 8).div_ceil(4) * 4 + 4;
+                (4 * (group * head_dimension + group * value_dimension + 2 * ATTENTION_CHUNK_KEYS)
+                    + ATTENTION_CHUNK_KEYS
+                        * (row(head_dimension, k.bits) + row(value_dimension, v.bits)))
+                    as usize
+            });
+        let split = self.function(match (staged_shared, grouped) {
+            (Some(_), _) => "tq_attention_split_staged_kernel",
+            (None, true) => "tq_attention_split_grouped_kernel",
+            (None, false) => "tq_attention_split_kernel",
+        })?;
+        // Partials per query head: the staged Kernel's blocks, or a chunk's.
+        let parts = match (staged_shared, schedule) {
+            (Some(shared), TqDecodeSchedule::Split) => {
+                let keys = match window_size {
+                    Some(window) if causal => kv_seq_len.min(window),
+                    _ => kv_seq_len,
+                };
+                self.tq_decode_splits(&split, shared, kv_head_count, keys)
+            }
+            _ => chunks,
+        };
         let partial_len =
-            usize::try_from(head_count * chunks * (value_dimension + 2)).map_err(|_| overflow())?;
+            usize::try_from(head_count * parts * (value_dimension + 2)).map_err(|_| overflow())?;
         let mut scratch = self.attention_scratch.lock().unwrap();
         if scratch
             .0
@@ -2643,16 +2786,6 @@ impl CudaKernels {
         let causal_flag: i32 = if causal { 1 } else { 0 };
         let window_arg: i64 = window_size.map(|w| w as i64).unwrap_or(-1);
         let query_position_offset = kv_seq_len - 1;
-        // A block per KV head serves its grouped query heads when they are
-        // few enough (`TQ_MAX_GROUP`): every code is decoded once for them
-        // all. Otherwise a block per query head.
-        let group = head_count / kv_head_count;
-        let grouped = group <= TQ_MAX_GROUP;
-        let split = self.function(if grouped {
-            "tq_attention_split_grouped_kernel"
-        } else {
-            "tq_attention_split_kernel"
-        })?;
         let mut args = self.stream.launch_builder(&split);
         args.arg(&q.slice)
             .arg(&k.codes)
@@ -2673,7 +2806,7 @@ impl CudaKernels {
             .arg(&causal_flag)
             .arg(&window_arg)
             .arg(&query_position_offset)
-            .arg(&chunks)
+            .arg(&parts)
             .arg(&step_offset)
             .arg(&score_scale)
             .arg(&value_dimension);
@@ -2693,13 +2826,13 @@ impl CudaKernels {
         args.arg(&exact_rows).arg(&v.signs).arg(&v.offsets);
         let config = LaunchConfig {
             grid_dim: (
-                u32::try_from(chunks).map_err(|_| overflow())?,
+                u32::try_from(parts).map_err(|_| overflow())?,
                 u32::try_from(if grouped { kv_head_count } else { head_count })
                     .map_err(|_| overflow())?,
                 1,
             ),
             block_dim: (ATTENTION_SPLIT_THREADS, 1, 1),
-            shared_mem_bytes: 0,
+            shared_mem_bytes: u32::try_from(staged_shared.unwrap_or(0)).map_err(|_| overflow())?,
         };
         unsafe { args.launch(config) }?;
         self.combine_attention_partials(
@@ -2707,7 +2840,7 @@ impl CudaKernels {
             &mut out_dev,
             head_count,
             value_dimension,
-            chunks,
+            parts,
         )?;
         let rotate = self.function("tq_rotate_back_kernel")?;
         let mut args = self.stream.launch_builder(&rotate);

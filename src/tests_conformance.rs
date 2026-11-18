@@ -17,7 +17,7 @@ use magnetar_provider_api::HostTensor;
 use magnetar_provider_api::{packed_weight::PackedWeight, packed_weight::PackedWeightFormat};
 
 use crate::half_precision;
-use crate::kernels::{CudaDeviceBuffer, CudaHalfDType, CudaKernels};
+use crate::kernels::{CudaDeviceBuffer, CudaHalfDType, CudaKernels, TqDecodeSchedule};
 use crate::provider::CudaProvider;
 
 const TOLERANCE: f32 = 1e-3;
@@ -1152,6 +1152,9 @@ fn turboquant_kv_stores_round_trip_and_attend_like_the_cpu() {
             // More query heads per KV head than one grouped block serves:
             // a block per query head.
             (70, 16, 1, 64, None),
+            // Many chunks: several per block of the split schedule, some
+            // blocks past the history.
+            (4100, 8, 2, 128, None),
         ]
         .into_iter()
         .enumerate()
@@ -1260,22 +1263,32 @@ fn turboquant_kv_stores_round_trip_and_attend_like_the_cpu() {
                     true,
                 )
                 .unwrap();
-                let actual = kernels
-                    .attention_valued(
-                        &upload(&kernels, &q),
-                        &k_store,
-                        &v_store,
-                        heads,
-                        dim,
-                        None,
-                        Some(kv_heads),
-                        window,
-                        true,
-                        Some(history),
-                        None,
-                    )
-                    .unwrap();
-                assert_close(&download(&kernels, &actual), &expected);
+                // A decode step under every schedule of the code Kernels
+                // (`speed-up-decode-attention-on-codes`).
+                for schedule in [
+                    TqDecodeSchedule::Split,
+                    TqDecodeSchedule::ChunkPerBlock,
+                    TqDecodeSchedule::Unstaged,
+                ] {
+                    kernels.set_tq_decode_schedule(schedule);
+                    let actual = kernels
+                        .attention_valued(
+                            &upload(&kernels, &q),
+                            &k_store,
+                            &v_store,
+                            heads,
+                            dim,
+                            None,
+                            Some(kv_heads),
+                            window,
+                            true,
+                            Some(history),
+                            None,
+                        )
+                        .unwrap();
+                    assert_close(&download(&kernels, &actual), &expected);
+                }
+                kernels.set_tq_decode_schedule(TqDecodeSchedule::Split);
             }
         }
     }
@@ -1303,6 +1316,10 @@ fn turboquant_exact_heads_attend_like_the_cpu() {
             (300, 8, 2, 128, None, 128),
             (129, 8, 1, 256, Some(64u64), 100),
             (70, 16, 1, 64, None, 40),
+            // Many chunks: the head inside the first block of the split
+            // schedule, several chunks per block.
+            (4100, 8, 2, 128, None, 1024),
+            (2000, 7, 1, 64, Some(1500u64), 1024),
         ]
         .into_iter()
         .enumerate()
@@ -1374,22 +1391,32 @@ fn turboquant_exact_heads_attend_like_the_cpu() {
                     true,
                 )
                 .unwrap();
-                let actual = kernels
-                    .attention_valued(
-                        &upload(&kernels, &q),
-                        &k_store,
-                        &v_store,
-                        heads,
-                        dim,
-                        None,
-                        Some(kv_heads),
-                        window,
-                        true,
-                        Some(history),
-                        None,
-                    )
-                    .unwrap();
-                assert_close(&download(&kernels, &actual), &expected);
+                // A decode step under every schedule of the code Kernels
+                // (`speed-up-decode-attention-on-codes`).
+                for schedule in [
+                    TqDecodeSchedule::Split,
+                    TqDecodeSchedule::ChunkPerBlock,
+                    TqDecodeSchedule::Unstaged,
+                ] {
+                    kernels.set_tq_decode_schedule(schedule);
+                    let actual = kernels
+                        .attention_valued(
+                            &upload(&kernels, &q),
+                            &k_store,
+                            &v_store,
+                            heads,
+                            dim,
+                            None,
+                            Some(kv_heads),
+                            window,
+                            true,
+                            Some(history),
+                            None,
+                        )
+                        .unwrap();
+                    assert_close(&download(&kernels, &actual), &expected);
+                }
+                kernels.set_tq_decode_schedule(TqDecodeSchedule::Split);
             }
         }
     }
@@ -1524,6 +1551,159 @@ fn captured_decode_steps_keep_their_exact_head_regime() {
                 expected[offset as usize].data,
                 "replayed at {position}"
             );
+        }
+    }
+}
+
+/// `speed-up-decode-attention-on-codes`, decision 4: the split count
+/// fills the target with blocks, keeps at least two chunks per block and
+/// at most 32 blocks per KV head, and fills whole waves.
+#[test]
+fn turboquant_decode_splits_follow_the_heuristic() {
+    use crate::kernels::tq_split_count;
+    // Qwen2.5-0.5B's 2 KV heads on 28 multiprocessors holding 4 blocks.
+    assert_eq!(tq_split_count(112, 2, 256), 32);
+    assert_eq!(tq_split_count(112, 2, 32), 16);
+    assert_eq!(tq_split_count(112, 2, 5), 2);
+    assert_eq!(tq_split_count(112, 2, 1), 1);
+    // Mistral 7B's 8 KV heads: 14 blocks each fill the 112 exactly.
+    assert_eq!(tq_split_count(112, 8, 256), 14);
+    // 84 resident blocks: 11 per KV head would leave a second wave of 4
+    // blocks; 10 fill one wave.
+    assert_eq!(tq_split_count(84, 8, 256), 10);
+    // As many KV heads as resident blocks: one block each.
+    assert_eq!(tq_split_count(28, 32, 256), 1);
+}
+
+/// `speed-up-decode-attention-on-codes`: a decode step over TurboQuant
+/// stores, captured with its history split over two blocks per KV head,
+/// replays over histories up to 1,001 keys with the same blocks (four
+/// chunks each), every replay matching the CPU reference over the stores'
+/// values.
+#[test]
+fn captured_split_decode_steps_cover_longer_histories() {
+    use magnetar_provider_api::{KvStorePrecision, TurboQuantStoreState};
+    use std::collections::BTreeSet;
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    kernels.set_tq_decode_schedule(TqDecodeSchedule::Split);
+    let (heads, kv_heads, dim, capacity, prefix) = (8u64, 2u64, 64u64, 1200u64, 600u64);
+    let width = kv_heads * dim;
+    let all_k = hashed_values((capacity * width) as usize, 1);
+    let all_v = hashed_values((capacity * width) as usize, 2);
+    let rows = |all: &[f32], from: u64, count: u64| {
+        HostTensor::new(
+            [count, width],
+            all[(from * width) as usize..((from + count) * width) as usize].to_vec(),
+        )
+        .unwrap()
+    };
+    let query = |position: u64| {
+        HostTensor::new(
+            [1, heads * dim],
+            hashed_values((heads * dim) as usize, 300 + position as usize),
+        )
+        .unwrap()
+    };
+    let mut stores = [&all_k, &all_v].map(|all| {
+        let mut store = kernels
+            .tq_zeros(&[capacity, width], KvStorePrecision::Tq4, dim)
+            .unwrap();
+        kernels
+            .kv_write(&mut store, &upload(&kernels, &rows(all, 0, prefix)), 0)
+            .unwrap();
+        store
+    });
+    let mut cpu = [&all_k, &all_v].map(|all| {
+        let mut store = TurboQuantStoreState::new(KvStorePrecision::Tq4, dim, width);
+        let values = store.write(&rows(all, 0, prefix).data, 0).unwrap();
+        (store, values)
+    });
+    let mut q = upload(&kernels, &query(prefix));
+    let mut k_row = upload(&kernels, &rows(&all_k, prefix, 1));
+    let mut v_row = upload(&kernels, &rows(&all_v, prefix, 1));
+    // An eager step first: Kernels compiled, scratch grown.
+    {
+        let [k_store, v_store] = &stores;
+        kernels
+            .attention_valued(
+                &q,
+                k_store,
+                v_store,
+                heads,
+                dim,
+                None,
+                Some(kv_heads),
+                None,
+                true,
+                Some(prefix),
+                None,
+            )
+            .unwrap();
+    }
+    let out = kernels
+        .stream()
+        .alloc_zeros::<f32>((heads * dim) as usize)
+        .unwrap();
+    kernels
+        .begin_capture(BTreeSet::from(["key_count".into(), "row_offset".into()]))
+        .unwrap();
+    let offered = kernels.offer_output(Some(out));
+    let captured = {
+        let [k_store, v_store] = &mut stores;
+        kernels.kv_write(k_store, &k_row, prefix).unwrap();
+        kernels.kv_write(v_store, &v_row, prefix).unwrap();
+        kernels
+            .attention_valued(
+                &q,
+                k_store,
+                v_store,
+                heads,
+                dim,
+                None,
+                Some(kv_heads),
+                None,
+                true,
+                Some(prefix + 1),
+                None,
+            )
+            .unwrap()
+    };
+    drop(offered);
+    let mut step = kernels.end_capture().unwrap();
+    assert_eq!(step.max_offset, capacity - (prefix + 1));
+    for offset in 0..=400u64 {
+        let position = prefix + offset;
+        kernels.write_into(&mut q, &query(position).data).unwrap();
+        kernels
+            .write_into(&mut k_row, &rows(&all_k, position, 1).data)
+            .unwrap();
+        kernels
+            .write_into(&mut v_row, &rows(&all_v, position, 1).data)
+            .unwrap();
+        for ((store, values), all) in cpu.iter_mut().zip([&all_k, &all_v]) {
+            values.extend(store.write(&rows(all, position, 1).data, position).unwrap());
+        }
+        kernels.launch_captured(&mut step, offset).unwrap();
+        // Histories of 5 to 8 chunks: two blocks of three or four chunks.
+        if offset % 100 == 0 || offset == 167 {
+            let keys = position + 1;
+            let history = |values: &Vec<f32>| {
+                HostTensor::new([keys, width], values[..(keys * width) as usize].to_vec()).unwrap()
+            };
+            let expected = magnetar_provider_cpu::attention(
+                &query(position),
+                &history(&cpu[0].1),
+                &history(&cpu[1].1),
+                heads,
+                dim,
+                Some(kv_heads),
+                None,
+                true,
+            )
+            .unwrap();
+            assert_close(&download(&kernels, &captured), &expected);
         }
     }
 }
@@ -2354,6 +2534,7 @@ fn decode_attention_times() {
         "attention_split_gqa128_kernel",
         "attention_combine_kernel",
         "tq_attention_split_grouped_kernel",
+        "tq_attention_split_staged_kernel",
         "tq_attention_split_kernel",
         "tq_rotate_back_kernel",
     ] {
@@ -2422,21 +2603,34 @@ fn decode_attention_times() {
                 "decode attention, {label}, {keys} keys: f32 {f32_us:.1} us ({:.0} GB/s)",
                 f32_bytes / f32_us / 1e3
             );
+            // Every schedule of the code Kernels on codes alone
+            // (`speed-up-decode-attention-on-codes`), and the split one
+            // with an exact head.
             for (precision, bits) in [(KvStorePrecision::Tq4, 4), (KvStorePrecision::Tq3, 3)] {
-                for exact in [0u64, 1024] {
+                for (schedule, exact, name) in [
+                    (TqDecodeSchedule::Unstaged, 0u64, "unstaged"),
+                    (
+                        TqDecodeSchedule::ChunkPerBlock,
+                        0,
+                        "staged, a chunk per block",
+                    ),
+                    (TqDecodeSchedule::Split, 0, "staged and split"),
+                    (
+                        TqDecodeSchedule::Split,
+                        1024,
+                        "staged and split, a 1,024-row head",
+                    ),
+                ] {
+                    kernels.set_tq_decode_schedule(schedule);
                     let us = tq(precision, exact);
                     line.push_str(&format!(
-                        ", {}{} {us:.1} us ({:.0} GB/s)",
+                        ", {} {name} {us:.1} us ({:.0} GB/s)",
                         precision.as_str(),
-                        if exact > 0 {
-                            " with a 1,024-row head"
-                        } else {
-                            ""
-                        },
                         tq_bytes(bits, exact) / us / 1e3
                     ));
                 }
             }
+            kernels.set_tq_decode_schedule(TqDecodeSchedule::Split);
             eprintln!("{line}");
         }
     }

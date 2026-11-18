@@ -6336,3 +6336,467 @@ extern "C" __global__ void tq_attention_split_grouped_kernel(
         out[value_dimension + 1] = row_sum[tid];
     }
 }
+
+// ---------------------------------------------------------------------------
+// TurboQuant decode attention, staged and split
+// (`speed-up-decode-attention-on-codes`).
+
+// `tq_attention_split_grouped_kernel`'s attention for 64- to 128-wide (at
+// most) heads, scheduled differently. Block (split, kv_head) serves the
+// group's query heads over its share of the admitted keys' chunks of
+// ATTENTION_CHUNK_KEYS: `splits` blocks per KV head share the `n` chunks
+// computed here from the key count, so a captured step's replays spread
+// their longer histories over the same blocks. The block
+// - rotates its query heads once (dynamic shared memory sized to the
+//   group);
+// - per chunk, stages the chunk's K and V codes and norms in shared memory
+//   with coalesced loads (rows padded by a word, so a thread per key reads
+//   distinct banks), scores the keys one thread per key, and takes an
+//   online softmax per query head (running maximum and sum; the
+//   accumulators rescaled when the maximum grows);
+// - sums the values with every thread: thread `t` owns value coordinate
+//   `t % v_dim` of the query heads `t / v_dim + i * (blockDim.x / v_dim)`;
+// - keeps an exact head's (`keep-turboquant-kv-head-exact`) keys scored
+//   against the query as it is and their values summed unrotated, rotated
+//   once at the end into the codes' domain;
+// - writes one partial per query head in `attention_split_kernel`'s layout
+//   (`splits` partials per head), for `attention_combine_kernel` and
+//   `tq_rotate_back_kernel`.
+// Dynamic shared memory: `group * head_dimension + group * value_dimension
+// + 2 * ATTENTION_CHUNK_KEYS` floats, then ATTENTION_CHUNK_KEYS rows of K
+// codes and of V codes, each `code bytes` rounded up to a word plus a word.
+extern "C" __global__ void tq_attention_split_staged_kernel(
+    const float* q,
+    const unsigned char* k_codes,
+    const float* k_norms,
+    const float* k_centroids,
+    const float* k_signs,
+    const float* k_offsets,
+    unsigned int k_bits,
+    const unsigned char* v_codes,
+    const float* v_norms,
+    const float* v_centroids,
+    unsigned int v_bits,
+    float* partial,
+    unsigned long long kv_seq_len,
+    unsigned long long head_count,
+    unsigned long long kv_head_count,
+    unsigned long long head_dimension,
+    int causal,
+    long long window_size,
+    unsigned long long query_position_offset,
+    unsigned long long splits,
+    const unsigned long long* step_offset,
+    float score_scale,
+    unsigned long long value_dimension,
+    const float* k_exact,
+    const float* v_exact,
+    unsigned long long exact_rows,
+    const float* v_signs,
+    const float* v_offsets
+) {
+    extern __shared__ float tq_staged[];
+    __shared__ float scores[TQ_MAX_GROUP][ATTENTION_CHUNK_KEYS];
+    __shared__ float q_offsets[TQ_MAX_GROUP];
+    __shared__ float run_max[TQ_MAX_GROUP];
+    __shared__ float run_sum[TQ_MAX_GROUP];
+    __shared__ float exact_weight[TQ_MAX_GROUP];
+    __shared__ float chunk_scale[TQ_MAX_GROUP];
+    __shared__ float k_book[16];
+    __shared__ float v_book[16];
+    if (step_offset) {
+        kv_seq_len += *step_offset;
+        query_position_offset += *step_offset;
+    }
+    unsigned long long split = blockIdx.x;
+    unsigned long long kv_head = blockIdx.y;
+    unsigned int tid = threadIdx.x;
+    unsigned int lane = tid & 31;
+    unsigned int warp = tid >> 5;
+    unsigned int warps = blockDim.x >> 5;
+    unsigned int group = (unsigned int)(head_count / kv_head_count);
+    unsigned int dim = (unsigned int)head_dimension;
+    unsigned int v_dim = (unsigned int)value_dimension;
+    unsigned long long head0 = kv_head * group;
+    float scale = score_scale > 0.0f ? score_scale : 1.0f / sqrtf((float)head_dimension);
+
+    unsigned long long query_position = query_position_offset;
+    unsigned long long key_upper = causal ? (query_position + 1) : kv_seq_len;
+    unsigned long long key_lower = 0;
+    if (window_size >= 0) {
+        unsigned long long window = (unsigned long long)window_size;
+        unsigned long long back = window > 0 ? window - 1 : 0;
+        key_lower = query_position > back ? query_position - back : 0;
+        if (key_lower > key_upper) {
+            key_lower = key_upper;
+        }
+    }
+    unsigned long long chunk_count =
+        (key_upper - key_lower + ATTENTION_CHUNK_KEYS - 1) / ATTENTION_CHUNK_KEYS;
+    unsigned long long per_split = (chunk_count + splits - 1) / splits;
+    unsigned long long chunk_begin = split * per_split;
+    unsigned long long chunk_end = chunk_begin + per_split;
+    if (chunk_end > chunk_count) {
+        chunk_end = chunk_count;
+    }
+    if (chunk_begin >= chunk_end) {
+        for (unsigned int g = 0; g < group; g++) {
+            float* out = partial + ((head0 + g) * splits + split) * (value_dimension + 2);
+            for (unsigned int d = tid; d < v_dim; d += blockDim.x) {
+                out[d] = 0.0f;
+            }
+            if (tid == 0) {
+                out[value_dimension] = neg_inf();
+                out[value_dimension + 1] = 0.0f;
+            }
+        }
+        return;
+    }
+
+    unsigned int k_code_bytes = dim * k_bits / 8u;
+    unsigned int v_code_bytes = v_dim * v_bits / 8u;
+    unsigned int k_row = ((k_code_bytes + 3u) & ~3u) + 4u;
+    unsigned int v_row = ((v_code_bytes + 3u) & ~3u) + 4u;
+    float* q_rot = tq_staged;
+    float* exact_rotated = q_rot + group * dim;
+    float* k_norm_s = exact_rotated + group * v_dim;
+    float* v_norm_s = k_norm_s + ATTENTION_CHUNK_KEYS;
+    unsigned char* k_stage = (unsigned char*)(v_norm_s + ATTENTION_CHUNK_KEYS);
+    unsigned char* v_stage = k_stage + ATTENTION_CHUNK_KEYS * k_row;
+
+    // The value coordinate and query heads this thread owns.
+    unsigned int slices = v_dim < blockDim.x ? blockDim.x / v_dim : 1u;
+    unsigned int own_d = tid % v_dim;
+    unsigned int slice = tid / v_dim;
+    bool owns = tid < slices * v_dim;
+
+    if (tid < (1u << k_bits)) {
+        k_book[tid] = k_centroids[tid];
+    }
+    if (tid < (1u << v_bits)) {
+        v_book[tid] = v_centroids[tid];
+    }
+    // Every query head after the signs, and its `q . k_offsets`.
+    const float* k_offset = k_offsets + kv_head * head_dimension;
+    for (unsigned int i = tid; i < group * dim; i += blockDim.x) {
+        unsigned int d = i % dim;
+        q_rot[i] = q[(head0 + i / dim) * head_dimension + d] * k_signs[d];
+    }
+    for (unsigned int g = warp; g < group; g += warps) {
+        const float* q_row = q + (head0 + g) * head_dimension;
+        float part = 0.0f;
+        for (unsigned int d = lane; d < dim; d += 32) {
+            part += q_row[d] * k_offset[d];
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            part += __shfl_xor_sync(0xffffffffu, part, offset);
+        }
+        if (lane == 0) {
+            q_offsets[g] = part;
+            run_max[g] = neg_inf();
+            run_sum[g] = 0.0f;
+            exact_weight[g] = 0.0f;
+        }
+    }
+    __syncthreads();
+    for (unsigned int half = 1; half < dim; half <<= 1) {
+        for (unsigned int t = tid; t < group * (dim / 2); t += blockDim.x) {
+            unsigned int base = (t / (dim / 2)) * dim;
+            unsigned int u = t % (dim / 2);
+            unsigned int i = base + (u / half) * 2 * half + (u % half);
+            float a = q_rot[i];
+            float b = q_rot[i + half];
+            q_rot[i] = a + b;
+            q_rot[i + half] = a - b;
+        }
+        __syncthreads();
+    }
+    float rotate_scale = 1.0f / sqrtf((float)dim);
+    for (unsigned int i = tid; i < group * dim; i += blockDim.x) {
+        q_rot[i] *= rotate_scale;
+    }
+    __syncthreads();
+
+    // The running sums of the owned coordinate: of rotated values (codes)
+    // and of unrotated ones (the exact head), relative to `run_max`.
+    float acc[TQ_MAX_GROUP];
+    float acc_exact[TQ_MAX_GROUP];
+#pragma unroll
+    for (unsigned int i = 0; i < TQ_MAX_GROUP; i++) {
+        acc[i] = 0.0f;
+        acc_exact[i] = 0.0f;
+    }
+    bool any_exact = false;
+    bool word_rows = (k_code_bytes & 3u) == 0 && (v_code_bytes & 3u) == 0;
+
+    for (unsigned long long c = chunk_begin; c < chunk_end; c++) {
+        unsigned long long first = key_lower + c * ATTENTION_CHUNK_KEYS;
+        unsigned long long last = first + ATTENTION_CHUNK_KEYS;
+        if (last > key_upper) {
+            last = key_upper;
+        }
+        unsigned int count = (unsigned int)(last - first);
+        unsigned long long exact_end = exact_rows < last ? exact_rows : last;
+        unsigned int exact_count = first < exact_end ? (unsigned int)(exact_end - first) : 0u;
+        any_exact = any_exact || exact_count > 0;
+
+        // Stage the coded keys' codes and norms, consecutive threads
+        // reading consecutive words (or bytes) of a row.
+        unsigned int coded = count - exact_count;
+        if (word_rows) {
+            unsigned int k_words = k_code_bytes / 4u;
+            unsigned int v_words = v_code_bytes / 4u;
+            const unsigned int* k_src = (const unsigned int*)k_codes;
+            const unsigned int* v_src = (const unsigned int*)v_codes;
+            for (unsigned int e = tid; e < coded * k_words; e += blockDim.x) {
+                unsigned int j = exact_count + e / k_words;
+                unsigned long long cell = (first + j) * kv_head_count + kv_head;
+                ((unsigned int*)(k_stage + j * k_row))[e % k_words] =
+                    k_src[cell * k_words + e % k_words];
+            }
+            for (unsigned int e = tid; e < coded * v_words; e += blockDim.x) {
+                unsigned int j = exact_count + e / v_words;
+                unsigned long long cell = (first + j) * kv_head_count + kv_head;
+                ((unsigned int*)(v_stage + j * v_row))[e % v_words] =
+                    v_src[cell * v_words + e % v_words];
+            }
+        } else {
+            for (unsigned int e = tid; e < coded * k_code_bytes; e += blockDim.x) {
+                unsigned int j = exact_count + e / k_code_bytes;
+                unsigned long long cell = (first + j) * kv_head_count + kv_head;
+                k_stage[j * k_row + e % k_code_bytes] =
+                    k_codes[cell * k_code_bytes + e % k_code_bytes];
+            }
+            for (unsigned int e = tid; e < coded * v_code_bytes; e += blockDim.x) {
+                unsigned int j = exact_count + e / v_code_bytes;
+                unsigned long long cell = (first + j) * kv_head_count + kv_head;
+                v_stage[j * v_row + e % v_code_bytes] =
+                    v_codes[cell * v_code_bytes + e % v_code_bytes];
+            }
+        }
+        for (unsigned int j = exact_count + tid; j < count; j += blockDim.x) {
+            unsigned long long cell = (first + j) * kv_head_count + kv_head;
+            k_norm_s[j] = k_norms[cell];
+            v_norm_s[j] = v_norms[cell];
+        }
+        __syncthreads();
+
+        // Scores: one thread per key, every query head.
+        for (unsigned int j = tid; j < count; j += blockDim.x) {
+            float dot[TQ_MAX_GROUP];
+#pragma unroll
+            for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
+                dot[g] = 0.0f;
+            }
+            if (j < exact_count) {
+                // An exact key against every query head as it is.
+                const float* exact_row =
+                    k_exact + ((first + j) * kv_head_count + kv_head) * head_dimension;
+                for (unsigned int d = 0; d < dim; d++) {
+                    float key = exact_row[d];
+#pragma unroll
+                    for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
+                        if (g < group) {
+                            dot[g] += q[(head0 + g) * head_dimension + d] * key;
+                        }
+                    }
+                }
+#pragma unroll
+                for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
+                    if (g < group) {
+                        scores[g][j] = dot[g] * scale;
+                    }
+                }
+                continue;
+            }
+            const unsigned char* k_row_codes = k_stage + j * k_row;
+            if (k_bits == 4u && word_rows) {
+                const unsigned int* words = (const unsigned int*)k_row_codes;
+                for (unsigned int d = 0; d < dim; d += 8) {
+                    unsigned int word = words[d >> 3];
+#pragma unroll
+                    for (unsigned int e = 0; e < 8; e++) {
+                        float centroid = k_book[(word >> (4u * e)) & 15u];
+#pragma unroll
+                        for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
+                            if (g < group) {
+                                dot[g] += q_rot[g * dim + d + e] * centroid;
+                            }
+                        }
+                    }
+                }
+            } else if (k_bits == 3u && (dim & 7u) == 0) {
+                // Eight 3-bit codes in every three bytes, little-endian.
+                for (unsigned int d = 0; d < dim; d += 8) {
+                    const unsigned char* bytes = k_row_codes + (d >> 3) * 3u;
+                    unsigned int word = (unsigned int)bytes[0] | ((unsigned int)bytes[1] << 8)
+                        | ((unsigned int)bytes[2] << 16);
+#pragma unroll
+                    for (unsigned int e = 0; e < 8; e++) {
+                        float centroid = k_book[(word >> (3u * e)) & 7u];
+#pragma unroll
+                        for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
+                            if (g < group) {
+                                dot[g] += q_rot[g * dim + d + e] * centroid;
+                            }
+                        }
+                    }
+                }
+            } else {
+                for (unsigned int d = 0; d < dim; d++) {
+                    float centroid = k_book[tq_code(k_row_codes, k_bits, d)];
+#pragma unroll
+                    for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
+                        if (g < group) {
+                            dot[g] += q_rot[g * dim + d] * centroid;
+                        }
+                    }
+                }
+            }
+            float norm = k_norm_s[j];
+#pragma unroll
+            for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
+                if (g < group) {
+                    scores[g][j] = (q_offsets[g] + dot[g] * norm) * scale;
+                }
+            }
+        }
+        __syncthreads();
+
+        // Online softmax: a warp per query head. The chunk's weights are
+        // taken against the new running maximum; the running sums and the
+        // owned accumulators are rescaled by `chunk_scale`. A key on codes
+        // weighs with its value's norm.
+        for (unsigned int g = warp; g < group; g += warps) {
+            float chunk_max = neg_inf();
+            for (unsigned int j = lane; j < count; j += 32) {
+                chunk_max = fmaxf(chunk_max, scores[g][j]);
+            }
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                chunk_max = fmaxf(chunk_max, __shfl_xor_sync(0xffffffffu, chunk_max, offset));
+            }
+            float old_max = run_max[g];
+            float new_max = fmaxf(old_max, chunk_max);
+            float rescale = old_max == neg_inf() ? 0.0f : expf(old_max - new_max);
+            float sum = 0.0f;
+            float exact_part = 0.0f;
+            for (unsigned int j = lane; j < count; j += 32) {
+                float weight = expf(scores[g][j] - new_max);
+                sum += weight;
+                if (j < exact_count) {
+                    exact_part += weight;
+                    scores[g][j] = weight;
+                } else {
+                    scores[g][j] = weight * v_norm_s[j];
+                }
+            }
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                sum += __shfl_xor_sync(0xffffffffu, sum, offset);
+                exact_part += __shfl_xor_sync(0xffffffffu, exact_part, offset);
+            }
+            if (lane == 0) {
+                run_max[g] = new_max;
+                run_sum[g] = run_sum[g] * rescale + sum;
+                exact_weight[g] = exact_weight[g] * rescale + exact_part;
+                chunk_scale[g] = rescale;
+            }
+        }
+        __syncthreads();
+
+        // Values: every thread its coordinate of its query heads.
+        if (owns) {
+#pragma unroll
+            for (unsigned int i = 0; i < TQ_MAX_GROUP; i++) {
+                unsigned int g = slice + i * slices;
+                if (g < group) {
+                    acc[i] *= chunk_scale[g];
+                    acc_exact[i] *= chunk_scale[g];
+                }
+            }
+            for (unsigned int j = exact_count; j < count; j++) {
+                const unsigned char* row = v_stage + j * v_row;
+                unsigned int code = v_bits == 4u
+                    ? (row[own_d >> 1] >> ((own_d & 1u) << 2)) & 15u
+                    : tq_code(row, v_bits, own_d);
+                float centroid = v_book[code];
+#pragma unroll
+                for (unsigned int i = 0; i < TQ_MAX_GROUP; i++) {
+                    unsigned int g = slice + i * slices;
+                    if (g < group) {
+                        acc[i] += scores[g][j] * centroid;
+                    }
+                }
+            }
+            for (unsigned int j = 0; j < exact_count; j++) {
+                float value =
+                    v_exact[((first + j) * kv_head_count + kv_head) * value_dimension + own_d];
+#pragma unroll
+                for (unsigned int i = 0; i < TQ_MAX_GROUP; i++) {
+                    unsigned int g = slice + i * slices;
+                    if (g < group) {
+                        acc_exact[i] += scores[g][j] * value;
+                    }
+                }
+            }
+        }
+        // The next chunk restages the codes and rewrites the scores.
+        __syncthreads();
+    }
+
+    if (any_exact) {
+        // The exact sums, less the value offsets they carry, rotated into
+        // the codes' domain, every query head at once.
+        if (owns) {
+            float offset = v_offsets[kv_head * value_dimension + own_d];
+            float sign = v_signs[own_d];
+#pragma unroll
+            for (unsigned int i = 0; i < TQ_MAX_GROUP; i++) {
+                unsigned int g = slice + i * slices;
+                if (g < group) {
+                    exact_rotated[g * v_dim + own_d] =
+                        (acc_exact[i] - exact_weight[g] * offset) * sign;
+                }
+            }
+        }
+        __syncthreads();
+        for (unsigned int half = 1; half < v_dim; half <<= 1) {
+            for (unsigned int t = tid; t < group * (v_dim / 2); t += blockDim.x) {
+                unsigned int base = (t / (v_dim / 2)) * v_dim;
+                unsigned int u = t % (v_dim / 2);
+                unsigned int i = base + (u / half) * 2 * half + (u % half);
+                float a = exact_rotated[i];
+                float b = exact_rotated[i + half];
+                exact_rotated[i] = a + b;
+                exact_rotated[i + half] = a - b;
+            }
+            __syncthreads();
+        }
+        if (owns) {
+            float v_scale = 1.0f / sqrtf((float)v_dim);
+#pragma unroll
+            for (unsigned int i = 0; i < TQ_MAX_GROUP; i++) {
+                unsigned int g = slice + i * slices;
+                if (g < group) {
+                    acc[i] += exact_rotated[g * v_dim + own_d] * v_scale;
+                }
+            }
+        }
+    }
+
+    // The block's partials: weighted means and their statistics.
+    if (owns) {
+#pragma unroll
+        for (unsigned int i = 0; i < TQ_MAX_GROUP; i++) {
+            unsigned int g = slice + i * slices;
+            if (g < group) {
+                partial[((head0 + g) * splits + split) * (value_dimension + 2) + own_d] =
+                    acc[i] / run_sum[g];
+            }
+        }
+    }
+    if (tid < group) {
+        float* out = partial + ((head0 + tid) * splits + split) * (value_dimension + 2);
+        out[value_dimension] = run_max[tid];
+        out[value_dimension + 1] = run_sum[tid];
+    }
+}
