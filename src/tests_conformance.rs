@@ -1708,6 +1708,104 @@ fn captured_split_decode_steps_cover_longer_histories() {
     }
 }
 
+/// `cache-latent-attention-history`, `speed-up-decode-attention-on-codes`:
+/// a decode step over a latent TurboQuant store read as both K and V (16
+/// query heads over 576-value rows in groups of 64, the values the leading
+/// 512) runs on its codes, and matches the CPU's attention over the CPU
+/// store's values, as the path through dequantized scratch does: short and
+/// longer histories, an exact head ending inside a chunk and one past
+/// 1,024 rows, a sliding window starting inside the head, `tq4` and `tq3`.
+#[test]
+fn turboquant_latent_decode_on_codes_matches_the_cpu() {
+    use magnetar_provider_api::{KvStorePrecision, TurboQuantStoreState, value_heads};
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let (heads, width, latent, group) = (16u64, 576u64, 512u64, 64u64);
+    for precision in [KvStorePrecision::Tq4, KvStorePrecision::Tq3] {
+        for (keys, exact, window) in [
+            (33u64, 0u64, None),
+            (300, 0, None),
+            (300, 100, None),
+            (1100, 1024, None),
+            (700, 600, Some(300u64)),
+        ] {
+            let label = format!("{} {keys} keys, head {exact}", precision.as_str());
+            let capacity = keys + 7;
+            let data = hashed_values((keys * width) as usize, 11 + keys as usize);
+            let split = ((keys - 1) * width) as usize;
+            let mut store = kernels
+                .tq_zeros_with_exact_head(&[capacity, width], precision, group, exact)
+                .unwrap();
+            for (from, rows, offset) in [(0, keys - 1, 0), (split, 1, keys - 1)] {
+                let tensor = HostTensor::new(
+                    [rows, width],
+                    data[from..from + (rows * width) as usize].to_vec(),
+                )
+                .unwrap();
+                kernels
+                    .kv_write(&mut store, &upload(&kernels, &tensor), offset)
+                    .unwrap();
+            }
+            let mut cpu = TurboQuantStoreState::new(precision, group, width).with_exact_rows(exact);
+            let mut values = cpu.write(&data[..split], 0).unwrap();
+            values.extend(cpu.write(&data[split..], keys - 1).unwrap());
+            let rounded = HostTensor::new([keys, width], values).unwrap();
+            let rounded_values = value_heads(&rounded, 1, width, latent).unwrap();
+            let q = HostTensor::new(
+                [1, heads * width],
+                attention_values((heads * width) as usize, 9),
+            )
+            .unwrap();
+            let expected = magnetar_provider_cpu::attention_with_value_width(
+                &q,
+                &rounded,
+                &rounded_values,
+                heads,
+                width,
+                latent,
+                Some(1),
+                window,
+                true,
+                Some(0.1),
+            )
+            .unwrap();
+            for on_codes in [true, false] {
+                kernels.set_tq_latent_on_codes(on_codes);
+                let actual = kernels
+                    .attention_strided_values(
+                        &upload(&kernels, &q),
+                        &store,
+                        &store,
+                        heads,
+                        width,
+                        Some(latent),
+                        width,
+                        Some(1),
+                        window,
+                        true,
+                        Some(keys),
+                        Some(0.1),
+                    )
+                    .unwrap();
+                let actual = download(&kernels, &actual);
+                assert_eq!(actual.shape, expected.shape, "{label}");
+                let difference = actual
+                    .data
+                    .iter()
+                    .zip(&expected.data)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0_f32, f32::max);
+                assert!(
+                    difference <= TOLERANCE,
+                    "{label}, on codes {on_codes}: {difference}"
+                );
+            }
+            kernels.set_tq_latent_on_codes(true);
+        }
+    }
+}
+
 /// `cache-latent-attention-history`: `batched-matmul` matches the CPU's,
 /// and attention over a latent history read as its own V
 /// (`value_head_stride`) matches the CPU's attention over the extracted
@@ -2640,7 +2738,8 @@ fn decode_attention_times() {
 /// (`cache-latent-attention-history`): 16 query heads over one latent
 /// history of 576-value rows (512 latent values and 64 rope ones), the
 /// values each row's leading 512, scale 0.1; in an f32 store and in `tq4`
-/// stores (groups of 64) without and with a 1,024-row exact head, over
+/// stores (groups of 64): through dequantized scratch, on the codes, and on
+/// the codes with a 1,024-row exact head, over
 /// 1,024 to 32,768 keys. Not a conformance check: run it with `--ignored
 /// --nocapture` on a GPU.
 #[test]
@@ -2699,22 +2798,25 @@ fn latent_decode_attention_times() {
             })
         };
         let f32_us = attend(&upload(&kernels, &rows));
-        let tq = |exact: u64| {
+        let tq = |exact: u64, on_codes: bool| {
             let mut store = kernels
                 .tq_zeros_with_exact_head(&[keys, width], KvStorePrecision::Tq4, group, exact)
                 .unwrap();
             kernels
                 .kv_write(&mut store, &upload(&kernels, &rows), 0)
                 .unwrap();
-            attend(&store)
+            kernels.set_tq_latent_on_codes(on_codes);
+            let us = attend(&store);
+            kernels.set_tq_latent_on_codes(true);
+            us
         };
-        let (codes_us, head_us) = (tq(0), tq(1024));
+        let (scratch_us, codes_us, head_us) = (tq(0, false), tq(0, true), tq(1024, true));
         let f32_bytes = (keys * width * 4) as f32;
         let tq_bytes = (keys * (width / group) * (group / 2 + 4)) as f32;
         eprintln!(
             "latent decode attention, DeepSeek-V2-Lite, {keys} keys: f32 {f32_us:.1} us \
-             ({:.0} GB/s), tq4 {codes_us:.1} us ({:.0} GB/s), tq4 with a 1,024-row head \
-             {head_us:.1} us",
+             ({:.0} GB/s), tq4 through dequantized scratch {scratch_us:.1} us, tq4 on codes \
+             {codes_us:.1} us ({:.0} GB/s), tq4 on codes with a 1,024-row head {head_us:.1} us",
             f32_bytes / f32_us / 1e3,
             tq_bytes / codes_us / 1e3,
         );

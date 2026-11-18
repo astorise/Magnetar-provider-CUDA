@@ -6899,3 +6899,370 @@ extern "C" __global__ void tq_attention_split_staged_kernel(
         out[value_dimension + 1] = run_sum[tid];
     }
 }
+
+// ---------------------------------------------------------------------------
+// TurboQuant decode attention over a latent history
+// (`cache-latent-attention-history`, `speed-up-decode-attention-on-codes`).
+
+// One query row against a latent TurboQuant store read as both K and V: a
+// row of `k_groups` groups of `d` values (each group quantized on its own:
+// codes, a norm, the store's offsets, the signs of `d`), each query head
+// `k_groups * d` wide, the values each row's leading `v_groups` groups.
+// Block (chunk, head block) serves up to TQ_MAX_GROUP query heads over a
+// chunk of ATTENTION_CHUNK_KEYS keys, so every code is decoded once for
+// them all:
+// - the prologue rotates every group of every query head (`q' = Pi q`, a
+//   transform per group) and computes each head's `q . offsets`;
+// - one thread per key scores it against every query head, a group at a
+//   time (`q . k = q . offsets + sum_g |k_g - o_g| q'_g . c_g`);
+// - one warp per query head takes the chunk's softmax;
+// - thread (d, h) sums value coordinate d of `value_heads` heads, each
+//   value `|v_g - o_g| c_g[d]` in its group's rotated domain;
+// - an exact head's (`keep-turboquant-kv-head-exact`) keys are scored as
+//   they are and their values summed unrotated, less the offsets, then
+//   rotated group by group into the codes' domain.
+// The partials are laid out as `attention_split_kernel`'s
+// (`v_groups * d + 2` floats per head and chunk), for
+// `attention_combine_kernel` and `tq_latent_rotate_back_kernel`.
+extern "C" __global__ void tq_latent_attention_split_kernel(
+    const float* q,
+    const unsigned char* codes,
+    const float* norms,
+    const float* centroids,
+    const float* signs,
+    const float* offsets,
+    unsigned int bits,
+    float* partial,
+    unsigned long long kv_seq_len,
+    unsigned long long head_count,
+    unsigned long long k_groups,
+    unsigned long long v_groups,
+    unsigned long long d,
+    int causal,
+    long long window_size,
+    unsigned long long query_position_offset,
+    unsigned long long chunks,
+    const unsigned long long* step_offset,
+    float score_scale,
+    const float* exact,
+    unsigned long long exact_rows
+) {
+    extern __shared__ __align__(16) float latent_shared[];
+    __shared__ __align__(16) float scores[ATTENTION_CHUNK_KEYS][TQ_MAX_GROUP];
+    __shared__ float q_offsets[TQ_MAX_GROUP];
+    __shared__ float row_max[TQ_MAX_GROUP];
+    __shared__ float row_sum[TQ_MAX_GROUP];
+    __shared__ float exact_sum[TQ_MAX_GROUP];
+    __shared__ float book[16];
+    if (step_offset) {
+        kv_seq_len += *step_offset;
+        query_position_offset += *step_offset;
+    }
+    unsigned long long chunk = blockIdx.x;
+    unsigned int tid = threadIdx.x;
+    unsigned int lane = tid & 31;
+    unsigned int warp = tid >> 5;
+    unsigned int warps = blockDim.x >> 5;
+    unsigned int dim = (unsigned int)d;
+    unsigned int k_width = (unsigned int)(k_groups * d);
+    unsigned int v_width = (unsigned int)(v_groups * d);
+    unsigned long long head0 = (unsigned long long)blockIdx.y * TQ_MAX_GROUP;
+    unsigned int group = (unsigned int)(head_count - head0 < TQ_MAX_GROUP
+        ? head_count - head0 : TQ_MAX_GROUP);
+    float scale = score_scale > 0.0f ? score_scale : 1.0f / sqrtf((float)k_width);
+    // The rotated queries, `group` rows of `k_width`; later the exact
+    // values' sums, `group` rows of `v_width`.
+    float* q_rot = latent_shared;
+
+    unsigned long long query_position = query_position_offset;
+    unsigned long long key_upper = causal ? (query_position + 1) : kv_seq_len;
+    unsigned long long key_lower = 0;
+    if (window_size >= 0) {
+        unsigned long long window = (unsigned long long)window_size;
+        unsigned long long back = window > 0 ? window - 1 : 0;
+        key_lower = query_position > back ? query_position - back : 0;
+        if (key_lower > key_upper) {
+            key_lower = key_upper;
+        }
+    }
+    unsigned long long first = key_lower + chunk * ATTENTION_CHUNK_KEYS;
+    unsigned long long last = first + ATTENTION_CHUNK_KEYS;
+    if (last > key_upper) {
+        last = key_upper;
+    }
+    if (first >= last) {
+        for (unsigned int g = 0; g < group; g++) {
+            float* out = partial + ((head0 + g) * chunks + chunk) * (v_width + 2);
+            for (unsigned int i = tid; i < v_width; i += blockDim.x) {
+                out[i] = 0.0f;
+            }
+            if (tid == 0) {
+                out[v_width] = neg_inf();
+                out[v_width + 1] = 0.0f;
+            }
+        }
+        return;
+    }
+    unsigned int count = (unsigned int)(last - first);
+    unsigned long long exact_end = exact_rows < last ? exact_rows : last;
+    unsigned int exact_count = first < exact_end ? (unsigned int)(exact_end - first) : 0u;
+
+    if (tid < (1u << bits)) {
+        book[tid] = centroids[tid];
+    }
+    // Every query head after the signs (group by group), and its
+    // `q . offsets`.
+    for (unsigned int i = tid; i < group * k_width; i += blockDim.x) {
+        q_rot[i] = q[(head0 + i / k_width) * k_width + i % k_width] * signs[i % dim];
+    }
+    for (unsigned int g = warp; g < group; g += warps) {
+        const float* q_row = q + (head0 + g) * k_width;
+        float part = 0.0f;
+        for (unsigned int i = lane; i < k_width; i += 32) {
+            part += q_row[i] * offsets[i];
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            part += __shfl_xor_sync(0xffffffffu, part, offset);
+        }
+        if (lane == 0) {
+            q_offsets[g] = part;
+        }
+    }
+    __syncthreads();
+    // The Walsh-Hadamard transform of every group of every head at once.
+    unsigned int transforms = group * (unsigned int)k_groups;
+    for (unsigned int half = 1; half < dim; half <<= 1) {
+        for (unsigned int t = tid; t < transforms * (dim / 2); t += blockDim.x) {
+            unsigned int base = (t / (dim / 2)) * dim;
+            unsigned int u = t % (dim / 2);
+            unsigned int i = base + (u / half) * 2 * half + (u % half);
+            float a = q_rot[i];
+            float b = q_rot[i + half];
+            q_rot[i] = a + b;
+            q_rot[i + half] = a - b;
+        }
+        __syncthreads();
+    }
+    float rotate_scale = 1.0f / sqrtf((float)dim);
+    for (unsigned int i = tid; i < group * k_width; i += blockDim.x) {
+        q_rot[i] *= rotate_scale;
+    }
+    __syncthreads();
+
+    // Scores: one thread per key, every query head, a group at a time.
+    unsigned int code_bytes = dim * bits / 8u;
+    for (unsigned int j = tid; j < count; j += blockDim.x) {
+        unsigned long long row = first + j;
+        float dot[TQ_MAX_GROUP];
+#pragma unroll
+        for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
+            dot[g] = 0.0f;
+        }
+        if (j < exact_count) {
+            // An exact key against every query head as it is.
+            const float* exact_row = exact + row * k_width;
+            for (unsigned int i = 0; i < k_width; i++) {
+                float key = exact_row[i];
+#pragma unroll
+                for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
+                    if (g < group) {
+                        dot[g] += q[(head0 + g) * k_width + i] * key;
+                    }
+                }
+            }
+#pragma unroll
+            for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
+                if (g < group) {
+                    scores[j][g] = dot[g] * scale;
+                }
+            }
+            continue;
+        }
+        for (unsigned int kg = 0; kg < (unsigned int)k_groups; kg++) {
+            unsigned long long cell = row * k_groups + kg;
+            const unsigned char* row_codes = codes + cell * code_bytes;
+            float part[TQ_MAX_GROUP];
+#pragma unroll
+            for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
+                part[g] = 0.0f;
+            }
+            for (unsigned int e8 = 0; e8 < dim; e8 += 8) {
+                float centroid[8];
+                if (bits == 4u) {
+                    unsigned int word = ((const unsigned int*)row_codes)[e8 >> 3];
+#pragma unroll
+                    for (unsigned int e = 0; e < 8; e++) {
+                        centroid[e] = book[(word >> (4u * e)) & 15u];
+                    }
+                } else {
+#pragma unroll
+                    for (unsigned int e = 0; e < 8; e++) {
+                        centroid[e] = book[tq_code(row_codes, bits, e8 + e)];
+                    }
+                }
+                tq_dot8(part, q_rot, group, k_width, kg * dim + e8, centroid);
+            }
+            float norm = norms[cell];
+#pragma unroll
+            for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
+                dot[g] = fmaf(norm, part[g], dot[g]);
+            }
+        }
+#pragma unroll
+        for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
+            if (g < group) {
+                scores[j][g] = (q_offsets[g] + dot[g]) * scale;
+            }
+        }
+    }
+    __syncthreads();
+
+    // Softmax: one warp per query head, the weights normalized; the exact
+    // keys' weights summed.
+    for (unsigned int g = warp; g < group; g += warps) {
+        float local_max = neg_inf();
+        for (unsigned int j = lane; j < count; j += 32) {
+            local_max = fmaxf(local_max, scores[j][g]);
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, offset));
+        }
+        float local_sum = 0.0f;
+        for (unsigned int j = lane; j < count; j += 32) {
+            float weight = expf(scores[j][g] - local_max);
+            scores[j][g] = weight;
+            local_sum += weight;
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            local_sum += __shfl_xor_sync(0xffffffffu, local_sum, offset);
+        }
+        float exact_part = 0.0f;
+        for (unsigned int j = lane; j < count; j += 32) {
+            float weight = scores[j][g] / local_sum;
+            scores[j][g] = weight;
+            if (j < exact_count) {
+                exact_part += weight;
+            }
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            exact_part += __shfl_xor_sync(0xffffffffu, exact_part, offset);
+        }
+        if (lane == 0) {
+            row_max[g] = local_max;
+            row_sum[g] = local_sum;
+            exact_sum[g] = exact_part;
+        }
+    }
+    __syncthreads();
+
+    // Values: thread (i, h) sums coordinate i of the heads from h *
+    // value_heads on, each code's value (its group's norm times the
+    // centroid) feeding every head and each float4 of weights four heads.
+    unsigned int value_heads = v_width * 2u <= blockDim.x ? 4u : TQ_MAX_GROUP;
+    unsigned int head_slices = TQ_MAX_GROUP / value_heads;
+    float* exact_rotated = q_rot;
+    for (unsigned int e = tid; e < v_width * head_slices; e += blockDim.x) {
+        unsigned int i = e % v_width;
+        unsigned int h0 = (e / v_width) * value_heads;
+        if (h0 >= group) {
+            continue;
+        }
+        unsigned int remaining = (group - h0 + 3u) & ~3u;
+        unsigned int heads = remaining < value_heads ? remaining : value_heads;
+        unsigned int vg = i / dim;
+        unsigned int di = i % dim;
+        float acc[TQ_MAX_GROUP];
+#pragma unroll
+        for (unsigned int a = 0; a < TQ_MAX_GROUP; a++) {
+            acc[a] = 0.0f;
+        }
+        for (unsigned int j = exact_count; j < count; j++) {
+            unsigned long long cell = (first + j) * k_groups + vg;
+            const unsigned char* row_codes = codes + cell * code_bytes;
+            unsigned int code = bits == 4u
+                ? (row_codes[di >> 1] >> ((di & 1u) << 2)) & 15u
+                : tq_code(row_codes, bits, di);
+            tq_weigh8(acc, scores[j], h0, heads, norms[cell] * book[code]);
+        }
+#pragma unroll
+        for (unsigned int a = 0; a < TQ_MAX_GROUP; a++) {
+            unsigned int g = h0 + a;
+            if (a < value_heads && g < group) {
+                partial[((head0 + g) * chunks + chunk) * (v_width + 2) + i] = acc[a];
+            }
+        }
+        if (exact_count > 0) {
+#pragma unroll
+            for (unsigned int a = 0; a < TQ_MAX_GROUP; a++) {
+                acc[a] = 0.0f;
+            }
+            for (unsigned int j = 0; j < exact_count; j++) {
+                tq_weigh8(acc, scores[j], h0, heads, exact[(first + j) * k_width + i]);
+            }
+            float offset = offsets[i];
+            float sign = signs[di];
+#pragma unroll
+            for (unsigned int a = 0; a < TQ_MAX_GROUP; a++) {
+                unsigned int g = h0 + a;
+                if (a < value_heads && g < group) {
+                    exact_rotated[g * v_width + i] = (acc[a] - exact_sum[g] * offset) * sign;
+                }
+            }
+        }
+    }
+    if (exact_count > 0) {
+        __syncthreads();
+        // The exact sums' transform, every group of every head at once,
+        // then the scale, added to the partials.
+        unsigned int value_transforms = group * (unsigned int)v_groups;
+        for (unsigned int half = 1; half < dim; half <<= 1) {
+            for (unsigned int t = tid; t < value_transforms * (dim / 2); t += blockDim.x) {
+                unsigned int base = (t / (dim / 2)) * dim;
+                unsigned int u = t % (dim / 2);
+                unsigned int i = base + (u / half) * 2 * half + (u % half);
+                float a = exact_rotated[i];
+                float b = exact_rotated[i + half];
+                exact_rotated[i] = a + b;
+                exact_rotated[i + half] = a - b;
+            }
+            __syncthreads();
+        }
+        float v_scale = 1.0f / sqrtf((float)dim);
+        for (unsigned int i = tid; i < v_width; i += blockDim.x) {
+            for (unsigned int g = 0; g < group; g++) {
+                partial[((head0 + g) * chunks + chunk) * (v_width + 2) + i] +=
+                    exact_rotated[g * v_width + i] * v_scale;
+            }
+        }
+    }
+    if (tid < group) {
+        float* out = partial + ((head0 + tid) * chunks + chunk) * (v_width + 2);
+        out[v_width] = row_max[tid];
+        out[v_width + 1] = row_sum[tid];
+    }
+}
+
+// `out[h][g] <- Pi^T out[h][g] + offsets[g]` for every `d`-wide group `g`
+// of every head's `groups * d` values: the latent decode's rotated value
+// sums back to values (the weights sum to one). Block (h * groups + g).
+extern "C" __global__ void tq_latent_rotate_back_kernel(
+    float* out,
+    const float* signs,
+    const float* offsets,
+    unsigned long long d,
+    unsigned long long groups
+) {
+    __shared__ float values[TQ_MAX_DIM];
+    unsigned int dim = (unsigned int)d;
+    float* row = out + blockIdx.x * d;
+    const float* offset = offsets + (blockIdx.x % groups) * d;
+    for (unsigned int i = threadIdx.x; i < dim; i += blockDim.x) {
+        values[i] = row[i];
+    }
+    __syncthreads();
+    tq_hadamard(values, dim);
+    float scale = 1.0f / sqrtf((float)dim);
+    for (unsigned int i = threadIdx.x; i < dim; i += blockDim.x) {
+        row[i] = values[i] * (signs[i] * scale) + offset[i];
+    }
+}

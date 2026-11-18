@@ -594,6 +594,10 @@ pub struct CudaKernels {
     /// Blocks of the staged TurboQuant decode Kernel a multiprocessor
     /// holds, by dynamic shared memory bytes.
     tq_staged_occupancy: std::sync::Mutex<std::collections::BTreeMap<usize, u64>>,
+    /// Whether a decode step over a latent TurboQuant store runs on its
+    /// codes (`tq_latent_attention_split_kernel`) rather than through
+    /// dequantized scratch; only the conformance and timing tests clear it.
+    tq_latent_on_codes: std::sync::atomic::AtomicBool,
 }
 
 /// Int8 activations: [`INT8_SCRATCH_VALUES`] signed bytes and one f32 scale
@@ -807,7 +811,15 @@ impl CudaKernels {
                 .map_or(1, |count| count.max(1) as u64),
             tq_decode_schedule: std::sync::atomic::AtomicU8::new(TqDecodeSchedule::Unstaged as u8),
             tq_staged_occupancy: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            tq_latent_on_codes: std::sync::atomic::AtomicBool::new(true),
         })
+    }
+
+    /// See `tq_latent_on_codes` (conformance and timing tests).
+    #[cfg(test)]
+    pub(crate) fn set_tq_latent_on_codes(&self, on_codes: bool) {
+        self.tq_latent_on_codes
+            .store(on_codes, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Schedules decode attention over TurboQuant stores
@@ -5506,6 +5518,34 @@ impl CudaKernels {
                     scale,
                 );
             }
+            // A decode step over a latent store read as both K and V (each
+            // row's leading values) runs on its codes.
+            if let Some(tq) = &k.tq
+                && std::ptr::eq(k, v)
+                && rows_cols_buf(q).is_ok_and(|(seq_len, _)| seq_len == 1)
+                && kv_head_count.unwrap_or(head_count) == 1
+                && value_stride == head_dimension
+                && tq.heads * tq.head_dimension == head_dimension
+                && value_dimension.unwrap_or(head_dimension) <= head_dimension
+                && value_dimension
+                    .unwrap_or(head_dimension)
+                    .is_multiple_of(tq.head_dimension)
+                && head_count > 0
+                && self
+                    .tq_latent_on_codes
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return self.tq_latent_attention_decode(
+                    q,
+                    k,
+                    head_count,
+                    value_dimension.unwrap_or(head_dimension),
+                    window_size,
+                    causal,
+                    key_count,
+                    scale,
+                );
+            }
             let step_offset = match key_count {
                 Some(_) => self.advancing_offset("key_count", kv_rows.saturating_sub(rows)),
                 None => 0,
@@ -5646,6 +5686,142 @@ impl CudaKernels {
         );
         self.tq_scratch.lock().unwrap().insert(key, values.slice);
         result
+    }
+
+    /// Decode attention over a latent TurboQuant store read as both K and
+    /// V (`tq_latent_attention_split_kernel`, then the combine and a
+    /// rotation back per group): one query row of `head_count` heads as wide
+    /// as the store's rows, the values each row's leading `width`.
+    #[allow(clippy::too_many_arguments)]
+    fn tq_latent_attention_decode(
+        &self,
+        q: &CudaDeviceBuffer,
+        store: &CudaDeviceBuffer,
+        head_count: u64,
+        width: u64,
+        window_size: Option<u64>,
+        causal: bool,
+        key_count: Option<u64>,
+        scale: Option<f32>,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        let overflow = || {
+            CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                "attention launch size overflows a grid dimension",
+            )
+        };
+        let tq = store.tq.as_ref().expect("a TurboQuant store");
+        let (kv_rows, k_width) = rows_cols_buf(store)?;
+        let kv_seq_len = key_count.unwrap_or(kv_rows);
+        if kv_seq_len == 0 || kv_seq_len > kv_rows || window_size == Some(0) {
+            return Err(CudaError::new(
+                CudaErrorCode::ShapeUnsupported,
+                format!("key_count {kv_seq_len} must lie in 1..={kv_rows}"),
+            ));
+        }
+        let score_scale = match scale {
+            None => 0.0_f32,
+            Some(scale) if scale.is_finite() && scale > 0.0 => scale,
+            Some(scale) => {
+                return Err(CudaError::new(
+                    CudaErrorCode::ShapeUnsupported,
+                    format!("attention scale {scale} must be finite and positive"),
+                ));
+            }
+        };
+        let step_offset = match key_count {
+            Some(_) => self.advancing_offset("key_count", kv_rows - kv_seq_len),
+            None => 0,
+        };
+        let chunks = kv_rows.div_ceil(ATTENTION_CHUNK_KEYS).max(1);
+        let partial_len =
+            usize::try_from(head_count * chunks * (width + 2)).map_err(|_| overflow())?;
+        let mut scratch = self.attention_scratch.lock().unwrap();
+        if scratch
+            .0
+            .as_ref()
+            .is_none_or(|slice| slice.len() < partial_len)
+        {
+            self.forbid_in_capture("growing the attention scratch buffer")?;
+            // SAFETY: the split Kernel writes every partial of this launch
+            // before the combine Kernel reads it, on this same stream.
+            let grown = unsafe { self.stream.alloc::<f32>(partial_len.max(1 << 16)) }?;
+            if let Some(outgrown) = scratch.0.replace(grown) {
+                scratch.1.push(outgrown);
+            }
+        }
+        let partial = scratch.0.as_mut().expect("allocated above");
+        let mut out_dev =
+            self.alloc_output(usize::try_from(head_count * width).map_err(|_| overflow())?)?;
+        let d = tq.head_dimension;
+        let (k_groups, v_groups) = (tq.heads, width / d);
+        let causal_flag: i32 = if causal { 1 } else { 0 };
+        let window_arg: i64 = window_size.map(|w| w as i64).unwrap_or(-1);
+        let query_position_offset = kv_seq_len - 1;
+        let no_head = 0u64;
+        let split = self.function("tq_latent_attention_split_kernel")?;
+        let mut args = self.stream.launch_builder(&split);
+        args.arg(&q.slice)
+            .arg(&tq.codes)
+            .arg(&tq.norms)
+            .arg(&tq.centroids)
+            .arg(&tq.signs)
+            .arg(&tq.offsets)
+            .arg(&tq.bits)
+            .arg(&mut *partial)
+            .arg(&kv_seq_len)
+            .arg(&head_count)
+            .arg(&k_groups)
+            .arg(&v_groups)
+            .arg(&d)
+            .arg(&causal_flag)
+            .arg(&window_arg)
+            .arg(&query_position_offset)
+            .arg(&chunks)
+            .arg(&step_offset)
+            .arg(&score_scale);
+        match tq.exact.as_ref() {
+            Some(exact) => args.arg(&exact.slice),
+            None => args.arg(&no_head),
+        };
+        args.arg(&tq.exact_rows);
+        let config = LaunchConfig {
+            grid_dim: (
+                u32::try_from(chunks).map_err(|_| overflow())?,
+                u32::try_from(head_count.div_ceil(TQ_MAX_GROUP)).map_err(|_| overflow())?,
+                1,
+            ),
+            block_dim: (ATTENTION_SPLIT_THREADS, 1, 1),
+            // The rotated queries of up to `TQ_MAX_GROUP` heads.
+            shared_mem_bytes: u32::try_from(4 * head_count.min(TQ_MAX_GROUP) * k_width)
+                .map_err(|_| overflow())?,
+        };
+        unsafe { args.launch(config) }?;
+        self.combine_attention_partials(&*partial, &mut out_dev, head_count, width, chunks)?;
+        let rotate = self.function("tq_latent_rotate_back_kernel")?;
+        let mut args = self.stream.launch_builder(&rotate);
+        args.arg(&mut out_dev)
+            .arg(&tq.signs)
+            .arg(&tq.offsets)
+            .arg(&d)
+            .arg(&v_groups);
+        let config = LaunchConfig {
+            grid_dim: (
+                u32::try_from(head_count * v_groups).map_err(|_| overflow())?,
+                1,
+                1,
+            ),
+            block_dim: (tq_threads(d), 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { args.launch(config) }?;
+        Ok(CudaDeviceBuffer {
+            slice: out_dev,
+            shape: vec![1, head_count * width],
+            bf16: None,
+            q8: None,
+            tq: None,
+        })
     }
 
     /// [`Self::attention_strided_values`] for one query row: the split
