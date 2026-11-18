@@ -5321,6 +5321,85 @@ fn attention_over_latent_keys_and_values_matches_the_cpu() {
     }
 }
 
+/// The Device time of one latent prefill attention pass
+/// (`attention_latent_kv`) at DeepSeek-V2-Lite's shapes (16 heads, 512
+/// latent and 64 rope values, 128-wide keys and values, packed `Q8_0`
+/// projections): 2,048 queries after 2,048 to 16,384 keys of an f32 and a
+/// `tq4` history (with and without a 1,024-row exact head), and of its
+/// first step alone (the rows split, a `tq4` history dequantized);
+/// diagnostic only.
+#[test]
+#[ignore = "GPU timing diagnostic"]
+fn latent_prefill_attention_times() {
+    use magnetar_provider_api::KvStorePrecision;
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let context = kernels.stream().context().clone();
+    let timing = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
+    let time_ms = |repeats: usize, run: &dyn Fn()| -> f32 {
+        run();
+        let start = context.new_event(timing).unwrap();
+        let end = context.new_event(timing).unwrap();
+        start.record(kernels.stream()).unwrap();
+        for _ in 0..repeats {
+            run();
+        }
+        end.record(kernels.stream()).unwrap();
+        start.elapsed_ms(&end).unwrap() / repeats as f32
+    };
+    let (heads, nope, rope, latent, value) = (16u64, 128u64, 64u64, 512u64, 128u64);
+    let width = latent + rope;
+    let w_k = kernels
+        .upload_packed_weight(&packed_q8(heads * nope, latent, true, 89))
+        .unwrap();
+    let w_v = kernels
+        .upload_packed_weight(&packed_q8(heads * value, latent, true, 90))
+        .unwrap();
+    let queries = 2048u64;
+    let q = upload(&kernels, &activations(queries, heads * (nope + rope), 91));
+    for keys in [2048u64, 8192, 16384] {
+        let capacity = keys + 64;
+        let data = activations(capacity, width, 92);
+        let f32_store = upload(&kernels, &data);
+        let mut stores = vec![("f32".to_string(), f32_store)];
+        for exact in [0u64, 1024] {
+            let mut store = kernels
+                .tq_zeros_with_exact_head(&[capacity, width], KvStorePrecision::Tq4, 64, exact)
+                .unwrap();
+            kernels
+                .kv_write(&mut store, &upload(&kernels, &data), 0)
+                .unwrap();
+            stores.push((format!("tq4, head {exact}"), store));
+        }
+        for (label, store) in &stores {
+            let pass = time_ms(3, &|| {
+                kernels
+                    .attention_latent_kv(
+                        [&q, store, store],
+                        [&w_k, &w_v],
+                        latent,
+                        [heads, nope + rope],
+                        Some(value),
+                        Some(heads),
+                        None,
+                        true,
+                        Some(keys),
+                        None,
+                    )
+                    .unwrap();
+            });
+            let split = time_ms(3, &|| {
+                kernels.latent_split(store, Some(keys), latent).unwrap();
+            });
+            eprintln!(
+                "latent prefill attention, {queries} queries after {keys} keys, {label}: \
+                 {pass:.2} ms, of which the split {split:.2} ms"
+            );
+        }
+    }
+}
+
 /// Attention with V rows narrower than Q and K (`value_head_dimension`,
 /// `express-latent-attention-forms`) in the Kernels that serve it: split-key
 /// decode (one chunk and several), the tiled prefill Kernel (192-dimension

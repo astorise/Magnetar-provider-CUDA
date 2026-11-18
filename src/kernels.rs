@@ -3755,7 +3755,7 @@ impl CudaKernels {
     /// The first `key_count` rows (every row without it) of the latent rows
     /// `store` (`[rows, width]`, f32 or a TurboQuant store) as their leading
     /// `latent_width` values and the rest (`latent_split_kernel`).
-    fn latent_split(
+    pub(crate) fn latent_split(
         &self,
         store: &CudaDeviceBuffer,
         key_count: Option<u64>,
