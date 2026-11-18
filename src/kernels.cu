@@ -6027,6 +6027,58 @@ extern "C" __global__ void value_heads_kernel(
 
 #define TQ_MAX_GROUP 8
 
+// `dot[g] += q[g][d + e] * centroid[e]` for e = 0..7 and every head g of
+// the group, in that order, the queries read as float4s
+// (`speed-up-decode-attention-on-codes`, decision 5). `q` is 16-byte
+// aligned, `dim` and `d` multiples of 8.
+__device__ __forceinline__ void tq_dot8(
+    float* dot,
+    const float* q,
+    unsigned int group,
+    unsigned int dim,
+    unsigned int d,
+    const float* centroid
+) {
+#pragma unroll
+    for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
+        if (g < group) {
+            const float4* row = (const float4*)(q + g * dim + d);
+            float4 a = row[0];
+            float4 b = row[1];
+            dot[g] = fmaf(a.x, centroid[0], dot[g]);
+            dot[g] = fmaf(a.y, centroid[1], dot[g]);
+            dot[g] = fmaf(a.z, centroid[2], dot[g]);
+            dot[g] = fmaf(a.w, centroid[3], dot[g]);
+            dot[g] = fmaf(b.x, centroid[4], dot[g]);
+            dot[g] = fmaf(b.y, centroid[5], dot[g]);
+            dot[g] = fmaf(b.z, centroid[6], dot[g]);
+            dot[g] = fmaf(b.w, centroid[7], dot[g]);
+        }
+    }
+}
+
+// `acc[i] += weights[h0 + i] * value` for the `heads` (4 or 8) heads from
+// `h0` on, the weights read as float4s; `weights` is a key's row of the
+// group's weights, 16-byte aligned.
+__device__ __forceinline__ void tq_weigh8(
+    float* acc,
+    const float* weights,
+    unsigned int h0,
+    unsigned int heads,
+    float value
+) {
+#pragma unroll
+    for (unsigned int i4 = 0; i4 < TQ_MAX_GROUP / 4; i4++) {
+        if (i4 * 4 < heads) {
+            float4 w = ((const float4*)weights)[h0 / 4 + i4];
+            acc[4 * i4] = fmaf(w.x, value, acc[4 * i4]);
+            acc[4 * i4 + 1] = fmaf(w.y, value, acc[4 * i4 + 1]);
+            acc[4 * i4 + 2] = fmaf(w.z, value, acc[4 * i4 + 2]);
+            acc[4 * i4 + 3] = fmaf(w.w, value, acc[4 * i4 + 3]);
+        }
+    }
+}
+
 // `tq_attention_split_kernel` with block (chunk, kv_head) serving the
 // `head_count / kv_head_count` (at most TQ_MAX_GROUP) query heads of its KV
 // head, so every key and value code is decoded once for them all:
@@ -6068,8 +6120,11 @@ extern "C" __global__ void tq_attention_split_grouped_kernel(
     const float* v_signs,
     const float* v_offsets
 ) {
-    __shared__ float scores[TQ_MAX_GROUP][ATTENTION_CHUNK_KEYS];
-    __shared__ float q_shared[TQ_MAX_GROUP * TQ_MAX_DIM];
+    // Key-major weights, the group's heads contiguous: a thread loads four
+    // heads' weights of a key at once (`speed-up-decode-attention-on-codes`,
+    // decision 5).
+    __shared__ __align__(16) float scores[ATTENTION_CHUNK_KEYS][TQ_MAX_GROUP];
+    __shared__ __align__(16) float q_shared[TQ_MAX_GROUP * TQ_MAX_DIM];
     __shared__ float q_offsets[TQ_MAX_GROUP];
     __shared__ float row_max[TQ_MAX_GROUP];
     __shared__ float row_sum[TQ_MAX_GROUP];
@@ -6198,7 +6253,7 @@ extern "C" __global__ void tq_attention_split_grouped_kernel(
 #pragma unroll
             for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
                 if (g < group) {
-                    scores[g][j] = dot[g] * scale;
+                    scores[j][g] = dot[g] * scale;
                 }
             }
             continue;
@@ -6207,16 +6262,12 @@ extern "C" __global__ void tq_attention_split_grouped_kernel(
             const unsigned int* words = (const unsigned int*)k_row;
             for (unsigned int d = 0; d < dim; d += 8) {
                 unsigned int word = words[d >> 3];
+                float centroid[8];
 #pragma unroll
                 for (unsigned int e = 0; e < 8; e++) {
-                    float centroid = k_book[(word >> (4u * e)) & 15u];
-#pragma unroll
-                    for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
-                        if (g < group) {
-                            dot[g] += q_shared[g * dim + d + e] * centroid;
-                        }
-                    }
+                    centroid[e] = k_book[(word >> (4u * e)) & 15u];
                 }
+                tq_dot8(dot, q_shared, group, dim, d, centroid);
             }
         } else if (k_bits == 3u) {
             // Eight 3-bit codes in every three bytes, little-endian.
@@ -6224,16 +6275,12 @@ extern "C" __global__ void tq_attention_split_grouped_kernel(
                 const unsigned char* bytes = k_row + (d >> 3) * 3u;
                 unsigned int word = (unsigned int)bytes[0] | ((unsigned int)bytes[1] << 8)
                     | ((unsigned int)bytes[2] << 16);
+                float centroid[8];
 #pragma unroll
                 for (unsigned int e = 0; e < 8; e++) {
-                    float centroid = k_book[(word >> (3u * e)) & 7u];
-#pragma unroll
-                    for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
-                        if (g < group) {
-                            dot[g] += q_shared[g * dim + d + e] * centroid;
-                        }
-                    }
+                    centroid[e] = k_book[(word >> (3u * e)) & 7u];
                 }
+                tq_dot8(dot, q_shared, group, dim, d, centroid);
             }
         } else {
             for (unsigned int d = 0; d < dim; d++) {
@@ -6250,7 +6297,7 @@ extern "C" __global__ void tq_attention_split_grouped_kernel(
 #pragma unroll
         for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
             if (g < group) {
-                scores[g][j] = (q_offsets[g] + dot[g] * norm) * scale;
+                scores[j][g] = (q_offsets[g] + dot[g] * norm) * scale;
             }
         }
     }
@@ -6262,15 +6309,15 @@ extern "C" __global__ void tq_attention_split_grouped_kernel(
     for (unsigned int g = warp; g < group; g += warps) {
         float local_max = neg_inf();
         for (unsigned int j = lane; j < count; j += 32) {
-            local_max = fmaxf(local_max, scores[g][j]);
+            local_max = fmaxf(local_max, scores[j][g]);
         }
         for (int offset = 16; offset > 0; offset >>= 1) {
             local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, offset));
         }
         float local_sum = 0.0f;
         for (unsigned int j = lane; j < count; j += 32) {
-            float weight = expf(scores[g][j] - local_max);
-            scores[g][j] = weight;
+            float weight = expf(scores[j][g] - local_max);
+            scores[j][g] = weight;
             local_sum += weight;
         }
         for (int offset = 16; offset > 0; offset >>= 1) {
@@ -6278,12 +6325,12 @@ extern "C" __global__ void tq_attention_split_grouped_kernel(
         }
         float exact_part = 0.0f;
         for (unsigned int j = lane; j < count; j += 32) {
-            float weight = scores[g][j] / local_sum;
+            float weight = scores[j][g] / local_sum;
             if (j < exact_count) {
                 exact_part += weight;
-                scores[g][j] = weight;
+                scores[j][g] = weight;
             } else {
-                scores[g][j] = weight * v_norms[(first + j) * kv_head_count + kv_head];
+                scores[j][g] = weight * v_norms[(first + j) * kv_head_count + kv_head];
             }
         }
         for (int offset = 16; offset > 0; offset >>= 1) {
@@ -6297,13 +6344,27 @@ extern "C" __global__ void tq_attention_split_grouped_kernel(
     }
     __syncthreads();
 
-    // Values: one thread per coordinate, every query head.
+    // Values: thread (d, h) sums coordinate d of `value_heads` query heads
+    // from h * value_heads on (four for heads up to 64 wide, so every
+    // thread works; all eight otherwise), each code's centroid feeding
+    // every head and each float4 of weights four heads. Summed in key
+    // order, as one thread per coordinate did.
     unsigned int v_code_bytes = v_dim * v_bits / 8u;
-    for (unsigned int d = tid; d < v_dim; d += blockDim.x) {
+    unsigned int value_heads = v_dim * 2u <= blockDim.x ? 4u : TQ_MAX_GROUP;
+    unsigned int head_slices = TQ_MAX_GROUP / value_heads;
+    for (unsigned int e = tid; e < v_dim * head_slices; e += blockDim.x) {
+        unsigned int d = e % v_dim;
+        unsigned int h0 = (e / v_dim) * value_heads;
+        if (h0 >= group) {
+            continue;
+        }
+        // The group's heads from h0 on, in whole float4s.
+        unsigned int remaining = (group - h0 + 3u) & ~3u;
+        unsigned int heads = remaining < value_heads ? remaining : value_heads;
         float acc[TQ_MAX_GROUP];
 #pragma unroll
-        for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
-            acc[g] = 0.0f;
+        for (unsigned int i = 0; i < TQ_MAX_GROUP; i++) {
+            acc[i] = 0.0f;
         }
         for (unsigned int j = exact_count; j < count; j++) {
             const unsigned char* v_row =
@@ -6311,44 +6372,35 @@ extern "C" __global__ void tq_attention_split_grouped_kernel(
             unsigned int code = v_bits == 4u
                 ? (v_row[d >> 1] >> ((d & 1u) << 2)) & 15u
                 : tq_code(v_row, v_bits, d);
-            float centroid = v_book[code];
-#pragma unroll
-            for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
-                if (g < group) {
-                    acc[g] += scores[g][j] * centroid;
-                }
-            }
+            tq_weigh8(acc, scores[j], h0, heads, v_book[code]);
         }
 #pragma unroll
-        for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
-            if (g < group) {
-                partial[((head0 + g) * chunks + chunk) * (value_dimension + 2) + d] = acc[g];
+        for (unsigned int i = 0; i < TQ_MAX_GROUP; i++) {
+            unsigned int g = h0 + i;
+            if (i < value_heads && g < group) {
+                partial[((head0 + g) * chunks + chunk) * (value_dimension + 2) + d] = acc[i];
             }
         }
         if (exact_count > 0) {
             // The exact values' weighted sums, less the value offsets they
             // carry, rotated below into the codes' domain.
 #pragma unroll
-            for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
-                acc[g] = 0.0f;
+            for (unsigned int i = 0; i < TQ_MAX_GROUP; i++) {
+                acc[i] = 0.0f;
             }
             for (unsigned int j = 0; j < exact_count; j++) {
                 float value =
                     v_exact[((first + j) * kv_head_count + kv_head) * value_dimension + d];
-#pragma unroll
-                for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
-                    if (g < group) {
-                        acc[g] += scores[g][j] * value;
-                    }
-                }
+                tq_weigh8(acc, scores[j], h0, heads, value);
             }
             float offset = v_offsets[kv_head * value_dimension + d];
             // Constant indices into `acc`: indexed at run time, the array
             // would leave the registers for local memory, in every loop.
 #pragma unroll
-            for (unsigned int g = 0; g < TQ_MAX_GROUP; g++) {
-                if (g < group) {
-                    q_shared[g * v_dim + d] = (acc[g] - exact_sum[g] * offset) * v_signs[d];
+            for (unsigned int i = 0; i < TQ_MAX_GROUP; i++) {
+                unsigned int g = h0 + i;
+                if (i < value_heads && g < group) {
+                    q_shared[g * v_dim + d] = (acc[i] - exact_sum[g] * offset) * v_signs[d];
                 }
             }
         }
