@@ -311,6 +311,31 @@ __device__ __forceinline__ void tca_keys_of(
 #define TCP_B_PITCH (TCP_BLOCK_N + 8)
 #define TCP_THREADS 256
 
+// `a` as three bfloat16 terms, `hi + mid + lo`, each the rounding of what
+// the terms before it leave (about 24 significant bits in all). A finite
+// value past bfloat16's range keeps a finite, truncated hi term.
+extern "C" __global__ void tc_split3_kernel(
+    const float* a,
+    unsigned short* hi,
+    unsigned short* mid,
+    unsigned short* lo,
+    unsigned long long count
+) {
+    for (unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x; i < count;
+         i += (unsigned long long)gridDim.x * blockDim.x) {
+        float value = a[i];
+        unsigned short h = tc_float_to_bf16(value);
+        if ((h & 0x7FFF) == 0x7F80 && isfinite(value)) {
+            h = (unsigned short)(((unsigned int)__float_as_int(value)) >> 16);
+        }
+        float rest = value - tc_bf16_to_float(h);
+        unsigned short md = tc_float_to_bf16(rest);
+        hi[i] = h;
+        mid[i] = md;
+        lo[i] = tc_float_to_bf16(rest - tc_bf16_to_float(md));
+    }
+}
+
 extern "C" __global__ void tc_split_kernel(
     const float* a,
     unsigned short* hi,
@@ -496,6 +521,179 @@ extern "C" __global__ void matmul_tcp_kernel(
                 unsigned long long col = n0 + (warp & 1) * 32 + nt * 8 + 2 * pair + (i & 1);
                 if (row < m && col < n) {
                     float value = acc[0][mt][nt][i];
+                    if (addend_mode == 1) {
+                        value += addend[col];
+                    } else if (addend_mode == 2) {
+                        value += addend[row * n + col];
+                    }
+                    out[row * n + col] = value;
+                }
+            }
+}
+
+// `a x b` for f32 operands that are not exactly bfloat16 (a dequantized
+// packed weight), each given as three bfloat16 terms (`tc_split3_kernel`:
+// hi + mid + lo keeps about 24 significant bits), plus `addend[col]` (mode
+// 1) or `addend[row * n + col]` (mode 2). Every product of terms down to
+// 2^-24 of the whole is accumulated in f32, smallest first: lo.hi, mid.mid,
+// hi.lo, mid.hi, hi.mid, hi.hi, into a partial per 16-inner tile that an
+// f32 add (round to nearest) takes into the output. The tiles and pipeline are
+// `tcp_matmul`'s; the six terms' two stages take 2 * TCP3_STAGE halves
+// (50,688 bytes) of dynamic shared memory.
+#define TCP3_A_TILE (TCP_BLOCK_M * TCP_A_PITCH)
+#define TCP3_B_TILE (TCP_BLOCK_K * TCP_B_PITCH)
+#define TCP3_STAGE (3 * TCP3_A_TILE + 3 * TCP3_B_TILE)
+
+__device__ __forceinline__ void tcp3_load_stage(
+    const unsigned short* const* a_terms, const unsigned short* const* b_terms,
+    unsigned long long m, unsigned long long k, unsigned long long n,
+    unsigned long long m0, unsigned long long n0, unsigned long long k0,
+    unsigned short* stage
+) {
+    unsigned int tid = threadIdx.x;
+#pragma unroll
+    for (int t = 0; t < 3; t++) {
+        unsigned short (*s_a)[TCP_A_PITCH] =
+            reinterpret_cast<unsigned short (*)[TCP_A_PITCH]>(stage + t * TCP3_A_TILE);
+        for (unsigned int c = tid; c < TCP_BLOCK_M * 2; c += TCP_THREADS) {
+            unsigned int r = c >> 1;
+            unsigned int col = (c & 1) * 8;
+            bool valid = m0 + r < m && k0 + col < k;
+            unsigned long long offset = valid ? (m0 + r) * k + k0 + col : 0;
+            tcp_copy16(&s_a[r][col], a_terms[t] + offset, valid);
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < 3; t++) {
+        unsigned short (*s_b)[TCP_B_PITCH] = reinterpret_cast<unsigned short (*)[TCP_B_PITCH]>(
+            stage + 3 * TCP3_A_TILE + t * TCP3_B_TILE);
+        for (unsigned int c = tid; c < TCP_BLOCK_K * (TCP_BLOCK_N / 8); c += TCP_THREADS) {
+            unsigned int r = c / (TCP_BLOCK_N / 8);
+            unsigned int col = (c % (TCP_BLOCK_N / 8)) * 8;
+            bool valid = k0 + r < k && n0 + col < n;
+            unsigned long long offset = valid ? (k0 + r) * n + n0 + col : 0;
+            tcp_copy16(&s_b[r][col], b_terms[t] + offset, valid);
+        }
+    }
+}
+
+extern "C" __global__ void matmul_tcp_split3_kernel(
+    const unsigned short* a_hi,
+    const unsigned short* a_mid,
+    const unsigned short* a_lo,
+    const unsigned short* b_hi,
+    const unsigned short* b_mid,
+    const unsigned short* b_lo,
+    float* out,
+    unsigned long long m,
+    unsigned long long k,
+    unsigned long long n,
+    const float* addend,
+    int addend_mode
+) {
+    extern __shared__ __align__(16) unsigned short tcp3_shared[];
+    const unsigned short* a_terms[3] = {a_hi, a_mid, a_lo};
+    const unsigned short* b_terms[3] = {b_hi, b_mid, b_lo};
+    unsigned long long m0 = (unsigned long long)blockIdx.y * TCP_BLOCK_M;
+    unsigned long long n0 = (unsigned long long)blockIdx.x * TCP_BLOCK_N;
+    unsigned int warp = threadIdx.x >> 5;
+    unsigned int lane = threadIdx.x & 31;
+    unsigned int warp_m = (warp >> 1) * 32;
+    unsigned int warp_n = (warp & 1) * 32;
+    float acc[2][4][4];
+#pragma unroll
+    for (int mt = 0; mt < 2; mt++)
+#pragma unroll
+        for (int nt = 0; nt < 4; nt++)
+#pragma unroll
+            for (int i = 0; i < 4; i++) acc[mt][nt][i] = 0.0f;
+
+    unsigned long long tiles = (k + TCP_BLOCK_K - 1) / TCP_BLOCK_K;
+    tcp3_load_stage(a_terms, b_terms, m, k, n, m0, n0, 0, tcp3_shared);
+    tcp_commit();
+    for (unsigned long long tile = 0; tile < tiles; tile++) {
+        unsigned int stage = tile & 1;
+        if (tile + 1 < tiles) {
+            tcp3_load_stage(a_terms, b_terms, m, k, n, m0, n0, (tile + 1) * TCP_BLOCK_K,
+                            tcp3_shared + (stage ^ 1) * TCP3_STAGE);
+            tcp_commit();
+            tcp_wait_all_but_one();
+        } else {
+            tcp_wait_all();
+        }
+        __syncthreads();
+        unsigned short* base = tcp3_shared + stage * TCP3_STAGE;
+        // This tile's products start from zero and are added to `acc` with
+        // an f32 add (round to nearest): the Tensor Cores' accumulation
+        // truncates relative to the largest term, which in one chain over
+        // every tile would be the running sum.
+        float part[2][4][4];
+#pragma unroll
+        for (int mt = 0; mt < 2; mt++)
+#pragma unroll
+            for (int nt = 0; nt < 4; nt++)
+#pragma unroll
+                for (int i = 0; i < 4; i++) part[mt][nt][i] = 0.0f;
+        unsigned int af[3][2][4];
+#pragma unroll
+        for (int t = 0; t < 3; t++) {
+            unsigned short (*s_a)[TCP_A_PITCH] =
+                reinterpret_cast<unsigned short (*)[TCP_A_PITCH]>(base + t * TCP3_A_TILE);
+#pragma unroll
+            for (int mt = 0; mt < 2; mt++) {
+                unsigned int row = warp_m + mt * 16 + (lane & 15);
+                unsigned int col = (lane >> 4) * 8;
+                tcp_ldmatrix_x4(af[t][mt], &s_a[row][col]);
+            }
+        }
+#pragma unroll
+        for (int np = 0; np < 2; np++) {
+            unsigned int bf[3][4];
+            unsigned int krow = (lane & 7) + ((lane >> 3) & 1) * 8;
+            unsigned int ncol = warp_n + np * 16 + (lane >> 4) * 8;
+#pragma unroll
+            for (int t = 0; t < 3; t++) {
+                unsigned short (*s_b)[TCP_B_PITCH] = reinterpret_cast<unsigned short (*)[TCP_B_PITCH]>(
+                    base + 3 * TCP3_A_TILE + t * TCP3_B_TILE);
+                tcp_ldmatrix_x4_trans(bf[t], &s_b[krow][ncol]);
+            }
+#pragma unroll
+            for (int mt = 0; mt < 2; mt++) {
+                // Smallest first: lo.hi, mid.mid, hi.lo, mid.hi, hi.mid, hi.hi.
+                tc_mma(part[mt][2 * np], af[2][mt], bf[0][0], bf[0][1]);
+                tc_mma(part[mt][2 * np + 1], af[2][mt], bf[0][2], bf[0][3]);
+                tc_mma(part[mt][2 * np], af[1][mt], bf[1][0], bf[1][1]);
+                tc_mma(part[mt][2 * np + 1], af[1][mt], bf[1][2], bf[1][3]);
+                tc_mma(part[mt][2 * np], af[0][mt], bf[2][0], bf[2][1]);
+                tc_mma(part[mt][2 * np + 1], af[0][mt], bf[2][2], bf[2][3]);
+                tc_mma(part[mt][2 * np], af[1][mt], bf[0][0], bf[0][1]);
+                tc_mma(part[mt][2 * np + 1], af[1][mt], bf[0][2], bf[0][3]);
+                tc_mma(part[mt][2 * np], af[0][mt], bf[1][0], bf[1][1]);
+                tc_mma(part[mt][2 * np + 1], af[0][mt], bf[1][2], bf[1][3]);
+                tc_mma(part[mt][2 * np], af[0][mt], bf[0][0], bf[0][1]);
+                tc_mma(part[mt][2 * np + 1], af[0][mt], bf[0][2], bf[0][3]);
+            }
+        }
+#pragma unroll
+        for (int mt = 0; mt < 2; mt++)
+#pragma unroll
+            for (int nt = 0; nt < 4; nt++)
+#pragma unroll
+                for (int i = 0; i < 4; i++) acc[mt][nt][i] += part[mt][nt][i];
+        __syncthreads();
+    }
+    unsigned int group = lane >> 2;
+    unsigned int pair = lane & 3;
+#pragma unroll
+    for (int mt = 0; mt < 2; mt++)
+#pragma unroll
+        for (int nt = 0; nt < 4; nt++)
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                unsigned long long row = m0 + warp_m + mt * 16 + group + (i >= 2 ? 8 : 0);
+                unsigned long long col = n0 + warp_n + nt * 8 + 2 * pair + (i & 1);
+                if (row < m && col < n) {
+                    float value = acc[mt][nt][i];
                     if (addend_mode == 1) {
                         value += addend[col];
                     } else if (addend_mode == 2) {

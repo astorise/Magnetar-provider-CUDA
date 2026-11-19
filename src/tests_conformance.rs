@@ -17,7 +17,7 @@ use magnetar_provider_api::HostTensor;
 use magnetar_provider_api::{packed_weight::PackedWeight, packed_weight::PackedWeightFormat};
 
 use crate::half_precision;
-use crate::kernels::{CudaDeviceBuffer, CudaHalfDType, CudaKernels};
+use crate::kernels::{CudaDeviceBuffer, CudaHalfDType, CudaKernels, TqDecodeSchedule};
 use crate::provider::CudaProvider;
 
 const TOLERANCE: f32 = 1e-3;
@@ -1152,6 +1152,9 @@ fn turboquant_kv_stores_round_trip_and_attend_like_the_cpu() {
             // More query heads per KV head than one grouped block serves:
             // a block per query head.
             (70, 16, 1, 64, None),
+            // Many chunks: several per block of the split schedule, some
+            // blocks past the history.
+            (4100, 8, 2, 128, None),
         ]
         .into_iter()
         .enumerate()
@@ -1260,23 +1263,680 @@ fn turboquant_kv_stores_round_trip_and_attend_like_the_cpu() {
                     true,
                 )
                 .unwrap();
+                // A decode step under every schedule of the code Kernels
+                // (`speed-up-decode-attention-on-codes`).
+                for schedule in [
+                    TqDecodeSchedule::Split,
+                    TqDecodeSchedule::ChunkPerBlock,
+                    TqDecodeSchedule::Unstaged,
+                ] {
+                    kernels.set_tq_decode_schedule(schedule);
+                    let actual = kernels
+                        .attention_valued(
+                            &upload(&kernels, &q),
+                            &k_store,
+                            &v_store,
+                            heads,
+                            dim,
+                            None,
+                            Some(kv_heads),
+                            window,
+                            true,
+                            Some(history),
+                            None,
+                        )
+                        .unwrap();
+                    assert_close(&download(&kernels, &actual), &expected);
+                }
+                kernels.set_tq_decode_schedule(TqDecodeSchedule::Unstaged);
+            }
+        }
+    }
+}
+
+/// `keep-turboquant-kv-head-exact`: a TurboQuant store whose first rows
+/// are kept exact holds them as written, and attention over it -- a
+/// decode step and a four-query prefill -- matches the CPU reference over
+/// the CPU store's values (`TurboQuantStoreState::with_exact_rows`): for a
+/// history the head holds (attention on the head), and for longer ones
+/// whose chunks start inside the head (100 and 40 rows: a chunk of exact
+/// keys and codes), at a chunk boundary (128 rows), under a sliding window
+/// starting inside the head, with grouped blocks and a block per query
+/// head.
+#[test]
+fn turboquant_exact_heads_attend_like_the_cpu() {
+    use magnetar_provider_api::{KvStorePrecision, TurboQuantStoreState};
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    for precision in [KvStorePrecision::Tq4, KvStorePrecision::Tq3] {
+        for (case, (history, heads, kv_heads, dim, window, exact)) in [
+            (37u64, 8u64, 2u64, 64u64, None, 64u64),
+            (300, 4, 1, 128, None, 100),
+            (300, 8, 2, 128, None, 128),
+            (129, 8, 1, 256, Some(64u64), 100),
+            (70, 16, 1, 64, None, 40),
+            // Many chunks: the head inside the first block of the split
+            // schedule, several chunks per block.
+            (4100, 8, 2, 128, None, 1024),
+            (2000, 7, 1, 64, Some(1500u64), 1024),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let label = format!("{} case {case}", precision.as_str());
+            let width = kv_heads * dim;
+            let capacity = history + 3;
+            // Rows sharing a large per-column component, as keys with a
+            // bias do: the store's offsets hold it.
+            let values = |seed: usize| {
+                let common = hashed_values(width as usize, 10 * case + seed + 5);
+                let data: Vec<f32> = hashed_values((history * width) as usize, 10 * case + seed)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, value)| value + 8.0 * common[i % width as usize])
+                    .collect();
+                HostTensor::new([history, width], data).unwrap()
+            };
+            let (k, v) = (values(2), values(3));
+            let split = ((history - 1) * width) as usize;
+            // Written as a prefill and then one appended row.
+            let store_of = |tensor: &HostTensor| {
+                let mut store = kernels
+                    .tq_zeros_with_exact_head(&[capacity, width], precision, dim, exact)
+                    .unwrap();
+                let prefix =
+                    HostTensor::new([history - 1, width], tensor.data[..split].to_vec()).unwrap();
+                let last = HostTensor::new([1, width], tensor.data[split..].to_vec()).unwrap();
+                kernels
+                    .kv_write(&mut store, &upload(&kernels, &prefix), 0)
+                    .unwrap();
+                kernels
+                    .kv_write(&mut store, &upload(&kernels, &last), history - 1)
+                    .unwrap();
+                store
+            };
+            let (k_store, v_store) = (store_of(&k), store_of(&v));
+            let cpu_values = |tensor: &HostTensor| {
+                let mut store =
+                    TurboQuantStoreState::new(precision, dim, width).with_exact_rows(exact);
+                let mut data = store.write(&tensor.data[..split], 0).unwrap();
+                data.extend(store.write(&tensor.data[split..], history - 1).unwrap());
+                HostTensor::new([history, width], data).unwrap()
+            };
+            let (k_values, v_values) = (cpu_values(&k), cpu_values(&v));
+
+            // The head's rows read back as written.
+            let held = (exact.min(history) * width) as usize;
+            for (store, written) in [(&k_store, &k), (&v_store, &v)] {
+                let stored = download(&kernels, store);
+                assert_eq!(stored.shape, vec![capacity, width], "{label}");
+                assert_eq!(stored.data[..held], written.data[..held], "{label}");
+            }
+
+            for queries in [1u64, 4] {
+                let q = HostTensor::new(
+                    [queries, heads * dim],
+                    attention_values((queries * heads * dim) as usize, 10 * case + 1),
+                )
+                .unwrap();
+                let expected = magnetar_provider_cpu::attention(
+                    &q,
+                    &k_values,
+                    &v_values,
+                    heads,
+                    dim,
+                    Some(kv_heads),
+                    window,
+                    true,
+                )
+                .unwrap();
+                // A decode step under every schedule of the code Kernels
+                // (`speed-up-decode-attention-on-codes`).
+                for schedule in [
+                    TqDecodeSchedule::Split,
+                    TqDecodeSchedule::ChunkPerBlock,
+                    TqDecodeSchedule::Unstaged,
+                ] {
+                    kernels.set_tq_decode_schedule(schedule);
+                    let actual = kernels
+                        .attention_valued(
+                            &upload(&kernels, &q),
+                            &k_store,
+                            &v_store,
+                            heads,
+                            dim,
+                            None,
+                            Some(kv_heads),
+                            window,
+                            true,
+                            Some(history),
+                            None,
+                        )
+                        .unwrap();
+                    assert_close(&download(&kernels, &actual), &expected);
+                }
+                kernels.set_tq_decode_schedule(TqDecodeSchedule::Unstaged);
+            }
+        }
+    }
+}
+
+/// `keep-turboquant-kv-head-exact`: a captured decode step (`kv-write` of
+/// its row, then attention) over TurboQuant stores with exact heads
+/// replays only within the regime it was captured in -- while the history
+/// stays in the heads, its bound ends where they do; past them, it
+/// replays on the codes up to the stores' capacity -- and every replay
+/// matches the same step run eagerly on a copy of the history.
+#[test]
+fn captured_decode_steps_keep_their_exact_head_regime() {
+    use magnetar_provider_api::KvStorePrecision;
+    use std::collections::BTreeSet;
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let (heads, kv_heads, dim, capacity, exact, prefix) = (4u64, 1u64, 64u64, 24u64, 8u64, 6u64);
+    let width = kv_heads * dim;
+    let rows = |seed: u64, count: u64| {
+        HostTensor::new(
+            [count, width],
+            hashed_values((count * width) as usize, seed as usize),
+        )
+        .unwrap()
+    };
+    let query = |position: u64| {
+        HostTensor::new(
+            [1, heads * dim],
+            hashed_values((heads * dim) as usize, 300 + position as usize),
+        )
+        .unwrap()
+    };
+    let store = || {
+        kernels
+            .tq_zeros_with_exact_head(&[capacity, width], KvStorePrecision::Tq4, dim, exact)
+            .unwrap()
+    };
+    // The same history twice: stepped by captured steps, and eagerly.
+    let [mut k_captured, mut v_captured, mut k_eager, mut v_eager] =
+        [store(), store(), store(), store()];
+    for (store, seed) in [
+        (&mut k_captured, 1),
+        (&mut v_captured, 2),
+        (&mut k_eager, 1),
+        (&mut v_eager, 2),
+    ] {
+        kernels
+            .kv_write(store, &upload(&kernels, &rows(seed, prefix)), 0)
+            .unwrap();
+    }
+    let decode = |q: &CudaDeviceBuffer,
+                  k: &mut CudaDeviceBuffer,
+                  v: &mut CudaDeviceBuffer,
+                  k_row: &CudaDeviceBuffer,
+                  v_row: &CudaDeviceBuffer,
+                  position: u64| {
+        kernels.kv_write(k, k_row, position)?;
+        kernels.kv_write(v, v_row, position)?;
+        kernels.attention_valued(
+            q,
+            k,
+            v,
+            heads,
+            dim,
+            None,
+            Some(kv_heads),
+            None,
+            true,
+            Some(position + 1),
+            None,
+        )
+    };
+    let mut eager = |position: u64| {
+        let out = decode(
+            &upload(&kernels, &query(position)),
+            &mut k_eager,
+            &mut v_eager,
+            &upload(&kernels, &rows(100 + position, 1)),
+            &upload(&kernels, &rows(200 + position, 1)),
+            position,
+        )
+        .unwrap();
+        download(&kernels, &out)
+    };
+    // Captured at a history the heads hold (7 rows), then past them (9).
+    for (captured_at, bound, replays) in [
+        (prefix, exact - (prefix + 1), 0..=1u64),
+        (exact, capacity - (exact + 1), 0..=3),
+    ] {
+        // Run eagerly first: Kernels compiled, scratch buffers grown.
+        let mut expected = vec![eager(captured_at)];
+        let mut q = upload(&kernels, &query(captured_at));
+        let mut k_row = upload(&kernels, &rows(100 + captured_at, 1));
+        let mut v_row = upload(&kernels, &rows(200 + captured_at, 1));
+        let out = kernels
+            .stream()
+            .alloc_zeros::<f32>((heads * dim) as usize)
+            .unwrap();
+        kernels
+            .begin_capture(BTreeSet::from(["key_count".into(), "row_offset".into()]))
+            .unwrap();
+        let offered = kernels.offer_output(Some(out));
+        let captured = decode(
+            &q,
+            &mut k_captured,
+            &mut v_captured,
+            &k_row,
+            &v_row,
+            captured_at,
+        )
+        .unwrap();
+        drop(offered);
+        let mut step = kernels.end_capture().unwrap();
+        assert_eq!(step.max_offset, bound, "captured at {captured_at}");
+        for offset in replays {
+            let position = captured_at + offset;
+            if offset > 0 {
+                expected.push(eager(position));
+                kernels.write_into(&mut q, &query(position).data).unwrap();
+                kernels
+                    .write_into(&mut k_row, &rows(100 + position, 1).data)
+                    .unwrap();
+                kernels
+                    .write_into(&mut v_row, &rows(200 + position, 1).data)
+                    .unwrap();
+            }
+            kernels.launch_captured(&mut step, offset).unwrap();
+            assert_eq!(
+                download(&kernels, &captured).data,
+                expected[offset as usize].data,
+                "replayed at {position}"
+            );
+        }
+    }
+}
+
+/// `speed-up-decode-attention-on-codes`, decision 4: the split count
+/// fills the target with blocks, keeps at least two chunks per block and
+/// at most 32 blocks per KV head, and fills whole waves.
+#[test]
+fn turboquant_decode_splits_follow_the_heuristic() {
+    use crate::kernels::tq_split_count;
+    // Qwen2.5-0.5B's 2 KV heads on 28 multiprocessors holding 4 blocks.
+    assert_eq!(tq_split_count(112, 2, 256), 32);
+    assert_eq!(tq_split_count(112, 2, 32), 16);
+    assert_eq!(tq_split_count(112, 2, 5), 2);
+    assert_eq!(tq_split_count(112, 2, 1), 1);
+    // Mistral 7B's 8 KV heads: 14 blocks each fill the 112 exactly.
+    assert_eq!(tq_split_count(112, 8, 256), 14);
+    // 84 resident blocks: 11 per KV head would leave a second wave of 4
+    // blocks; 10 fill one wave.
+    assert_eq!(tq_split_count(84, 8, 256), 10);
+    // As many KV heads as resident blocks: one block each.
+    assert_eq!(tq_split_count(28, 32, 256), 1);
+}
+
+/// `speed-up-decode-attention-on-codes`: a decode step over TurboQuant
+/// stores, captured with its history split over two blocks per KV head,
+/// replays over histories up to 1,001 keys with the same blocks (four
+/// chunks each), every replay matching the CPU reference over the stores'
+/// values.
+#[test]
+fn captured_split_decode_steps_cover_longer_histories() {
+    use magnetar_provider_api::{KvStorePrecision, TurboQuantStoreState};
+    use std::collections::BTreeSet;
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    kernels.set_tq_decode_schedule(TqDecodeSchedule::Split);
+    let (heads, kv_heads, dim, capacity, prefix) = (8u64, 2u64, 64u64, 1200u64, 600u64);
+    let width = kv_heads * dim;
+    let all_k = hashed_values((capacity * width) as usize, 1);
+    let all_v = hashed_values((capacity * width) as usize, 2);
+    let rows = |all: &[f32], from: u64, count: u64| {
+        HostTensor::new(
+            [count, width],
+            all[(from * width) as usize..((from + count) * width) as usize].to_vec(),
+        )
+        .unwrap()
+    };
+    let query = |position: u64| {
+        HostTensor::new(
+            [1, heads * dim],
+            hashed_values((heads * dim) as usize, 300 + position as usize),
+        )
+        .unwrap()
+    };
+    let mut stores = [&all_k, &all_v].map(|all| {
+        let mut store = kernels
+            .tq_zeros(&[capacity, width], KvStorePrecision::Tq4, dim)
+            .unwrap();
+        kernels
+            .kv_write(&mut store, &upload(&kernels, &rows(all, 0, prefix)), 0)
+            .unwrap();
+        store
+    });
+    let mut cpu = [&all_k, &all_v].map(|all| {
+        let mut store = TurboQuantStoreState::new(KvStorePrecision::Tq4, dim, width);
+        let values = store.write(&rows(all, 0, prefix).data, 0).unwrap();
+        (store, values)
+    });
+    let mut q = upload(&kernels, &query(prefix));
+    let mut k_row = upload(&kernels, &rows(&all_k, prefix, 1));
+    let mut v_row = upload(&kernels, &rows(&all_v, prefix, 1));
+    // An eager step first: Kernels compiled, scratch grown.
+    {
+        let [k_store, v_store] = &stores;
+        kernels
+            .attention_valued(
+                &q,
+                k_store,
+                v_store,
+                heads,
+                dim,
+                None,
+                Some(kv_heads),
+                None,
+                true,
+                Some(prefix),
+                None,
+            )
+            .unwrap();
+    }
+    let out = kernels
+        .stream()
+        .alloc_zeros::<f32>((heads * dim) as usize)
+        .unwrap();
+    kernels
+        .begin_capture(BTreeSet::from(["key_count".into(), "row_offset".into()]))
+        .unwrap();
+    let offered = kernels.offer_output(Some(out));
+    let captured = {
+        let [k_store, v_store] = &mut stores;
+        kernels.kv_write(k_store, &k_row, prefix).unwrap();
+        kernels.kv_write(v_store, &v_row, prefix).unwrap();
+        kernels
+            .attention_valued(
+                &q,
+                k_store,
+                v_store,
+                heads,
+                dim,
+                None,
+                Some(kv_heads),
+                None,
+                true,
+                Some(prefix + 1),
+                None,
+            )
+            .unwrap()
+    };
+    drop(offered);
+    let mut step = kernels.end_capture().unwrap();
+    assert_eq!(step.max_offset, capacity - (prefix + 1));
+    for offset in 0..=400u64 {
+        let position = prefix + offset;
+        kernels.write_into(&mut q, &query(position).data).unwrap();
+        kernels
+            .write_into(&mut k_row, &rows(&all_k, position, 1).data)
+            .unwrap();
+        kernels
+            .write_into(&mut v_row, &rows(&all_v, position, 1).data)
+            .unwrap();
+        for ((store, values), all) in cpu.iter_mut().zip([&all_k, &all_v]) {
+            values.extend(store.write(&rows(all, position, 1).data, position).unwrap());
+        }
+        kernels.launch_captured(&mut step, offset).unwrap();
+        // Histories of 5 to 8 chunks: two blocks of three or four chunks.
+        if offset % 100 == 0 || offset == 167 {
+            let keys = position + 1;
+            let history = |values: &Vec<f32>| {
+                HostTensor::new([keys, width], values[..(keys * width) as usize].to_vec()).unwrap()
+            };
+            let expected = magnetar_provider_cpu::attention(
+                &query(position),
+                &history(&cpu[0].1),
+                &history(&cpu[1].1),
+                heads,
+                dim,
+                Some(kv_heads),
+                None,
+                true,
+            )
+            .unwrap();
+            assert_close(&download(&kernels, &captured), &expected);
+        }
+    }
+}
+
+/// `cache-latent-attention-history`: a decode step over an f32 latent
+/// history read as both K and V (16 query heads over 576-value rows, the
+/// values the leading 512; a block serving eight heads) matches the CPU's
+/// attention, for short and longer histories and a sliding window.
+#[test]
+fn latent_decode_matches_the_cpu() {
+    use magnetar_provider_api::value_heads;
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let (heads, width, latent) = (16u64, 576u64, 512u64);
+    for (keys, window) in [
+        (33u64, None),
+        (300, None),
+        (1100, None),
+        (700, Some(300u64)),
+    ] {
+        let capacity = keys + 5;
+        let data = hashed_values((capacity * width) as usize, 21 + keys as usize);
+        let store = upload(
+            &kernels,
+            &HostTensor::new([capacity, width], data.clone()).unwrap(),
+        );
+        let history =
+            HostTensor::new([keys, width], data[..(keys * width) as usize].to_vec()).unwrap();
+        let history_values = value_heads(&history, 1, width, latent).unwrap();
+        let q = HostTensor::new(
+            [1, heads * width],
+            attention_values((heads * width) as usize, 13),
+        )
+        .unwrap();
+        let expected = magnetar_provider_cpu::attention_with_value_width(
+            &q,
+            &history,
+            &history_values,
+            heads,
+            width,
+            latent,
+            Some(1),
+            window,
+            true,
+            Some(0.1),
+        )
+        .unwrap();
+        let actual = kernels
+            .attention_strided_values(
+                &upload(&kernels, &q),
+                &store,
+                &store,
+                heads,
+                width,
+                Some(latent),
+                width,
+                Some(1),
+                window,
+                true,
+                Some(keys),
+                Some(0.1),
+            )
+            .unwrap();
+        assert_close(&download(&kernels, &actual), &expected);
+    }
+}
+
+/// `cache-latent-attention-history`: strided values over several KV heads
+/// (two of them, V heads 64 values apart, each value its head's leading 32)
+/// match the CPU's attention over the extracted values, both for one query
+/// row, which the split Kernel reads in place, and for several, which
+/// gather the values first: every KV head reads V at its own stride.
+#[test]
+fn strided_values_over_several_kv_heads_match_the_cpu() {
+    use magnetar_provider_api::value_heads;
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let (heads, kv_heads, dim, stride, width) = (4u64, 2u64, 64u64, 64u64, 32u64);
+    let (capacity, keys) = (40u64, 33u64);
+    let k = HostTensor::new(
+        [capacity, kv_heads * dim],
+        hashed_values((capacity * kv_heads * dim) as usize, 31),
+    )
+    .unwrap();
+    let v = HostTensor::new(
+        [capacity, kv_heads * stride],
+        hashed_values((capacity * kv_heads * stride) as usize, 32),
+    )
+    .unwrap();
+    let leading = |tensor: &HostTensor| {
+        HostTensor::new(
+            [keys, tensor.shape[1]],
+            tensor.data[..(keys * tensor.shape[1]) as usize].to_vec(),
+        )
+        .unwrap()
+    };
+    let values = value_heads(&leading(&v), kv_heads, stride, width).unwrap();
+    let (k_store, v_store) = (upload(&kernels, &k), upload(&kernels, &v));
+    for queries in [1u64, 3] {
+        let q = HostTensor::new(
+            [queries, heads * dim],
+            hashed_values((queries * heads * dim) as usize, 33 + queries as usize),
+        )
+        .unwrap();
+        let expected = magnetar_provider_cpu::attention_with_value_width(
+            &q,
+            &leading(&k),
+            &values,
+            heads,
+            dim,
+            width,
+            Some(kv_heads),
+            None,
+            true,
+            None,
+        )
+        .unwrap();
+        let actual = kernels
+            .attention_strided_values(
+                &upload(&kernels, &q),
+                &k_store,
+                &v_store,
+                heads,
+                dim,
+                Some(width),
+                stride,
+                Some(kv_heads),
+                None,
+                true,
+                Some(keys),
+                None,
+            )
+            .unwrap();
+        assert_close(&download(&kernels, &actual), &expected);
+    }
+}
+
+/// `cache-latent-attention-history`, `speed-up-decode-attention-on-codes`:
+/// a decode step over a latent TurboQuant store read as both K and V (16
+/// query heads over 576-value rows in groups of 64, the values the leading
+/// 512) runs on its codes, and matches the CPU's attention over the CPU
+/// store's values, as the path through dequantized scratch does: short and
+/// longer histories, an exact head ending inside a chunk and one past
+/// 1,024 rows, a sliding window starting inside the head, `tq4` and `tq3`.
+#[test]
+fn turboquant_latent_decode_on_codes_matches_the_cpu() {
+    use magnetar_provider_api::{KvStorePrecision, TurboQuantStoreState, value_heads};
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let (heads, width, latent, group) = (16u64, 576u64, 512u64, 64u64);
+    for precision in [KvStorePrecision::Tq4, KvStorePrecision::Tq3] {
+        for (keys, exact, window) in [
+            (33u64, 0u64, None),
+            (300, 0, None),
+            (300, 100, None),
+            (1100, 1024, None),
+            (700, 600, Some(300u64)),
+        ] {
+            let label = format!("{} {keys} keys, head {exact}", precision.as_str());
+            let capacity = keys + 7;
+            let data = hashed_values((keys * width) as usize, 11 + keys as usize);
+            let split = ((keys - 1) * width) as usize;
+            let mut store = kernels
+                .tq_zeros_with_exact_head(&[capacity, width], precision, group, exact)
+                .unwrap();
+            for (from, rows, offset) in [(0, keys - 1, 0), (split, 1, keys - 1)] {
+                let tensor = HostTensor::new(
+                    [rows, width],
+                    data[from..from + (rows * width) as usize].to_vec(),
+                )
+                .unwrap();
+                kernels
+                    .kv_write(&mut store, &upload(&kernels, &tensor), offset)
+                    .unwrap();
+            }
+            let mut cpu = TurboQuantStoreState::new(precision, group, width).with_exact_rows(exact);
+            let mut values = cpu.write(&data[..split], 0).unwrap();
+            values.extend(cpu.write(&data[split..], keys - 1).unwrap());
+            let rounded = HostTensor::new([keys, width], values).unwrap();
+            let rounded_values = value_heads(&rounded, 1, width, latent).unwrap();
+            let q = HostTensor::new(
+                [1, heads * width],
+                attention_values((heads * width) as usize, 9),
+            )
+            .unwrap();
+            let expected = magnetar_provider_cpu::attention_with_value_width(
+                &q,
+                &rounded,
+                &rounded_values,
+                heads,
+                width,
+                latent,
+                Some(1),
+                window,
+                true,
+                Some(0.1),
+            )
+            .unwrap();
+            for on_codes in [true, false] {
+                kernels.set_tq_latent_on_codes(on_codes);
                 let actual = kernels
-                    .attention_valued(
+                    .attention_strided_values(
                         &upload(&kernels, &q),
-                        &k_store,
-                        &v_store,
+                        &store,
+                        &store,
                         heads,
-                        dim,
-                        None,
-                        Some(kv_heads),
+                        width,
+                        Some(latent),
+                        width,
+                        Some(1),
                         window,
                         true,
-                        Some(history),
-                        None,
+                        Some(keys),
+                        Some(0.1),
                     )
                     .unwrap();
-                assert_close(&download(&kernels, &actual), &expected);
+                let actual = download(&kernels, &actual);
+                assert_eq!(actual.shape, expected.shape, "{label}");
+                let difference = actual
+                    .data
+                    .iter()
+                    .zip(&expected.data)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0_f32, f32::max);
+                assert!(
+                    difference <= TOLERANCE,
+                    "{label}, on codes {on_codes}: {difference}"
+                );
             }
+            kernels.set_tq_latent_on_codes(true);
         }
     }
 }
@@ -2071,6 +2731,243 @@ fn long_context_kernel_times() {
     }
 }
 
+/// Device time of one decode step's attention -- a query row over a
+/// history of each length -- in f32 stores and in `tq4` and `tq3` stores
+/// with every row on codes and with an exact head of 1,024 rows
+/// (`keep-turboquant-kv-head-exact`), for Qwen2.5-0.5B's heads (14 query,
+/// 2 KV, 64 wide) and Mistral 7B's (32, 8, 128), with the bandwidth each
+/// reaches on the bytes it must read. Not a conformance check: run it with
+/// `--ignored --nocapture` on a GPU.
+#[test]
+#[ignore = "GPU timing diagnostic"]
+fn decode_attention_times() {
+    use magnetar_provider_api::KvStorePrecision;
+    if cfg!(debug_assertions) {
+        return;
+    }
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let context = kernels.stream().context().clone();
+    let timing = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
+    let time_us = |repeats: usize, run: &dyn Fn()| -> f32 {
+        run();
+        let start = context.new_event(timing).unwrap();
+        let end = context.new_event(timing).unwrap();
+        start.record(kernels.stream()).unwrap();
+        for _ in 0..repeats {
+            run();
+        }
+        end.record(kernels.stream()).unwrap();
+        start.elapsed_ms(&end).unwrap() * 1e3 / repeats as f32
+    };
+    // Local memory per thread means an array left the registers.
+    for name in [
+        "attention_split_gqa_kernel",
+        "attention_split_gqa128_kernel",
+        "attention_combine_kernel",
+        "tq_attention_split_grouped_kernel",
+        "tq_attention_split_staged_kernel",
+        "tq_attention_split_kernel",
+        "tq_rotate_back_kernel",
+    ] {
+        let [registers, local, shared] = kernels.kernel_resources(name).unwrap();
+        eprintln!(
+            "{name}: {registers} registers, {local} bytes of local memory per thread, \
+             {shared} bytes of static shared memory"
+        );
+    }
+    for (label, heads, kv_heads, dim) in [
+        ("Qwen2.5-0.5B", 14u64, 2u64, 64u64),
+        ("Mistral 7B", 32, 8, 128),
+    ] {
+        let width = kv_heads * dim;
+        let q = upload(
+            &kernels,
+            &HostTensor::new([1, heads * dim], hashed_values((heads * dim) as usize, 11)).unwrap(),
+        );
+        for keys in [512u64, 1024, 4096, 16384, 32768] {
+            let rows = |seed| {
+                HostTensor::new([keys, width], hashed_values((keys * width) as usize, seed))
+                    .unwrap()
+            };
+            let (k_rows, v_rows) = (rows(7), rows(9));
+            let attend = |k: &CudaDeviceBuffer, v: &CudaDeviceBuffer| {
+                time_us(50, &|| {
+                    kernels
+                        .attention_valued(
+                            &q,
+                            k,
+                            v,
+                            heads,
+                            dim,
+                            None,
+                            Some(kv_heads),
+                            None,
+                            true,
+                            Some(keys),
+                            None,
+                        )
+                        .unwrap();
+                })
+            };
+            let f32_us = attend(&upload(&kernels, &k_rows), &upload(&kernels, &v_rows));
+            let tq = |precision: KvStorePrecision, exact: u64| {
+                let store = |tensor: &HostTensor| {
+                    let mut store = kernels
+                        .tq_zeros_with_exact_head(&[keys, width], precision, dim, exact)
+                        .unwrap();
+                    kernels
+                        .kv_write(&mut store, &upload(&kernels, tensor), 0)
+                        .unwrap();
+                    store
+                };
+                attend(&store(&k_rows), &store(&v_rows))
+            };
+            // The bytes read: K and V rows in f32; codes and a norm per
+            // head row in TurboQuant, with the head's rows in f32.
+            let f32_bytes = (2 * keys * width * 4) as f32;
+            let tq_bytes = |bits: u64, exact: u64| {
+                let exact = exact.min(keys);
+                let codes = (keys - exact) * kv_heads * (dim * bits / 8 + 4);
+                (2 * (codes + exact * width * 4)) as f32
+            };
+            let mut line = format!(
+                "decode attention, {label}, {keys} keys: f32 {f32_us:.1} us ({:.0} GB/s)",
+                f32_bytes / f32_us / 1e3
+            );
+            // Every schedule of the code Kernels on codes alone
+            // (`speed-up-decode-attention-on-codes`), and the default one
+            // with an exact head.
+            for (precision, bits) in [(KvStorePrecision::Tq4, 4), (KvStorePrecision::Tq3, 3)] {
+                for (schedule, exact, name) in [
+                    (TqDecodeSchedule::Unstaged, 0u64, "unstaged"),
+                    (
+                        TqDecodeSchedule::ChunkPerBlock,
+                        0,
+                        "staged, a chunk per block",
+                    ),
+                    (TqDecodeSchedule::Split, 0, "staged and split"),
+                    (
+                        TqDecodeSchedule::Unstaged,
+                        1024,
+                        "unstaged, a 1,024-row head",
+                    ),
+                ] {
+                    kernels.set_tq_decode_schedule(schedule);
+                    let us = tq(precision, exact);
+                    line.push_str(&format!(
+                        ", {} {name} {us:.1} us ({:.0} GB/s)",
+                        precision.as_str(),
+                        tq_bytes(bits, exact) / us / 1e3
+                    ));
+                }
+            }
+            kernels.set_tq_decode_schedule(TqDecodeSchedule::Unstaged);
+            eprintln!("{line}");
+        }
+    }
+}
+
+/// Device time of DeepSeek-V2-Lite's absorbed decode attention
+/// (`cache-latent-attention-history`): 16 query heads over one latent
+/// history of 576-value rows (512 latent values and 64 rope ones), the
+/// values each row's leading 512, scale 0.1; in an f32 store and in `tq4`
+/// stores (groups of 64): through dequantized scratch, on the codes, and on
+/// the codes with a 1,024-row exact head, over
+/// 1,024 to 32,768 keys. Not a conformance check: run it with `--ignored
+/// --nocapture` on a GPU.
+#[test]
+#[ignore = "GPU timing diagnostic"]
+fn latent_decode_attention_times() {
+    use magnetar_provider_api::KvStorePrecision;
+    if cfg!(debug_assertions) {
+        return;
+    }
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let context = kernels.stream().context().clone();
+    let timing = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
+    let time_us = |repeats: usize, run: &dyn Fn()| -> f32 {
+        run();
+        let start = context.new_event(timing).unwrap();
+        let end = context.new_event(timing).unwrap();
+        start.record(kernels.stream()).unwrap();
+        for _ in 0..repeats {
+            run();
+        }
+        end.record(kernels.stream()).unwrap();
+        start.elapsed_ms(&end).unwrap() * 1e3 / repeats as f32
+    };
+    for name in [
+        "latent_attention_split_kernel",
+        "tq_latent_attention_split_kernel",
+    ] {
+        let [registers, local, shared] = kernels.kernel_resources(name).unwrap();
+        eprintln!(
+            "{name}: {registers} registers, {local} bytes of local memory per thread, \
+             {shared} bytes of static shared memory"
+        );
+    }
+    let (heads, width, latent, group) = (16u64, 576u64, 512u64, 64u64);
+    let q = upload(
+        &kernels,
+        &HostTensor::new(
+            [1, heads * width],
+            hashed_values((heads * width) as usize, 11),
+        )
+        .unwrap(),
+    );
+    for keys in [1024u64, 4096, 16384, 32768] {
+        let rows =
+            HostTensor::new([keys, width], hashed_values((keys * width) as usize, 7)).unwrap();
+        let attend = |store: &CudaDeviceBuffer| {
+            time_us(20, &|| {
+                kernels
+                    .attention_strided_values(
+                        &q,
+                        store,
+                        store,
+                        heads,
+                        width,
+                        Some(latent),
+                        width,
+                        Some(1),
+                        None,
+                        true,
+                        Some(keys),
+                        Some(0.1),
+                    )
+                    .unwrap();
+            })
+        };
+        let f32_us = attend(&upload(&kernels, &rows));
+        let tq = |exact: u64, on_codes: bool| {
+            let mut store = kernels
+                .tq_zeros_with_exact_head(&[keys, width], KvStorePrecision::Tq4, group, exact)
+                .unwrap();
+            kernels
+                .kv_write(&mut store, &upload(&kernels, &rows), 0)
+                .unwrap();
+            kernels.set_tq_latent_on_codes(on_codes);
+            let us = attend(&store);
+            kernels.set_tq_latent_on_codes(true);
+            us
+        };
+        let (scratch_us, codes_us, head_us) = (tq(0, false), tq(0, true), tq(1024, true));
+        let f32_bytes = (keys * width * 4) as f32;
+        let tq_bytes = (keys * (width / group) * (group / 2 + 4)) as f32;
+        eprintln!(
+            "latent decode attention, DeepSeek-V2-Lite, {keys} keys: f32 {f32_us:.1} us \
+             ({:.0} GB/s), tq4 through dequantized scratch {scratch_us:.1} us, tq4 on codes \
+             {codes_us:.1} us ({:.0} GB/s), tq4 on codes with a 1,024-row head {head_us:.1} us",
+            f32_bytes / f32_us / 1e3,
+            tq_bytes / codes_us / 1e3,
+        );
+    }
+}
+
 /// Diagnostic, not a gate: the Device time of one decode-step matmul of
 /// each Qwen2.5-0.5B projection shape, f32 and compact, and the bandwidth
 /// it reaches. 200 back-to-back launches are timed, so a shape whose
@@ -2785,6 +3682,51 @@ fn q6k_packed_matmul_matches_reference_cpu() {
     }
 }
 
+/// Long prefills against packed weights: more rows than the packed row
+/// Kernels take, so the weight is dequantized for the call and, on a Device
+/// with Tensor Cores, multiplied with both operands split into three
+/// bfloat16 terms (`matmul_tcp_split3_kernel`); the f32 Kernels otherwise.
+/// With and without a bias or residual, against the Reference CPU on the
+/// dequantized weights, within 1e-5 of the largest output: a weight rounded
+/// to bfloat16 alone would be off by about 5e-4.
+#[test]
+fn long_prefills_against_packed_weights_match_reference_cpu() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    // 136 columns and 300 rows leave partial Tensor Core tiles.
+    let (k, n) = (512_u64, 136_u64);
+    let weights = [
+        ("Q8_0", packed_q8(n, k, true, 61)),
+        ("Q4_K", packed_q4k(n, k, true, 62)),
+        ("Q6_K", packed_q6k(n, k, true, 63)),
+    ];
+    let bias = HostTensor::new([n], (0..n).map(|i| i as f32 * 0.01).collect::<Vec<_>>()).unwrap();
+    for (label, packed) in weights {
+        let dense = packed.dequantize();
+        let weight = kernels.upload_packed_weight(&packed).unwrap();
+        for m in [64_u64, 200, 300] {
+            let a = activations(m, k, m as u32 + 70);
+            let expected = magnetar_provider_cpu::matmul(&a, &dense, false, false).unwrap();
+            let a_dev = upload(&kernels, &a);
+            let actual = kernels.matmul(&a_dev, &weight, false, false).unwrap();
+            assert_eq!(actual.shape, vec![m, n], "{label} m={m}");
+            assert_close_relative(&download(&kernels, &actual), &expected);
+            let with_bias = kernels
+                .matmul_bias(&a_dev, &weight, &upload(&kernels, &bias), false, false)
+                .unwrap();
+            let expected_bias = magnetar_provider_cpu::add(&expected, &bias).unwrap();
+            assert_close_relative(&download(&kernels, &with_bias), &expected_bias);
+            let residual = activations(m, n, 96);
+            let with_residual = kernels
+                .matmul_residual(&a_dev, &weight, &upload(&kernels, &residual), false, false)
+                .unwrap();
+            let expected_residual = magnetar_provider_cpu::add(&expected, &residual).unwrap();
+            assert_close_relative(&download(&kernels, &with_residual), &expected_residual);
+        }
+    }
+}
+
 /// A deterministic packed `Q2_K` or `Q3_K` matrix of `stored_rows` x
 /// `stored_cols` super-blocks: random quants, masks and scales, small
 /// positive f16 `d` (and `dmin`).
@@ -3403,6 +4345,276 @@ fn moe_experts_match_reference_cpu_for_f32_and_packed_experts() {
     let mut graph = kernels.end_capture().unwrap();
     kernels.launch_captured(&mut graph, 0).unwrap();
     assert_eq!(download(&kernels, &captured).data, eager.data);
+}
+
+/// A long prefill's matmul against a packed weight runs on Tensor Cores
+/// 2,048 rows of A at a time (`SPLIT_TCP_BLOCK_ROWS`): each output row is
+/// the one a matmul over fewer rows gives, bit for bit, in the first
+/// block, across a block boundary and in the last; with a full addend
+/// (`matmul-residual`); and `gated-matmul` holds the gate's and up's
+/// products a block at a time, its values `silu_mul` of both matmuls'.
+#[test]
+fn long_prefill_matmuls_run_in_row_blocks() {
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    if !kernels.has_tensor_cores() {
+        eprintln!("skipped: no Tensor Cores");
+        return;
+    }
+    let (m, k, n) = (4500_u64, 256_u64, 512_u64);
+    let a = activations(m, k, 81);
+    let residual = activations(m, n, 82);
+    let weight = kernels
+        .upload_packed_weight(&packed_q8(n, k, true, 83))
+        .unwrap();
+    let gate = kernels
+        .upload_packed_weight(&packed_q8(n, k, true, 84))
+        .unwrap();
+    let up = kernels
+        .upload_packed_weight(&packed_q8(n, k, true, 85))
+        .unwrap();
+    let rows_of = |tensor: &HostTensor, width: u64, first: u64, count: u64| {
+        HostTensor::new(
+            [count, width],
+            tensor.data[(first * width) as usize..((first + count) * width) as usize].to_vec(),
+        )
+        .unwrap()
+    };
+    let (da, dresidual) = (upload(&kernels, &a), upload(&kernels, &residual));
+    let full = download(
+        &kernels,
+        &kernels.matmul(&da, &weight, false, false).unwrap(),
+    );
+    let full_residual = download(
+        &kernels,
+        &kernels
+            .matmul_residual(&da, &weight, &dresidual, false, false)
+            .unwrap(),
+    );
+    let gated = download(
+        &kernels,
+        &kernels.gated_matmul(&da, &gate, &up, false, false).unwrap(),
+    );
+    let separate = download(
+        &kernels,
+        &kernels
+            .silu_mul(
+                &kernels.matmul(&da, &gate, false, false).unwrap(),
+                &kernels.matmul(&da, &up, false, false).unwrap(),
+            )
+            .unwrap(),
+    );
+    assert_eq!(gated.shape, vec![m, n]);
+    for (index, (g, s)) in gated.data.iter().zip(&separate.data).enumerate() {
+        assert_eq!(
+            g.to_bits(),
+            s.to_bits(),
+            "gated element {index}: {g} against {s}"
+        );
+    }
+    for (first, count) in [(0_u64, 100_u64), (2000, 100), (4400, 100)] {
+        let sub = upload(&kernels, &rows_of(&a, k, first, count));
+        let sub_residual = upload(&kernels, &rows_of(&residual, n, first, count));
+        let checks = [
+            (
+                "matmul",
+                &full,
+                download(
+                    &kernels,
+                    &kernels.matmul(&sub, &weight, false, false).unwrap(),
+                ),
+            ),
+            (
+                "matmul-residual",
+                &full_residual,
+                download(
+                    &kernels,
+                    &kernels
+                        .matmul_residual(&sub, &weight, &sub_residual, false, false)
+                        .unwrap(),
+                ),
+            ),
+            (
+                "gated-matmul",
+                &gated,
+                download(
+                    &kernels,
+                    &kernels
+                        .gated_matmul(&sub, &gate, &up, false, false)
+                        .unwrap(),
+                ),
+            ),
+        ];
+        for (what, whole, part) in checks {
+            let expected = &whole.data[(first * n) as usize..((first + count) * n) as usize];
+            for (index, (p, w)) in part.data.iter().zip(expected).enumerate() {
+                assert_eq!(
+                    p.to_bits(),
+                    w.to_bits(),
+                    "{what}, rows {first}..{}, element {index}: {p} against {w}",
+                    first + count
+                );
+            }
+        }
+    }
+    // Against the Reference CPU's product of the expanded weight.
+    let expected = magnetar_runtime::reference_cpu::matmul(
+        &a,
+        &packed_q8(n, k, true, 83).dequantize(),
+        false,
+        false,
+    )
+    .unwrap();
+    assert_close_relative(&full, &expected);
+}
+
+/// A `moe-experts` prefill over packed `Q8_0` experts, its pairs grouped by
+/// expert (`moe_q8_gated_grouped_kernel`), gives the per-pair Kernels' own
+/// values: for prompts served in one and in several token chunks, a share
+/// of the experts (pairs held elsewhere skipped), SiLU and GELU gates with
+/// a per-expert scale; and matches the Reference CPU.
+#[test]
+fn grouped_moe_prefill_matches_the_per_pair_kernels() {
+    use crate::kernels::CudaMoeOptions;
+    use magnetar_provider_api::{MoeRouting, moe_experts};
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let (hidden, inter, experts, top_k) = (64_u64, 32_u64, 16_u64, 4_u64);
+    for (tokens, held) in [(65_u64, (0, experts)), (300, (5, 6)), (2500, (0, experts))] {
+        let count = held.1;
+        let gate = packed_q8(count * inter, hidden, true, 71);
+        let up = packed_q8(count * inter, hidden, true, 72);
+        let down = packed_q8(count * hidden, inter, true, 73);
+        let packed = [&gate, &up, &down].map(|w| kernels.upload_packed_weight(w).unwrap());
+        let h = activations(tokens, hidden, 74);
+        let logits = activations(tokens, experts, 75);
+        let (dh, dlogits) = (upload(&kernels, &h), upload(&kernels, &logits));
+        let scale = upload(
+            &kernels,
+            &HostTensor::new(
+                [experts],
+                (0..experts)
+                    .map(|e| 0.5 + e as f32 / 16.0)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        );
+        for (normalize, gelu_tanh) in [(true, false), (false, true)] {
+            let routing = MoeRouting {
+                experts,
+                top_k,
+                normalize,
+            };
+            let options = CudaMoeOptions {
+                gelu_tanh,
+                per_expert_scale: gelu_tanh.then_some(&scale),
+            };
+            let run = |grouped: bool| {
+                kernels.set_moe_grouped(grouped);
+                let out = kernels
+                    .moe_experts_with(
+                        &dh,
+                        &dlogits,
+                        [&packed[0], &packed[1], &packed[2]],
+                        routing,
+                        held,
+                        options,
+                    )
+                    .unwrap();
+                download(&kernels, &out)
+            };
+            let per_pair = run(false);
+            let grouped = run(true);
+            assert_eq!(grouped.shape, per_pair.shape);
+            for (index, (g, p)) in grouped.data.iter().zip(&per_pair.data).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    p.to_bits(),
+                    "{tokens} tokens, experts {held:?}, normalize {normalize}, gelu \
+                     {gelu_tanh}, element {index}: grouped {g} per-pair {p}"
+                );
+            }
+            if held == (0, experts) && !gelu_tanh {
+                let expected = moe_experts(
+                    &h,
+                    &logits,
+                    [&gate.dequantize(), &up.dequantize(), &down.dequantize()],
+                    routing,
+                )
+                .unwrap();
+                assert_close_relative(&grouped, &expected);
+            }
+        }
+    }
+    kernels.set_moe_grouped(true);
+}
+
+/// The Device time of one `moe-experts` prefill at DeepSeek-V2-Lite's
+/// routed experts (2048 hidden, 1408 intermediate, 64 experts, top 6),
+/// packed `Q8_0`, over 1,024 and 4,096 tokens: the pairs grouped by expert
+/// against one pair at a time; diagnostic only.
+#[test]
+#[ignore = "GPU timing diagnostic"]
+fn moe_prefill_kernel_times() {
+    use magnetar_provider_api::MoeRouting;
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let context = kernels.stream().context().clone();
+    let timing = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
+    let time = |run: &dyn Fn(), repeats: u32| -> f32 {
+        run();
+        let start = context.new_event(timing).unwrap();
+        let end = context.new_event(timing).unwrap();
+        start.record(kernels.stream()).unwrap();
+        for _ in 0..repeats {
+            run();
+        }
+        end.record(kernels.stream()).unwrap();
+        start.elapsed_ms(&end).unwrap() / repeats as f32
+    };
+    let (hidden, inter, experts, top_k) = (2048_u64, 1408_u64, 64_u64, 6_u64);
+    let routing = MoeRouting {
+        experts,
+        top_k,
+        normalize: false,
+    };
+    let gate = kernels
+        .upload_packed_weight(&packed_q8(experts * inter, hidden, true, 76))
+        .unwrap();
+    let up = kernels
+        .upload_packed_weight(&packed_q8(experts * inter, hidden, true, 77))
+        .unwrap();
+    let down = kernels
+        .upload_packed_weight(&packed_q8(experts * hidden, inter, true, 78))
+        .unwrap();
+    for tokens in [1024_u64, 4096] {
+        let h = upload(&kernels, &activations(tokens, hidden, 79));
+        let logits = upload(&kernels, &activations(tokens, experts, 80));
+        for grouped in [false, true] {
+            kernels.set_moe_grouped(grouped);
+            let ms = time(
+                &|| {
+                    kernels
+                        .moe_experts(&h, &logits, [&gate, &up, &down], routing, (0, experts))
+                        .unwrap();
+                },
+                3,
+            );
+            eprintln!(
+                "moe-experts prefill, {tokens} tokens, {}: {:.2} ms",
+                if grouped {
+                    "pairs grouped by expert"
+                } else {
+                    "one pair at a time"
+                },
+                ms
+            );
+        }
+    }
+    kernels.set_moe_grouped(true);
 }
 
 /// Tensor parallelism splits a `moe-experts` layer's experts whole across
@@ -4079,11 +5291,193 @@ fn yarn_rope_matches_reference_cpu() {
     );
 }
 
+/// Attention over latent K and V (`latent_kv_width`,
+/// `chunk-latent-prefills`): the key rows a pass reads (`key_count`, the
+/// queries the last of them) expanded per head by packed projections, from
+/// an f32 history and from `tq4` histories with and without an exact head,
+/// against the Reference CPU's expansion and attention.
+#[test]
+fn attention_over_latent_keys_and_values_matches_the_cpu() {
+    use magnetar_provider_api::operator_semantics::{latent_keys, latent_values};
+    use magnetar_provider_api::{KvStorePrecision, TurboQuantStoreState};
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    // Four heads of 16 + 8 key values and 16 values, 32 latent values.
+    let (heads, nope, rope, latent, value) = (4u64, 16u64, 8u64, 32u64, 16u64);
+    let (width, head_dimension) = (latent + rope, nope + rope);
+    let w_k = packed_q8(heads * nope, latent, true, 86);
+    let w_v = packed_q8(heads * value, latent, true, 87);
+    let (dw_k, dw_v) = (
+        kernels.upload_packed_weight(&w_k).unwrap(),
+        kernels.upload_packed_weight(&w_v).unwrap(),
+    );
+    let (w_k, w_v) = (w_k.dequantize(), w_v.dequantize());
+    for (queries, keys, exact, precision) in [
+        (70_u64, 260_u64, 0_u64, None),
+        (40, 40, 0, None),
+        (70, 260, 0, Some(KvStorePrecision::Tq4)),
+        (70, 260, 100, Some(KvStorePrecision::Tq4)),
+    ] {
+        let label = format!("{queries} queries over {keys} keys, {precision:?}, head {exact}");
+        let capacity = keys + 9;
+        let data = hashed_values((keys * width) as usize, 31 + keys as usize);
+        let (store, rows) = match precision {
+            None => {
+                let mut padded = data.clone();
+                padded.resize((capacity * width) as usize, 0.5);
+                (
+                    upload(
+                        &kernels,
+                        &HostTensor::new([capacity, width], padded).unwrap(),
+                    ),
+                    HostTensor::new([keys, width], data.clone()).unwrap(),
+                )
+            }
+            Some(precision) => {
+                let mut store = kernels
+                    .tq_zeros_with_exact_head(&[capacity, width], precision, 8, exact)
+                    .unwrap();
+                kernels
+                    .kv_write(
+                        &mut store,
+                        &upload(
+                            &kernels,
+                            &HostTensor::new([keys, width], data.clone()).unwrap(),
+                        ),
+                        0,
+                    )
+                    .unwrap();
+                let mut cpu = TurboQuantStoreState::new(precision, 8, width).with_exact_rows(exact);
+                let values = cpu.write(&data, 0).unwrap();
+                (store, HostTensor::new([keys, width], values).unwrap())
+            }
+        };
+        let q = activations(queries, heads * head_dimension, 88);
+        let expected = magnetar_provider_cpu::attention_with_value_width(
+            &q,
+            &latent_keys(&rows, &w_k, latent, heads).unwrap(),
+            &latent_values(&rows, &w_v, latent).unwrap(),
+            heads,
+            head_dimension,
+            value,
+            Some(heads),
+            None,
+            true,
+            Some(0.2),
+        )
+        .unwrap();
+        let actual = kernels
+            .attention_latent_kv(
+                [&upload(&kernels, &q), &store, &store],
+                [&dw_k, &dw_v],
+                latent,
+                [heads, head_dimension],
+                Some(value),
+                Some(heads),
+                None,
+                true,
+                Some(keys),
+                Some(0.2),
+            )
+            .unwrap();
+        let actual = download(&kernels, &actual);
+        assert_eq!(actual.shape, expected.shape, "{label}");
+        for (index, (a, e)) in actual.data.iter().zip(&expected.data).enumerate() {
+            assert!(
+                (a - e).abs() <= 2e-3,
+                "{label}, element {index}: cuda={a} reference={e}"
+            );
+        }
+    }
+}
+
+/// The Device time of one latent prefill attention pass
+/// (`attention_latent_kv`) at DeepSeek-V2-Lite's shapes (16 heads, 512
+/// latent and 64 rope values, 128-wide keys and values, packed `Q8_0`
+/// projections): 2,048 queries after 2,048 to 16,384 keys of an f32 and a
+/// `tq4` history (with and without a 1,024-row exact head), and of its
+/// first step alone (the rows split, a `tq4` history dequantized);
+/// diagnostic only.
+#[test]
+#[ignore = "GPU timing diagnostic"]
+fn latent_prefill_attention_times() {
+    use magnetar_provider_api::KvStorePrecision;
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let context = kernels.stream().context().clone();
+    let timing = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
+    let time_ms = |repeats: usize, run: &dyn Fn()| -> f32 {
+        run();
+        let start = context.new_event(timing).unwrap();
+        let end = context.new_event(timing).unwrap();
+        start.record(kernels.stream()).unwrap();
+        for _ in 0..repeats {
+            run();
+        }
+        end.record(kernels.stream()).unwrap();
+        start.elapsed_ms(&end).unwrap() / repeats as f32
+    };
+    let (heads, nope, rope, latent, value) = (16u64, 128u64, 64u64, 512u64, 128u64);
+    let width = latent + rope;
+    let w_k = kernels
+        .upload_packed_weight(&packed_q8(heads * nope, latent, true, 89))
+        .unwrap();
+    let w_v = kernels
+        .upload_packed_weight(&packed_q8(heads * value, latent, true, 90))
+        .unwrap();
+    let queries = 2048u64;
+    let q = upload(&kernels, &activations(queries, heads * (nope + rope), 91));
+    for keys in [2048u64, 8192, 16384] {
+        let capacity = keys + 64;
+        let data = activations(capacity, width, 92);
+        let f32_store = upload(&kernels, &data);
+        let mut stores = vec![("f32".to_string(), f32_store)];
+        for exact in [0u64, 1024] {
+            let mut store = kernels
+                .tq_zeros_with_exact_head(&[capacity, width], KvStorePrecision::Tq4, 64, exact)
+                .unwrap();
+            kernels
+                .kv_write(&mut store, &upload(&kernels, &data), 0)
+                .unwrap();
+            stores.push((format!("tq4, head {exact}"), store));
+        }
+        for (label, store) in &stores {
+            let pass = time_ms(3, &|| {
+                kernels
+                    .attention_latent_kv(
+                        [&q, store, store],
+                        [&w_k, &w_v],
+                        latent,
+                        [heads, nope + rope],
+                        Some(value),
+                        Some(heads),
+                        None,
+                        true,
+                        Some(keys),
+                        None,
+                    )
+                    .unwrap();
+            });
+            let split = time_ms(3, &|| {
+                kernels.latent_split(store, Some(keys), latent).unwrap();
+            });
+            eprintln!(
+                "latent prefill attention, {queries} queries after {keys} keys, {label}: \
+                 {pass:.2} ms, of which the split {split:.2} ms"
+            );
+        }
+    }
+}
+
 /// Attention with V rows narrower than Q and K (`value_head_dimension`,
 /// `express-latent-attention-forms`) in the Kernels that serve it: split-key
-/// decode (one chunk and several), the block Kernel and the one-thread
-/// Kernel (a history too long for the block Kernel's shared memory); equal
-/// widths unchanged.
+/// decode (one chunk and several), the tiled prefill Kernel (192-dimension
+/// keys, 128-dimension values: several query tiles, a window, grouped
+/// heads, queries after a longer history), the block Kernel and the
+/// one-thread Kernel (a history too long for the block Kernel's shared
+/// memory); equal widths unchanged.
 #[test]
 fn attention_with_a_value_width_matches_reference_cpu() {
     use magnetar_runtime::reference_cpu::attention_with_value_width;
@@ -4097,6 +5491,9 @@ fn attention_with_a_value_width_matches_reference_cpu() {
         (1, 300, 2, 2, 192, 128, None),
         (1, 300, 4, 2, 24, 16, Some(64_u64)),
         (7, 7, 2, 2, 192, 128, None),
+        (130, 130, 3, 3, 192, 128, None),
+        (70, 300, 4, 2, 192, 128, None),
+        (100, 100, 2, 1, 192, 128, Some(40)),
         (24, 24, 4, 1, 12, 20, Some(8)),
         (3, 13_000, 1, 1, 16, 8, None),
         (6, 9, 2, 2, 64, 64, None),

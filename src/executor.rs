@@ -81,6 +81,13 @@ fn half_dtype_from_descriptor(descriptor: &TensorDescriptor) -> Result<CudaHalfD
 /// How many recent Kernel observations a [`CudaExecutor`] keeps.
 pub const KERNEL_OBSERVATION_LOG_CAPACITY: usize = 4096;
 
+/// Whether every dispatch waits for its Kernels (`MAGNETAR_CUDA_SYNC_NODES=1`):
+/// a diagnostic, so that host-timed phase attribution covers Device time.
+fn synchronize_each_node() -> bool {
+    static SYNC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SYNC.get_or_init(|| std::env::var("MAGNETAR_CUDA_SYNC_NODES").as_deref() == Ok("1"))
+}
+
 pub struct CudaExecutor {
     kernels: CudaKernels,
     device_id: DeviceId,
@@ -557,9 +564,26 @@ impl CudaExecutor {
         precision: KvStorePrecision,
         head_dimension: u64,
     ) -> Result<bool, ProviderExecutionError> {
+        self.write_zeroed_kv_store_with_exact_head(id, shape, precision, head_dimension, 0)
+    }
+
+    /// See [`ProviderExecutionApi::write_zeroed_kv_store_with_exact_head`]:
+    /// [`Self::write_zeroed_kv_store`] whose first `exact_rows` rows are
+    /// kept exact in an f32 head (`keep-turboquant-kv-head-exact`).
+    pub fn write_zeroed_kv_store_with_exact_head(
+        &self,
+        id: &TensorResourceId,
+        shape: &[u64],
+        precision: KvStorePrecision,
+        head_dimension: u64,
+        exact_rows: u64,
+    ) -> Result<bool, ProviderExecutionError> {
         let buffer = match precision {
             KvStorePrecision::F32 => self.kernels.zeros(shape),
-            _ => self.kernels.tq_zeros(shape, precision, head_dimension),
+            _ => {
+                self.kernels
+                    .tq_zeros_with_exact_head(shape, precision, head_dimension, exact_rows)
+            }
         }
         .map_err(|error| {
             ProviderExecutionError::new(
@@ -1228,6 +1252,15 @@ impl CudaExecutor {
         let result = self.run_invocation_uncaptured(invocation);
         if result.is_ok() {
             self.record_captured_resources(invocation);
+            // A diagnostic: the host time of each dispatch then covers its
+            // Kernels' Device time (`MAGNETAR_CUDA_SYNC_NODES=1`).
+            if synchronize_each_node() && !self.kernels.is_capturing() {
+                self.kernels.stream().synchronize().map_err(|error| {
+                    KernelError::KernelExecutionFailed {
+                        reason: format!("synchronizing after {}: {error}", invocation.kernel.name),
+                    }
+                })?;
+            }
         }
         result
     }
@@ -1306,7 +1339,9 @@ impl CudaExecutor {
             // writes its store's codes and attention reads K and V codes
             // or dequantizes them for the call; neither is expanded for good.
             "kv-write" => index == 0,
-            "attention" => index == 1 || index == 2,
+            // Latent K and V's projections (`chunk-latent-prefills`) go
+            // through the matmul, which reads them compact.
+            "attention" => (1..=4).contains(&index),
             _ => false,
         };
         let mut storage = self.storage.lock().unwrap();
@@ -1701,8 +1736,35 @@ impl CudaExecutor {
                             });
                         }
                     };
-                    match value_stride {
-                        Some(stride) => self.kernels.attention_strided_values(
+                    // `chunk-latent-prefills`: latent K and V, expanded by
+                    // the fourth and fifth inputs.
+                    let latent_width = match invocation.attributes.get("latent_kv_width") {
+                        None => None,
+                        Some(OperatorAttributeValue::Integer(width)) if *width > 0 => {
+                            Some(*width as u64)
+                        }
+                        Some(other) => {
+                            return Err(KernelError::KernelAttributeUnsupported {
+                                attribute: format!(
+                                    "latent_kv_width {other:?} must be a positive integer"
+                                ),
+                            });
+                        }
+                    };
+                    match (latent_width, value_stride) {
+                        (Some(latent_width), _) => self.kernels.attention_latent_kv(
+                            [q, k, v],
+                            [get(3)?, get(4)?],
+                            latent_width,
+                            [head_count, head_dimension],
+                            value_dimension,
+                            kv_head_count,
+                            window_size,
+                            causal,
+                            key_count,
+                            scale,
+                        ),
+                        (None, Some(stride)) => self.kernels.attention_strided_values(
                             q,
                             k,
                             v,
@@ -1716,7 +1778,7 @@ impl CudaExecutor {
                             key_count,
                             scale,
                         ),
-                        None => self.kernels.attention_valued(
+                        (None, None) => self.kernels.attention_valued(
                             q,
                             k,
                             v,
@@ -2406,6 +2468,24 @@ impl ProviderExecutionApi for CudaExecutor {
         head_dimension: u64,
     ) -> Result<bool, ProviderExecutionError> {
         CudaExecutor::write_zeroed_kv_store(self, id, shape, precision, head_dimension)
+    }
+
+    fn write_zeroed_kv_store_with_exact_head(
+        &self,
+        id: &TensorResourceId,
+        shape: &[u64],
+        precision: KvStorePrecision,
+        head_dimension: u64,
+        exact_rows: u64,
+    ) -> Result<bool, ProviderExecutionError> {
+        CudaExecutor::write_zeroed_kv_store_with_exact_head(
+            self,
+            id,
+            shape,
+            precision,
+            head_dimension,
+            exact_rows,
+        )
     }
 
     fn write_tensor_value_admitted(

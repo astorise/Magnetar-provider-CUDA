@@ -17,10 +17,14 @@ pub const KEY_COUNT_FEATURE: &str = "key-count";
 use magnetar_core::ComputeDType;
 use magnetar_core::capability::CapabilityVersion;
 use magnetar_core::device::DeviceId;
-use magnetar_core::operator::{ATTENTION_TURBOQUANT_KV_FEATURE, KV_WRITE_TURBOQUANT_FEATURE};
+use magnetar_core::operator::{
+    ATTENTION_TURBOQUANT_KV_FEATURE, KV_WRITE_TURBOQUANT_EXACT_HEAD_FEATURE,
+    KV_WRITE_TURBOQUANT_FEATURE,
+};
 use magnetar_core::{DeviceBinding, ProviderBinding};
 use magnetar_core::{
-    operator::ATTENTION_SCALE_FEATURE, operator::ATTENTION_VALUE_HEAD_DIMENSION_FEATURE,
+    operator::ATTENTION_LATENT_KV_FEATURE, operator::ATTENTION_SCALE_FEATURE,
+    operator::ATTENTION_VALUE_HEAD_DIMENSION_FEATURE,
     operator::ATTENTION_VALUE_HEAD_STRIDE_FEATURE, operator::CONCAT_HEADS_FEATURE,
     operator::EMBEDDING_SCALE_FEATURE, operator::MOE_EXPERTS_ACTIVATION_FEATURE,
     operator::MOE_PER_EXPERT_SCALE_FEATURE, operator::OperatorFamily, operator::OperatorId,
@@ -226,7 +230,8 @@ pub fn cuda_kernel_advertisements(
         ),
         // Honours `key_count` (`append-kv-history-in-place`), `scale`,
         // `value_head_dimension` and `value_head_stride`
-        // (`cache-latent-attention-history`).
+        // (`cache-latent-attention-history`) and `latent_kv_width`
+        // (`chunk-latent-prefills`).
         advertisement_with_features(
             "attention",
             OperatorFamily::Attention,
@@ -237,6 +242,7 @@ pub fn cuda_kernel_advertisements(
                 ATTENTION_SCALE_FEATURE,
                 ATTENTION_VALUE_HEAD_DIMENSION_FEATURE,
                 ATTENTION_VALUE_HEAD_STRIDE_FEATURE,
+                ATTENTION_LATENT_KV_FEATURE,
                 ATTENTION_TURBOQUANT_KV_FEATURE,
             ],
         ),
@@ -259,13 +265,17 @@ pub fn cuda_kernel_advertisements(
             provider_name,
             &[CONCAT_HEADS_FEATURE],
         ),
-        // Creates and writes TurboQuant stores (`turboquant-kv-history`).
+        // Creates and writes TurboQuant stores (`turboquant-kv-history`),
+        // with an exact head (`keep-turboquant-kv-head-exact`).
         advertisement_with_features(
             "kv-write",
             OperatorFamily::Tensor,
             device_id,
             provider_name,
-            &[KV_WRITE_TURBOQUANT_FEATURE],
+            &[
+                KV_WRITE_TURBOQUANT_FEATURE,
+                KV_WRITE_TURBOQUANT_EXACT_HEAD_FEATURE,
+            ],
         ),
         baseline_advertisement(
             "residual-add",

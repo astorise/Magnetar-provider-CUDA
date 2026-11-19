@@ -773,26 +773,39 @@ impl ProviderExecutionApi for CudaMultiExecutor {
         precision: magnetar_provider_api::KvStorePrecision,
         head_dimension: u64,
     ) -> Result<bool, ProviderExecutionError> {
+        self.write_zeroed_kv_store_with_exact_head(id, shape, precision, head_dimension, 0)
+    }
+
+    fn write_zeroed_kv_store_with_exact_head(
+        &self,
+        id: &TensorResourceId,
+        shape: &[u64],
+        precision: magnetar_provider_api::KvStorePrecision,
+        head_dimension: u64,
+        exact_rows: u64,
+    ) -> Result<bool, ProviderExecutionError> {
         if self.tensor_parallel_active() {
             let mut written = true;
             for member in &self.members {
-                written &= ProviderExecutionApi::write_zeroed_kv_store(
+                written &= ProviderExecutionApi::write_zeroed_kv_store_with_exact_head(
                     &**member,
                     id,
                     shape,
                     precision,
                     head_dimension,
+                    exact_rows,
                 )?;
             }
             return Ok(written);
         }
         let member = self.write_member(id);
-        let written = ProviderExecutionApi::write_zeroed_kv_store(
+        let written = ProviderExecutionApi::write_zeroed_kv_store_with_exact_head(
             &*self.members[member],
             id,
             shape,
             precision,
             head_dimension,
+            exact_rows,
         )?;
         if written {
             self.record_produced(id, member, None);
@@ -1054,6 +1067,7 @@ impl ProviderExecutionApi for CudaMultiExecutor {
 pub struct CudaMultiProvider {
     metadata: ProviderMetadata,
     devices: Vec<Arc<DeviceDescriptor>>,
+    contexts: Vec<Arc<CudaContext>>,
     executor: Option<Arc<CudaMultiExecutor>>,
 }
 
@@ -1098,6 +1112,7 @@ impl CudaMultiProvider {
         Self {
             metadata: crate::provider::cuda_provider_metadata_for(&provider_name),
             devices: if available { devices } else { Vec::new() },
+            contexts: if available { contexts } else { Vec::new() },
             executor: available.then(|| {
                 Arc::new(CudaMultiExecutor {
                     provider_name,
@@ -1119,6 +1134,16 @@ impl CudaMultiProvider {
 
     pub fn executor(&self) -> Option<Arc<CudaMultiExecutor>> {
         self.executor.clone()
+    }
+
+    /// Each GPU's free memory in bytes, in the order of the ordinals
+    /// (`None` where the driver does not say): a diagnostic, never part of
+    /// the portable Provider contract.
+    pub fn free_memory(&self) -> Vec<Option<u64>> {
+        self.contexts
+            .iter()
+            .map(|context| context.mem_get_info().ok().map(|(free, _)| free as u64))
+            .collect()
     }
 }
 
