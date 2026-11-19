@@ -174,7 +174,6 @@ impl CudaProvider {
             return Err(DriverError(CUresult::CUDA_ERROR_NO_DEVICE));
         }
         let context = CudaContext::new(ordinal)?;
-        retain_freed_device_memory(&context);
         let device = cuda_device_descriptor(&context, provider_name)?;
         Ok((context, device))
     }
@@ -322,34 +321,4 @@ impl Provider for CudaProvider {
     // instead of a deep `TensorError::ResidencyUnavailable`; this change
     // closes the constraint itself, so the override is removed rather than
     // kept as dead documentation of a limitation that no longer exists.
-}
-
-/// Keeps the memory the stream-ordered allocator frees in the device's
-/// default pool for later allocations instead of returning it to the driver
-/// at every synchronization (the driver's default release threshold, 0):
-/// a prefill's large temporaries are then served from the pool. The memory
-/// stays this process's until it exits. `MAGNETAR_CUDA_POOL_RELEASE=1` keeps
-/// the driver's default. A device without memory pools is left as it is.
-fn retain_freed_device_memory(context: &CudaContext) {
-    if std::env::var("MAGNETAR_CUDA_POOL_RELEASE").as_deref() == Ok("1")
-        || !context.has_async_alloc()
-    {
-        return;
-    }
-    let mut pool: cudarc::driver::sys::CUmemoryPool = std::ptr::null_mut();
-    // SAFETY: `pool` receives the device's default pool handle, owned by the
-    // driver; the threshold is read from a live `u64`.
-    unsafe {
-        if cudarc::driver::sys::cuDeviceGetDefaultMemPool(&mut pool, context.cu_device())
-            != CUresult::CUDA_SUCCESS
-        {
-            return;
-        }
-        let mut threshold = u64::MAX;
-        let _ = cudarc::driver::sys::cuMemPoolSetAttribute(
-            pool,
-            cudarc::driver::sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
-            (&mut threshold as *mut u64).cast(),
-        );
-    }
 }
