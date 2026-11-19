@@ -1446,7 +1446,7 @@ impl CudaKernels {
         self.advancing_offset(PADDING_ROWS_ATTRIBUTE, m - 1)
     }
 
-    fn is_capturing(&self) -> bool {
+    pub(crate) fn is_capturing(&self) -> bool {
         self.capture.lock().unwrap().is_some()
     }
 

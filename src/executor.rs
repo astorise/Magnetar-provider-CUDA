@@ -81,6 +81,13 @@ fn half_dtype_from_descriptor(descriptor: &TensorDescriptor) -> Result<CudaHalfD
 /// How many recent Kernel observations a [`CudaExecutor`] keeps.
 pub const KERNEL_OBSERVATION_LOG_CAPACITY: usize = 4096;
 
+/// Whether every dispatch waits for its Kernels (`MAGNETAR_CUDA_SYNC_NODES=1`):
+/// a diagnostic, so that host-timed phase attribution covers Device time.
+fn synchronize_each_node() -> bool {
+    static SYNC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SYNC.get_or_init(|| std::env::var("MAGNETAR_CUDA_SYNC_NODES").as_deref() == Ok("1"))
+}
+
 pub struct CudaExecutor {
     kernels: CudaKernels,
     device_id: DeviceId,
@@ -1245,6 +1252,15 @@ impl CudaExecutor {
         let result = self.run_invocation_uncaptured(invocation);
         if result.is_ok() {
             self.record_captured_resources(invocation);
+            // A diagnostic: the host time of each dispatch then covers its
+            // Kernels' Device time (`MAGNETAR_CUDA_SYNC_NODES=1`).
+            if synchronize_each_node() && !self.kernels.is_capturing() {
+                self.kernels.stream().synchronize().map_err(|error| {
+                    KernelError::KernelExecutionFailed {
+                        reason: format!("synchronizing after {}: {error}", invocation.kernel.name),
+                    }
+                })?;
+            }
         }
         result
     }
