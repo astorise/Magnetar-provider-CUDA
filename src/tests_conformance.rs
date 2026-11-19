@@ -1772,6 +1772,77 @@ fn latent_decode_matches_the_cpu() {
     }
 }
 
+/// `cache-latent-attention-history`: strided values over several KV heads
+/// (two of them, V heads 64 values apart, each value its head's leading 32)
+/// match the CPU's attention over the extracted values, both for one query
+/// row, which the split Kernel reads in place, and for several, which
+/// gather the values first: every KV head reads V at its own stride.
+#[test]
+fn strided_values_over_several_kv_heads_match_the_cpu() {
+    use magnetar_provider_api::value_heads;
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let (heads, kv_heads, dim, stride, width) = (4u64, 2u64, 64u64, 64u64, 32u64);
+    let (capacity, keys) = (40u64, 33u64);
+    let k = HostTensor::new(
+        [capacity, kv_heads * dim],
+        hashed_values((capacity * kv_heads * dim) as usize, 31),
+    )
+    .unwrap();
+    let v = HostTensor::new(
+        [capacity, kv_heads * stride],
+        hashed_values((capacity * kv_heads * stride) as usize, 32),
+    )
+    .unwrap();
+    let leading = |tensor: &HostTensor| {
+        HostTensor::new(
+            [keys, tensor.shape[1]],
+            tensor.data[..(keys * tensor.shape[1]) as usize].to_vec(),
+        )
+        .unwrap()
+    };
+    let values = value_heads(&leading(&v), kv_heads, stride, width).unwrap();
+    let (k_store, v_store) = (upload(&kernels, &k), upload(&kernels, &v));
+    for queries in [1u64, 3] {
+        let q = HostTensor::new(
+            [queries, heads * dim],
+            hashed_values((queries * heads * dim) as usize, 33 + queries as usize),
+        )
+        .unwrap();
+        let expected = magnetar_provider_cpu::attention_with_value_width(
+            &q,
+            &leading(&k),
+            &values,
+            heads,
+            dim,
+            width,
+            Some(kv_heads),
+            None,
+            true,
+            None,
+        )
+        .unwrap();
+        let actual = kernels
+            .attention_strided_values(
+                &upload(&kernels, &q),
+                &k_store,
+                &v_store,
+                heads,
+                dim,
+                Some(width),
+                stride,
+                Some(kv_heads),
+                None,
+                true,
+                Some(keys),
+                None,
+            )
+            .unwrap();
+        assert_close(&download(&kernels, &actual), &expected);
+    }
+}
+
 /// `cache-latent-attention-history`, `speed-up-decode-attention-on-codes`:
 /// a decode step over a latent TurboQuant store read as both K and V (16
 /// query heads over 576-value rows in groups of 64, the values the leading

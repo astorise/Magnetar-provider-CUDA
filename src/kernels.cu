@@ -2428,7 +2428,10 @@ extern "C" __global__ void attention_split_kernel(
     }
     __syncthreads();
 
-    unsigned long long v_offset = (head / group_size) * value_dimension;
+    // Each KV head's V starts `v_model_dim / kv_head_count` values after the
+    // last: its value width, or its stride when the values are each head's
+    // leading `value_dimension` of a wider V head (`value_head_stride`).
+    unsigned long long v_offset = (head / group_size) * (v_model_dim / kv_head_count);
     for (unsigned long long d = tid; d < value_dimension; d += ATTENTION_SPLIT_THREADS) {
         float acc = 0.0f;
         for (unsigned long long j = 0; j < count; j++) {
