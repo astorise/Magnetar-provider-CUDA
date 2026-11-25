@@ -1000,8 +1000,11 @@ fn a_replay_in_flight_survives_the_retirement_of_its_resources_on_real_hardware(
 
 /// `capture-and-replay-cuda-graphs` 1.2: the Device memory a captured step
 /// retains (its graph executable), and what releasing the capture gives
-/// back. Diagnostic: the free memory of a Device other processes also use
-/// is not exact, so it reports and only bounds the retained bytes.
+/// back. One `rope -> rmsnorm` step is two Kernels, below the granularity
+/// the driver allocates in, so the same step is also captured 128 and 1,024
+/// times in one graph (a whole-model decode step is about 315 launches).
+/// Diagnostic: the free memory of a Device other processes also use is not
+/// exact, so it reports and only bounds the retained bytes.
 #[test]
 #[ignore = "diagnostic: reports the Device memory a captured step holds"]
 fn captured_step_device_memory() {
@@ -1031,30 +1034,35 @@ fn captured_step_device_memory() {
     // One uncaptured step first: its kernels are loaded and its buffers
     // allocated, so the capture's own cost is what the difference shows.
     large_step(&mut fixture, &x, &rotated, &weight, &sum, shape);
-    let before = free();
-    let request = StepCaptureRequest {
-        advancing_attributes: vec!["position_offset".into()],
-    };
-    fixture.executor.begin_step_capture(&request).unwrap();
-    large_step(&mut fixture, &x, &rotated, &weight, &sum, shape);
-    let capture = fixture.executor.end_step_capture().unwrap();
-    let held = free();
-    fixture.executor.release_step_capture(&capture);
-    let released = free();
     let kib = |bytes: i64| bytes as f64 / 1024.0;
-    eprintln!(
-        "captured rope -> rmsnorm step ({rows} x {width}): {:.0} KiB of Device memory retained \
-         by the capture (free {:.1} -> {:.1} MiB), {:.0} KiB given back by its release",
-        kib(before - held),
-        before as f64 / 1048576.0,
-        held as f64 / 1048576.0,
-        kib(released - held),
-    );
-    assert!(
-        before - held < 32 * 1024 * 1024,
-        "a two-Kernel capture retains {} bytes of Device memory",
-        before - held
-    );
+    for repeats in [1_u32, 128, 1024] {
+        let before = free();
+        let request = StepCaptureRequest {
+            advancing_attributes: vec!["position_offset".into()],
+        };
+        fixture.executor.begin_step_capture(&request).unwrap();
+        for _ in 0..repeats {
+            large_step(&mut fixture, &x, &rotated, &weight, &sum, shape);
+        }
+        let capture = fixture.executor.end_step_capture().unwrap();
+        let held = free();
+        fixture.executor.release_step_capture(&capture);
+        let released = free();
+        eprintln!(
+            "captured rope -> rmsnorm x {repeats} ({} Kernels, {rows} x {width}): {:.0} KiB of Device \
+             memory retained by the capture (free {:.1} -> {:.1} MiB), {:.0} KiB given back by its release",
+            repeats * 2,
+            kib(before - held),
+            before as f64 / 1048576.0,
+            held as f64 / 1048576.0,
+            kib(released - held),
+        );
+        assert!(
+            before - held < 64 * 1024 * 1024,
+            "a {repeats}-step capture retains {} bytes of Device memory",
+            before - held
+        );
+    }
 }
 
 /// `execute-native-half-precision`: a weight written as one is stored
