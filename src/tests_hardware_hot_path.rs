@@ -869,6 +869,228 @@ fn step_without_reading(
     );
 }
 
+/// A captured `rope -> rmsnorm` step over `rows x width` values, as the
+/// retirement and memory tests of a capture run it.
+fn large_step(
+    fixture: &mut ChainFixture,
+    x: &TensorResourceId,
+    rotated: &TensorResourceId,
+    weight: &TensorResourceId,
+    sum: &TensorResourceId,
+    (rows, width): (u64, u64),
+) {
+    dispatch(
+        fixture,
+        "large-rope",
+        "rope",
+        vec![(x.clone(), descriptor(rows, width))],
+        rotated.clone(),
+        descriptor(rows, width),
+        BTreeMap::from([
+            ("base".to_string(), OperatorAttributeValue::Float(10000.0)),
+            (
+                "dimension".to_string(),
+                OperatorAttributeValue::Integer(width as i64),
+            ),
+            (
+                "position_offset".to_string(),
+                OperatorAttributeValue::Integer(3),
+            ),
+        ]),
+    );
+    dispatch(
+        fixture,
+        "large-rmsnorm",
+        "rmsnorm",
+        vec![
+            (rotated.clone(), descriptor(rows, width)),
+            (weight.clone(), descriptor_1d(width)),
+        ],
+        sum.clone(),
+        descriptor(rows, width),
+        BTreeMap::from([("epsilon".to_string(), OperatorAttributeValue::Float(1e-6))]),
+    );
+}
+
+fn large_values(count: u64, seed: u64) -> Vec<f32> {
+    (0..count)
+        .map(|index| (((index * 37 + seed * 11) % 97) as f32 - 48.0) / 64.0)
+        .collect()
+}
+
+/// `capture-and-replay-cuda-graphs` 3.3, lease retirement: the buffers a
+/// replay reads can be retired, and their memory reused, the moment the
+/// replay is launched, before it completes. The Provider frees in stream
+/// order, so the replay still computes what it was captured to compute, and
+/// a capture whose resources are gone refuses to replay.
+#[test]
+fn a_replay_in_flight_survives_the_retirement_of_its_resources_on_real_hardware() {
+    let Some(mut fixture) = chain_fixture_or_skip() else {
+        return;
+    };
+    let shape = (1024_u64, 2048_u64);
+    let (rows, width) = shape;
+    let input = HostTensor::new([rows, width], large_values(rows * width, 1)).unwrap();
+    let garbage = HostTensor::new([rows, width], large_values(rows * width, 2)).unwrap();
+    let weight = TensorResourceId::new("retire.norm.weight");
+    stage_weight(
+        &mut fixture,
+        &weight,
+        HostTensor::new([width], large_values(width, 3)).unwrap(),
+    );
+    for iteration in 0..8 {
+        let id = |name: &str| TensorResourceId::new(format!("retire.{iteration}.{name}"));
+        let (x, rotated, sum) = (id("x"), id("rotated"), id("sum"));
+        stage_weight(&mut fixture, &x, input.clone());
+        large_step(&mut fixture, &x, &rotated, &weight, &sum, shape);
+        let expected = fixture.executor.read_tensor(&sum).unwrap().data;
+
+        let request = StepCaptureRequest {
+            advancing_attributes: vec!["position_offset".into()],
+        };
+        fixture.executor.begin_step_capture(&request).unwrap();
+        large_step(&mut fixture, &x, &rotated, &weight, &sum, shape);
+        let capture = fixture.executor.end_step_capture().unwrap();
+
+        // Launch, then retire what the replay reads at once, and reuse its
+        // memory before anything waits for the replay.
+        fixture
+            .executor
+            .replay_step(&capture, 0, vec![(x.clone(), input.clone())])
+            .unwrap();
+        let memory = fixture.runtime.memory_mut();
+        assert!(
+            fixture
+                .executor
+                .release_admitted_tensor(memory, &x)
+                .unwrap()
+        );
+        assert!(
+            fixture
+                .executor
+                .release_admitted_tensor(memory, &rotated)
+                .unwrap()
+        );
+        let reused: Vec<TensorResourceId> = (0..4).map(|k| id(&format!("garbage.{k}"))).collect();
+        for resource in &reused {
+            stage_weight(&mut fixture, resource, garbage.clone());
+        }
+        assert_eq!(
+            fixture.executor.read_tensor(&sum).unwrap().data,
+            expected,
+            "iteration {iteration}: the replay's result changed after its inputs were retired"
+        );
+        assert!(
+            matches!(
+                fixture.executor.replay_step(&capture, 0, vec![]),
+                Err(StepReplayError::Invalidated { .. })
+            ),
+            "iteration {iteration}: a capture replayed against resources that are gone"
+        );
+        fixture.executor.release_step_capture(&capture);
+        let memory = fixture.runtime.memory_mut();
+        for resource in reused.iter().chain([&sum]) {
+            fixture
+                .executor
+                .release_admitted_tensor(memory, resource)
+                .unwrap();
+        }
+    }
+}
+
+/// `capture-and-replay-cuda-graphs` 1.2: the Device memory a captured step
+/// retains (its graph executable), and what releasing the capture gives
+/// back. One `rope -> rmsnorm` step is two Kernels, below the granularity
+/// the driver allocates in, so the same step is also captured 128 and 1,024
+/// times in one graph (a whole-model decode step is about 315 launches).
+/// Diagnostic: the free memory of a Device other processes also use is not
+/// exact, so it reports and only bounds the retained bytes.
+#[test]
+#[ignore = "diagnostic: reports the Device memory a captured step holds"]
+fn captured_step_device_memory() {
+    let Some(mut fixture) = chain_fixture_or_skip() else {
+        return;
+    };
+    let context = cudarc::driver::CudaContext::new(0).expect("the first CUDA Device");
+    let free = || context.mem_get_info().expect("Device memory info").0 as i64;
+    let shape = (1024_u64, 2048_u64);
+    let (rows, width) = shape;
+    let (x, rotated, sum, weight) = (
+        TensorResourceId::new("memory.x"),
+        TensorResourceId::new("memory.rotated"),
+        TensorResourceId::new("memory.sum"),
+        TensorResourceId::new("memory.norm.weight"),
+    );
+    stage_weight(
+        &mut fixture,
+        &x,
+        HostTensor::new([rows, width], large_values(rows * width, 1)).unwrap(),
+    );
+    stage_weight(
+        &mut fixture,
+        &weight,
+        HostTensor::new([width], large_values(width, 3)).unwrap(),
+    );
+    // One uncaptured step first: its kernels are loaded and its buffers
+    // allocated, so the capture's own cost is what the difference shows.
+    large_step(&mut fixture, &x, &rotated, &weight, &sum, shape);
+    let kib = |bytes: i64| bytes as f64 / 1024.0;
+    for repeats in [1_u32, 128, 1024] {
+        let before = free();
+        let request = StepCaptureRequest {
+            advancing_attributes: vec!["position_offset".into()],
+        };
+        fixture.executor.begin_step_capture(&request).unwrap();
+        for _ in 0..repeats {
+            large_step(&mut fixture, &x, &rotated, &weight, &sum, shape);
+        }
+        let capture = fixture.executor.end_step_capture().unwrap();
+        let held = free();
+        fixture.executor.release_step_capture(&capture);
+        let released = free();
+        eprintln!(
+            "captured rope -> rmsnorm x {repeats} ({} Kernels, {rows} x {width}): {:.0} KiB of Device \
+             memory retained by the capture (free {:.1} -> {:.1} MiB), {:.0} KiB given back by its release",
+            repeats * 2,
+            kib(before - held),
+            before as f64 / 1048576.0,
+            held as f64 / 1048576.0,
+            kib(released - held),
+        );
+        assert!(
+            before - held < 64 * 1024 * 1024,
+            "a {repeats}-step capture retains {} bytes of Device memory",
+            before - held
+        );
+    }
+    // A request releases its capture when it ends: whether the next capture
+    // reuses what the release gave back, or the memory accumulates (run
+    // 45576847703: a 2,048-Kernel capture retained 12 MiB and its release
+    // gave nothing back).
+    let baseline = free();
+    for cycle in 0..8 {
+        let request = StepCaptureRequest {
+            advancing_attributes: vec!["position_offset".into()],
+        };
+        fixture.executor.begin_step_capture(&request).unwrap();
+        for _ in 0..1024 {
+            large_step(&mut fixture, &x, &rotated, &weight, &sum, shape);
+        }
+        let capture = fixture.executor.end_step_capture().unwrap();
+        fixture.executor.release_step_capture(&capture);
+        eprintln!(
+            "capture and release cycle {cycle} (2,048 Kernels): free {:.1} MiB, {:.0} KiB below the start",
+            free() as f64 / 1048576.0,
+            kib(baseline - free()),
+        );
+    }
+    assert!(
+        baseline - free() < 64 * 1024 * 1024,
+        "eight capture and release cycles hold {} bytes of Device memory",
+        baseline - free()
+    );
+}
+
 /// `execute-native-half-precision`: a weight written as one is stored
 /// compact, and a Kernel argument that only reads f32 gets it expanded,
 /// with the same result as the weight written as an ordinary tensor.
