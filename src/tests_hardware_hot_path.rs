@@ -1063,6 +1063,32 @@ fn captured_step_device_memory() {
             before - held
         );
     }
+    // A request releases its capture when it ends: whether the next capture
+    // reuses what the release gave back, or the memory accumulates (run
+    // 45576847703: a 2,048-Kernel capture retained 12 MiB and its release
+    // gave nothing back).
+    let baseline = free();
+    for cycle in 0..8 {
+        let request = StepCaptureRequest {
+            advancing_attributes: vec!["position_offset".into()],
+        };
+        fixture.executor.begin_step_capture(&request).unwrap();
+        for _ in 0..1024 {
+            large_step(&mut fixture, &x, &rotated, &weight, &sum, shape);
+        }
+        let capture = fixture.executor.end_step_capture().unwrap();
+        fixture.executor.release_step_capture(&capture);
+        eprintln!(
+            "capture and release cycle {cycle} (2,048 Kernels): free {:.1} MiB, {:.0} KiB below the start",
+            free() as f64 / 1048576.0,
+            kib(baseline - free()),
+        );
+    }
+    assert!(
+        baseline - free() < 64 * 1024 * 1024,
+        "eight capture and release cycles hold {} bytes of Device memory",
+        baseline - free()
+    );
 }
 
 /// `execute-native-half-precision`: a weight written as one is stored
