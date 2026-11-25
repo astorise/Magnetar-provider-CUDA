@@ -5696,18 +5696,28 @@ fn qwen3_5_norm_offset_and_per_head_split_match_reference_cpu() {
     assert!(kernels.split_halves(&upload(&kernels, &rows), 3).is_err());
 }
 
-/// The gated-delta mixer against the shared f32 semantics: a masked
-/// five-token prefill from non-zero states, then a one-token decode from
-/// the states it returned. Every output is compared, the two next states
-/// included.
-#[test]
-fn gated_delta_mixer_matches_reference_cpu_across_steps() {
+/// The gated-delta mixer against the shared f32 semantics at one
+/// geometry `(key_heads, value_heads, key_dim, value_dim, conv_kernel,
+/// hidden)`: a masked five-token prefill from non-zero states, then a
+/// one-token decode from the states it returned, every output compared
+/// (the two next states included). `compact` rounds the weights to
+/// bfloat16 and uploads them as the loader does, so the large projections
+/// are read compact.
+fn check_gated_delta_mixer(
+    kernels: &CudaKernels,
+    (key_heads, value_heads, key_dim, value_dim, conv_kernel, hidden): (
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+    ),
+    compact: bool,
+    tolerance: f32,
+) {
     use crate::kernels::GatedDeltaGeometry;
     use magnetar_provider_api::operator_semantics::{GatedDeltaMixer, gated_delta_mixer};
-    let Some(kernels) = kernels_or_skip() else {
-        return;
-    };
-    let (key_heads, value_heads, key_dim, value_dim, conv_kernel, hidden) = (2, 4, 16, 8, 4, 24);
     let channels = 2 * key_heads * key_dim + value_heads * value_dim;
     let value_width = value_heads * value_dim;
     let reference = GatedDeltaMixer {
@@ -5726,6 +5736,17 @@ fn gated_delta_mixer_matches_reference_cpu_across_steps() {
         conv_kernel,
         epsilon: 1e-6,
     };
+    let bf16 = |tensor: HostTensor| {
+        if !compact {
+            return tensor;
+        }
+        let data: Vec<f32> = tensor
+            .data
+            .iter()
+            .map(|value| f32::from_bits(value.to_bits() & 0xFFFF_0000))
+            .collect();
+        HostTensor::new(tensor.shape.clone(), data).unwrap()
+    };
     // Inputs 3..=11: the projections, convolution, A_log, dt_bias, norm
     // and output projection.
     let weights = [
@@ -5738,11 +5759,24 @@ fn gated_delta_mixer_matches_reference_cpu_across_steps() {
         shaped(&[value_heads], 116, 0.5),
         shaped(&[value_dim], 117, 0.2),
         shaped(&[hidden, value_width], 118, 0.3),
-    ];
+    ]
+    .map(bf16);
     let device_weights = weights
         .iter()
-        .map(|tensor| upload(&kernels, tensor))
+        .map(|tensor| {
+            if compact {
+                kernels.upload_weight(tensor).unwrap()
+            } else {
+                upload(kernels, tensor)
+            }
+        })
         .collect::<Vec<_>>();
+    if compact {
+        assert!(
+            device_weights[0].is_compact() && device_weights[8].is_compact(),
+            "the large projections are stored compact"
+        );
+    }
     let mut states = [
         shaped(&[channels, conv_kernel], 119, 0.5),
         shaped(&[value_heads, key_dim, value_dim], 120, 0.2),
@@ -5756,34 +5790,56 @@ fn gated_delta_mixer_matches_reference_cpu_across_steps() {
         }
         let expected = gated_delta_mixer(&host, reference).unwrap();
         let mut device = vec![
-            upload(&kernels, &host[0]),
-            upload(&kernels, &states[0]),
-            upload(&kernels, &states[1]),
+            upload(kernels, &host[0]),
+            upload(kernels, &states[0]),
+            upload(kernels, &states[1]),
         ];
         if let Some(mask) = host.get(12) {
-            device.push(upload(&kernels, mask));
+            device.push(upload(kernels, mask));
         }
         let mut inputs: Vec<&CudaDeviceBuffer> = device[..3].iter().collect();
         inputs.extend(&device_weights);
         inputs.extend(device.get(3));
         let actual = kernels.gated_delta_mixer(&inputs, geometry).unwrap();
         for (output, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
-            let actual = download(&kernels, actual);
+            let actual = download(kernels, actual);
             assert_eq!(actual.shape, expected.shape, "output {output}");
             for (index, (a, e)) in actual.data.iter().zip(&expected.data).enumerate() {
                 assert!(
-                    (a - e).abs() <= 1e-4 * (1.0 + e.abs()),
-                    "{tokens} token(s), output {output}, element {index}: cuda={a} reference={e}"
+                    (a - e).abs() <= tolerance * (1.0 + e.abs()),
+                    "hidden {hidden}, {tokens} token(s), output {output}, element {index}: \
+                     cuda={a} reference={e}"
                 );
             }
         }
         states = [expected[1].clone(), expected[2].clone()];
     }
+}
+
+/// The gated-delta mixer against the shared f32 semantics across a
+/// prefill and a decode step: a small geometry with f32 weights, and a
+/// larger one whose projections are read compact (bfloat16), as the
+/// checkpoint's are.
+#[test]
+fn gated_delta_mixer_matches_reference_cpu_across_steps() {
+    use crate::kernels::GatedDeltaGeometry;
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    check_gated_delta_mixer(&kernels, (2, 4, 16, 8, 4, 24), false, 1e-4);
+    // 512-wide projections: the sums run in another order than the
+    // Reference's (strided lanes, then a shuffle tree).
+    check_gated_delta_mixer(&kernels, (4, 8, 32, 32, 4, 512), true, 2e-4);
     // Wider key heads than the registers hold are refused.
     let wide = GatedDeltaGeometry {
+        key_heads: 2,
+        value_heads: 4,
         key_dim: 256,
-        ..geometry
+        value_dim: 8,
+        conv_kernel: 4,
+        epsilon: 1e-6,
     };
-    let inputs: Vec<&CudaDeviceBuffer> = device_weights.iter().collect();
+    let weight = upload(&kernels, &shaped(&[4, 4], 122, 1.0));
+    let inputs = vec![&weight; 12];
     assert!(kernels.gated_delta_mixer(&inputs, wide).is_err());
 }

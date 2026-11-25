@@ -8113,3 +8113,54 @@ extern "C" __global__ void mask_rows_kernel(
     }
     out[i] = mask[i / cols] == 0.0f ? 0.0f : input[i];
 }
+
+// `out = a · wᵀ` for a weight stored `[n, k]` row-major (the checkpoint's
+// `[out, in]` order the gated-delta mixer's projections keep): one warp
+// per output column, its 32 lanes reading that column's contiguous weight
+// row together, for up to GDN_PROJECT_ROWS rows of `a` per block (each
+// weight loaded once for all of them). A warp's lanes hold strided partial
+// sums, combined by a fixed shuffle tree. `w16` holds the weight's
+// bfloat16 bits when it is compact (`w` is then unused).
+#define GDN_PROJECT_WARPS 8
+#define GDN_PROJECT_ROWS 8
+extern "C" __global__ void gdn_project_kernel(
+    const float* a,
+    const float* w,
+    const unsigned short* w16,
+    float* out,
+    unsigned long long m,
+    unsigned long long k,
+    unsigned long long n
+) {
+    unsigned long long column = (unsigned long long)blockIdx.x * GDN_PROJECT_WARPS + threadIdx.y;
+    unsigned long long first = (unsigned long long)blockIdx.y * GDN_PROJECT_ROWS;
+    if (column >= n || first >= m) {
+        return;
+    }
+    unsigned long long remaining = m - first;
+    int rows = remaining < GDN_PROJECT_ROWS ? (int)remaining : GDN_PROJECT_ROWS;
+    float acc[GDN_PROJECT_ROWS];
+#pragma unroll
+    for (int r = 0; r < GDN_PROJECT_ROWS; ++r) {
+        acc[r] = 0.0f;
+    }
+    for (unsigned long long inner = threadIdx.x; inner < k; inner += 32) {
+        float weight = w16 ? bf16_bits_to_float(w16[column * k + inner]) : w[column * k + inner];
+#pragma unroll
+        for (int r = 0; r < GDN_PROJECT_ROWS; ++r) {
+            if (r < rows) {
+                acc[r] += a[(first + r) * k + inner] * weight;
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < GDN_PROJECT_ROWS; ++r) {
+        float sum = acc[r];
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum += __shfl_xor_sync(0xffffffffu, sum, offset);
+        }
+        if (threadIdx.x == 0 && r < rows) {
+            out[(first + r) * n + column] = sum;
+        }
+    }
+}

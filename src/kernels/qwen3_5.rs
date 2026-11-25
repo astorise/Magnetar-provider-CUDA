@@ -1,8 +1,8 @@
 //! Qwen3.5's forms (`support-qwen38-flash-next`): the per-head `split` of
 //! `q_proj` and the gated-delta linear-attention mixer. The mixer mirrors
 //! `magnetar_provider_api::operator_semantics::gated_delta_mixer` step by
-//! step: projections through [`CudaKernels::matmul`] against the
-//! checkpoint-order `[out, in]` weights, then one Kernel per stage.
+//! step: projections against the checkpoint-order `[out, in]` weights
+//! ([`CudaKernels::project`]), then one Kernel per stage.
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 
@@ -41,7 +41,58 @@ fn buffer(slice: cudarc::driver::CudaSlice<f32>, shape: Vec<u64>) -> CudaDeviceB
     }
 }
 
+/// Output columns (warps) and rows of `a` one `gdn_project_kernel` block
+/// serves (`GDN_PROJECT_WARPS`, `GDN_PROJECT_ROWS` in `kernels.cu`).
+const PROJECT_WARPS: u64 = 8;
+const PROJECT_ROWS: u64 = 8;
+
 impl CudaKernels {
+    /// `x · weightᵀ` for a `[n, k]` weight in checkpoint `[out, in]` order,
+    /// f32 or compact: one warp per output column reads its contiguous
+    /// weight row (the generic matmul would read it with a stride of `k`).
+    /// A packed weight takes the matmul's own path.
+    fn project(
+        &self,
+        x: &CudaDeviceBuffer,
+        weight: &CudaDeviceBuffer,
+    ) -> Result<CudaDeviceBuffer, CudaError> {
+        let ([m, k], [n, k2]) = (&x.shape[..], &weight.shape[..]) else {
+            return Err(shape_error("a projection needs rank-two operands"));
+        };
+        let (m, k, n) = (*m, *k, *n);
+        if weight.is_q8() || weight.is_tq() || m.div_ceil(PROJECT_ROWS) > 65_535 {
+            return self.matmul(x, weight, false, true);
+        }
+        if k != *k2 {
+            return Err(shape_error(format!(
+                "projection inner dimension mismatch: {k} vs {k2}"
+            )));
+        }
+        Self::require_f32(&[x], "a projection")?;
+        let weight16 = self.bf16_address(weight);
+        let mut out = self.alloc_output((m * n) as usize)?;
+        let func = self.function("gdn_project_kernel")?;
+        let mut args = self.stream.launch_builder(&func);
+        args.arg(&x.slice)
+            .arg(&weight.slice)
+            .arg(&weight16)
+            .arg(&mut out)
+            .arg(&m)
+            .arg(&k)
+            .arg(&n);
+        let config = LaunchConfig {
+            grid_dim: (
+                n.div_ceil(PROJECT_WARPS) as u32,
+                m.div_ceil(PROJECT_ROWS) as u32,
+                1,
+            ),
+            block_dim: (32, PROJECT_WARPS as u32, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { args.launch(config) }?;
+        Ok(buffer(out, vec![m, n]))
+    }
+
     /// `split` (`split-per-head`): the last dimension divides into
     /// `head_count` equal blocks; the first half of every block goes to the
     /// first output and the second half to the second, block after block.
@@ -179,10 +230,10 @@ impl CudaKernels {
             }
             None => inputs[0],
         };
-        let projected = self.matmul(x, inputs[3], false, true)?;
-        let z = self.matmul(x, inputs[4], false, true)?;
-        let a = self.matmul(x, inputs[5], false, true)?;
-        let b = self.matmul(x, inputs[6], false, true)?;
+        let projected = self.project(x, inputs[3])?;
+        let z = self.project(x, inputs[4])?;
+        let a = self.project(x, inputs[5])?;
+        let b = self.project(x, inputs[6])?;
 
         // The causal depthwise convolution and the next convolution state.
         let mut convolution_state = self.alloc_output((channels * conv_kernel) as usize)?;
@@ -275,7 +326,7 @@ impl CudaKernels {
             unsafe { args.launch(LaunchConfig::for_num_elems(rows as u32)) }?;
         }
         let normalized = buffer(normalized, vec![tokens, value_width]);
-        let output = self.matmul(&normalized, inputs[11], false, true)?;
+        let output = self.project(&normalized, inputs[11])?;
         Ok([
             output,
             buffer(convolution_state, vec![channels, conv_kernel]),
