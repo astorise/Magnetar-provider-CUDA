@@ -34,6 +34,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::error::{CudaError, CudaErrorCode};
 use crate::half_precision;
 
+mod qwen3_5;
+pub use qwen3_5::{GATED_DELTA_MAX_CONV_KERNEL, GATED_DELTA_MAX_KEY_DIM, GatedDeltaGeometry};
+
 const KERNEL_SOURCE: &str = include_str!("kernels.cu");
 /// Tensor Core matmuls (`mma.sync` bfloat16), built for compute capability
 /// 8.0 and later only.
@@ -4002,7 +4005,7 @@ impl CudaKernels {
         weight: &CudaDeviceBuffer,
         epsilon: f32,
     ) -> Result<CudaDeviceBuffer, CudaError> {
-        self.rmsnorm_with(input, Some(weight), epsilon, None)
+        self.rmsnorm_with(input, Some(weight), epsilon, None, 0.0)
     }
 
     /// [`Self::rmsnorm`] with its optional forms: no weight (scale 1), and
@@ -4010,12 +4013,15 @@ impl CudaKernels {
     /// each row's `head_count` blocks normalized alone, with one
     /// `[head_dimension]` weight. Rows are contiguous, so the heads are the
     /// rows of a `[rows * head_count, head_dimension]` view.
+    /// `weight_offset` is added to every weight value (`rmsnorm.weight_offset`:
+    /// 1 for Qwen3.5's zero-centered `x * (1 + w)` norms, 0 otherwise).
     pub fn rmsnorm_with(
         &self,
         input: &CudaDeviceBuffer,
         weight: Option<&CudaDeviceBuffer>,
         epsilon: f32,
         heads: Option<(u64, u64)>,
+        weight_offset: f32,
     ) -> Result<CudaDeviceBuffer, CudaError> {
         Self::require_f32(&[input], "rmsnorm")?;
         if let Some(weight) = weight {
@@ -4087,7 +4093,8 @@ impl CudaKernels {
             .arg(&rows)
             .arg(&cols)
             .arg(&weight_row_stride)
-            .arg(&epsilon);
+            .arg(&epsilon)
+            .arg(&weight_offset);
         let config = LaunchConfig {
             grid_dim: (rows as u32, 1, 1),
             block_dim: (RMSNORM_THREADS, 1, 1),

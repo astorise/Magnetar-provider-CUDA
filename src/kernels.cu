@@ -1101,6 +1101,8 @@ extern "C" __global__ void bias_add_kernel(const float* a, const float* bias, fl
 // sums a strided slice of the row's squares, then a fixed-order tree sum
 // combines the slices, so the result is deterministic.
 #define RMSNORM_THREADS 256
+// `weight_offset` is added to every weight value: 1 for Qwen3.5's
+// zero-centered norms (`rmsnorm.weight_offset`), 0 otherwise.
 extern "C" __global__ void rmsnorm_kernel(
     const float* input,
     const float* weight,
@@ -1108,7 +1110,8 @@ extern "C" __global__ void rmsnorm_kernel(
     unsigned long long rows,
     unsigned long long cols,
     unsigned long long weight_row_stride,
-    float epsilon
+    float epsilon,
+    float weight_offset
 ) {
     __shared__ float partial[RMSNORM_THREADS];
     unsigned long long row = blockIdx.x;
@@ -1133,7 +1136,7 @@ extern "C" __global__ void rmsnorm_kernel(
     float scale = 1.0f / sqrtf(partial[0] / (float)cols + epsilon);
     float* out_row = out + row * cols;
     for (unsigned long long i = threadIdx.x; i < cols; i += RMSNORM_THREADS) {
-        out_row[i] = w_row ? in_row[i] * scale * w_row[i] : in_row[i] * scale;
+        out_row[i] = w_row ? in_row[i] * scale * (w_row[i] + weight_offset) : in_row[i] * scale;
     }
 }
 
@@ -7856,5 +7859,313 @@ extern "C" __global__ void latent_attention_split_kernel(
         float* out = partial + ((head0 + tid) * chunks + chunk) * (v_width + 2);
         out[v_width] = row_max[tid];
         out[v_width + 1] = row_sum[tid];
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Qwen3.5 (`support-qwen38-flash-next`).
+// ---------------------------------------------------------------------------
+
+// `split` with `head_count`: the input is `blocks` contiguous blocks of
+// `2 * half` values; the first half of each block goes to `left`, the
+// second to `right`, block after block. One thread per output element.
+extern "C" __global__ void split_halves_kernel(
+    const float* input,
+    float* left,
+    float* right,
+    unsigned long long blocks,
+    unsigned long long half
+) {
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= blocks * half) {
+        return;
+    }
+    unsigned long long block = i / half;
+    unsigned long long j = i % half;
+    left[i] = input[block * 2 * half + j];
+    right[i] = input[block * 2 * half + half + j];
+}
+
+__device__ __forceinline__ float gdn_sigmoid(float value) {
+    if (value >= 0.0f) {
+        return 1.0f / (1.0f + expf(-value));
+    }
+    float e = expf(value);
+    return e / (1.0f + e);
+}
+
+__device__ __forceinline__ float gdn_silu(float value) {
+    return value * gdn_sigmoid(value);
+}
+
+// The gated-delta mixer's causal depthwise convolution, one thread per
+// channel, every token in order. `history` (the convolution state,
+// `[channels, kernel]`, oldest first) shifts left and takes the token's
+// projected value; the output is `silu(sum(history * weight))`. The final
+// history is the next convolution state. Mirrors
+// `operator_semantics::mixer_f32` term by term.
+#define GDN_MAX_KERNEL 8
+extern "C" __global__ void gdn_conv_kernel(
+    const float* projected,
+    const float* state_in,
+    const float* weight,
+    float* state_out,
+    float* convolved,
+    unsigned long long tokens,
+    unsigned long long channels,
+    unsigned long long kernel
+) {
+    unsigned long long c = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) {
+        return;
+    }
+    float history[GDN_MAX_KERNEL];
+    for (unsigned long long i = 0; i < kernel; ++i) {
+        history[i] = state_in[c * kernel + i];
+    }
+    for (unsigned long long t = 0; t < tokens; ++t) {
+        for (unsigned long long i = 0; i + 1 < kernel; ++i) {
+            history[i] = history[i + 1];
+        }
+        history[kernel - 1] = projected[t * channels + c];
+        float sum = 0.0f;
+        for (unsigned long long i = 0; i < kernel; ++i) {
+            sum += history[i] * weight[c * kernel + i];
+        }
+        convolved[t * channels + c] = gdn_silu(sum);
+    }
+    for (unsigned long long i = 0; i < kernel; ++i) {
+        state_out[c * kernel + i] = history[i];
+    }
+}
+
+// Each token's per-value-head log decay `-exp(A_log) * softplus(a +
+// dt_bias)` and `beta = sigmoid(b)`. One thread per (token, head).
+extern "C" __global__ void gdn_gates_kernel(
+    const float* a,
+    const float* b,
+    const float* a_log,
+    const float* dt_bias,
+    float* decay,
+    float* beta,
+    unsigned long long tokens,
+    unsigned long long heads
+) {
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= tokens * heads) {
+        return;
+    }
+    unsigned long long head = i % heads;
+    float time = a[i] + dt_bias[head];
+    // Stable softplus, as the reference computes it.
+    float softplus = time > 20.0f ? time : log1pf(expf(time));
+    decay[i] = -expf(a_log[head]) * softplus;
+    beta[i] = gdn_sigmoid(b[i]);
+}
+
+// The L2-normalized queries (also scaled by `1/sqrt(key_dim)`) and keys,
+// one thread per (token, key head), each sum in order.
+extern "C" __global__ void gdn_qk_norm_kernel(
+    const float* convolved,
+    float* query,
+    float* key,
+    unsigned long long tokens,
+    unsigned long long channels,
+    unsigned long long key_heads,
+    unsigned long long key_dim
+) {
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= tokens * key_heads) {
+        return;
+    }
+    unsigned long long t = i / key_heads;
+    unsigned long long h = i % key_heads;
+    unsigned long long key_width = key_heads * key_dim;
+    const float* q = convolved + t * channels + h * key_dim;
+    const float* k = convolved + t * channels + key_width + h * key_dim;
+    float q_sum = 0.0f;
+    float k_sum = 0.0f;
+    for (unsigned long long r = 0; r < key_dim; ++r) {
+        q_sum += q[r] * q[r];
+        k_sum += k[r] * k[r];
+    }
+    float q_norm = (1.0f / sqrtf(q_sum + 1e-6f)) * (1.0f / sqrtf((float)key_dim));
+    float k_norm = 1.0f / sqrtf(k_sum + 1e-6f);
+    float* q_out = query + i * key_dim;
+    float* k_out = key + i * key_dim;
+    for (unsigned long long r = 0; r < key_dim; ++r) {
+        q_out[r] = q[r] * q_norm;
+        k_out[r] = k[r] * k_norm;
+    }
+}
+
+// The gated delta rule, one thread per (value head, value column): every
+// column of a head's `[key_dim, value_dim]` state evolves alone, kept in
+// registers across the tokens (`key_dim <= GDN_MAX_KEY_DIM`). For each
+// token: decay the column, read `memory = sum(state * key)`, write
+// `state += key * (value - memory) * beta`, and output `sum(state *
+// query)`, each sum in row order as the Reference computes it. `state_in`
+// is the initial state; `state_out` takes the next one.
+#define GDN_MAX_KEY_DIM 128
+// Threads per block: the state column takes about GDN_MAX_KEY_DIM
+// registers per thread, too many for the 1024-thread blocks the
+// element-wise Kernels use (CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES); small
+// blocks also spread a decode step's few hundred columns over more SMs.
+#define GDN_DELTA_THREADS 64
+extern "C" __global__ void __launch_bounds__(GDN_DELTA_THREADS) gdn_delta_kernel(
+    const float* query,
+    const float* key,
+    const float* convolved,
+    const float* decay,
+    const float* beta,
+    const float* state_in,
+    float* state_out,
+    float* out,
+    unsigned long long tokens,
+    unsigned long long channels,
+    unsigned long long key_heads,
+    unsigned long long value_heads,
+    unsigned long long key_dim,
+    unsigned long long value_dim
+) {
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= value_heads * value_dim) {
+        return;
+    }
+    unsigned long long vh = i / value_dim;
+    unsigned long long column = i % value_dim;
+    unsigned long long kh = vh / (value_heads / key_heads);
+    unsigned long long value_offset = 2 * key_heads * key_dim;
+    unsigned long long base = vh * key_dim * value_dim + column;
+    float cells[GDN_MAX_KEY_DIM];
+#pragma unroll
+    for (int r = 0; r < GDN_MAX_KEY_DIM; ++r) {
+        cells[r] = r < (int)key_dim ? state_in[base + r * value_dim] : 0.0f;
+    }
+    for (unsigned long long t = 0; t < tokens; ++t) {
+        unsigned long long gate = t * value_heads + vh;
+        float d = expf(decay[gate]);
+        float b = beta[gate];
+        const float* q = query + (t * key_heads + kh) * key_dim;
+        const float* k = key + (t * key_heads + kh) * key_dim;
+        float memory = 0.0f;
+#pragma unroll
+        for (int r = 0; r < GDN_MAX_KEY_DIM; ++r) {
+            if (r < (int)key_dim) {
+                cells[r] *= d;
+                memory += cells[r] * k[r];
+            }
+        }
+        float v = convolved[t * channels + value_offset + vh * value_dim + column];
+        float delta = (v - memory) * b;
+        float result = 0.0f;
+#pragma unroll
+        for (int r = 0; r < GDN_MAX_KEY_DIM; ++r) {
+            if (r < (int)key_dim) {
+                cells[r] += k[r] * delta;
+                result += cells[r] * q[r];
+            }
+        }
+        out[(t * value_heads + vh) * value_dim + column] = result;
+    }
+#pragma unroll
+    for (int r = 0; r < GDN_MAX_KEY_DIM; ++r) {
+        if (r < (int)key_dim) {
+            state_out[base + r * value_dim] = cells[r];
+        }
+    }
+}
+
+// The gated RMSNorm of each (token, value head) row: `row / rms * weight *
+// silu(gate)`. One thread per row, its sum in order.
+extern "C" __global__ void gdn_gated_norm_kernel(
+    const float* values,
+    const float* gates,
+    const float* weight,
+    float* out,
+    unsigned long long rows,
+    unsigned long long value_dim,
+    float epsilon
+) {
+    unsigned long long row = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows) {
+        return;
+    }
+    const float* x = values + row * value_dim;
+    const float* g = gates + row * value_dim;
+    float sum = 0.0f;
+    for (unsigned long long c = 0; c < value_dim; ++c) {
+        sum += x[c] * x[c];
+    }
+    float inverse = 1.0f / sqrtf(sum / (float)value_dim + epsilon);
+    for (unsigned long long c = 0; c < value_dim; ++c) {
+        out[row * value_dim + c] = x[c] * inverse * weight[c] * gdn_silu(g[c]);
+    }
+}
+
+// Zeroes the rows whose mask entry is 0 (a 0/1 token mask).
+extern "C" __global__ void mask_rows_kernel(
+    const float* input,
+    const float* mask,
+    float* out,
+    unsigned long long rows,
+    unsigned long long cols
+) {
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * cols) {
+        return;
+    }
+    out[i] = mask[i / cols] == 0.0f ? 0.0f : input[i];
+}
+
+// `out = a · wᵀ` for a weight stored `[n, k]` row-major (the checkpoint's
+// `[out, in]` order the gated-delta mixer's projections keep): one warp
+// per output column, its 32 lanes reading that column's contiguous weight
+// row together, for up to GDN_PROJECT_ROWS rows of `a` per block (each
+// weight loaded once for all of them). A warp's lanes hold strided partial
+// sums, combined by a fixed shuffle tree. `w16` holds the weight's
+// bfloat16 bits when it is compact (`w` is then unused).
+#define GDN_PROJECT_WARPS 8
+#define GDN_PROJECT_ROWS 8
+extern "C" __global__ void gdn_project_kernel(
+    const float* a,
+    const float* w,
+    const unsigned short* w16,
+    float* out,
+    unsigned long long m,
+    unsigned long long k,
+    unsigned long long n
+) {
+    unsigned long long column = (unsigned long long)blockIdx.x * GDN_PROJECT_WARPS + threadIdx.y;
+    unsigned long long first = (unsigned long long)blockIdx.y * GDN_PROJECT_ROWS;
+    if (column >= n || first >= m) {
+        return;
+    }
+    unsigned long long remaining = m - first;
+    int rows = remaining < GDN_PROJECT_ROWS ? (int)remaining : GDN_PROJECT_ROWS;
+    float acc[GDN_PROJECT_ROWS];
+#pragma unroll
+    for (int r = 0; r < GDN_PROJECT_ROWS; ++r) {
+        acc[r] = 0.0f;
+    }
+    for (unsigned long long inner = threadIdx.x; inner < k; inner += 32) {
+        float weight = w16 ? bf16_bits_to_float(w16[column * k + inner]) : w[column * k + inner];
+#pragma unroll
+        for (int r = 0; r < GDN_PROJECT_ROWS; ++r) {
+            if (r < rows) {
+                acc[r] += a[(first + r) * k + inner] * weight;
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < GDN_PROJECT_ROWS; ++r) {
+        float sum = acc[r];
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum += __shfl_xor_sync(0xffffffffu, sum, offset);
+        }
+        if (threadIdx.x == 0 && r < rows) {
+            out[(first + r) * n + column] = sum;
+        }
     }
 }
