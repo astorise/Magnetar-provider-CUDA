@@ -1497,6 +1497,8 @@ impl CudaExecutor {
                     value_dim: config.value_dim as u64,
                     conv_kernel: config.conv_kernel as u64,
                     epsilon: config.epsilon,
+                    sigmoid_gate: config.output_gate
+                        == magnetar_provider_api::operator_semantics::MixerOutputGate::Sigmoid,
                 };
                 self.kernels
                     .gated_delta_mixer(&inputs, geometry)
