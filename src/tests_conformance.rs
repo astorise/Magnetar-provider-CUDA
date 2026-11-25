@@ -5715,9 +5715,12 @@ fn check_gated_delta_mixer(
     ),
     compact: bool,
     tolerance: f32,
+    sigmoid_gate: bool,
 ) {
     use crate::kernels::GatedDeltaGeometry;
-    use magnetar_provider_api::operator_semantics::{GatedDeltaMixer, gated_delta_mixer};
+    use magnetar_provider_api::operator_semantics::{
+        GatedDeltaMixer, MixerOutputGate, gated_delta_mixer,
+    };
     let channels = 2 * key_heads * key_dim + value_heads * value_dim;
     let value_width = value_heads * value_dim;
     let reference = GatedDeltaMixer {
@@ -5727,6 +5730,11 @@ fn check_gated_delta_mixer(
         value_dim: value_dim as usize,
         conv_kernel: conv_kernel as usize,
         epsilon: 1e-6,
+        output_gate: if sigmoid_gate {
+            MixerOutputGate::Sigmoid
+        } else {
+            MixerOutputGate::Silu
+        },
     };
     let geometry = GatedDeltaGeometry {
         key_heads,
@@ -5735,6 +5743,7 @@ fn check_gated_delta_mixer(
         value_dim,
         conv_kernel,
         epsilon: 1e-6,
+        sigmoid_gate,
     };
     let bf16 = |tensor: HostTensor| {
         if !compact {
@@ -5826,10 +5835,13 @@ fn gated_delta_mixer_matches_reference_cpu_across_steps() {
     let Some(kernels) = kernels_or_skip() else {
         return;
     };
-    check_gated_delta_mixer(&kernels, (2, 4, 16, 8, 4, 24), false, 1e-4);
+    check_gated_delta_mixer(&kernels, (2, 4, 16, 8, 4, 24), false, 1e-4, false);
     // 512-wide projections: the sums run in another order than the
     // Reference's (strided lanes, then a shuffle tree).
-    check_gated_delta_mixer(&kernels, (4, 8, 32, 32, 4, 512), true, 2e-4);
+    check_gated_delta_mixer(&kernels, (4, 8, 32, 32, 4, 512), true, 2e-4, false);
+    // Qwen4-Exp's sigmoid output gate (`output_gate_type`).
+    check_gated_delta_mixer(&kernels, (2, 4, 16, 8, 4, 24), false, 1e-4, true);
+    check_gated_delta_mixer(&kernels, (4, 8, 32, 32, 4, 512), true, 2e-4, true);
     // Wider key heads than the registers hold are refused.
     let wide = GatedDeltaGeometry {
         key_heads: 2,
@@ -5838,6 +5850,7 @@ fn gated_delta_mixer_matches_reference_cpu_across_steps() {
         value_dim: 8,
         conv_kernel: 4,
         epsilon: 1e-6,
+        sigmoid_gate: false,
     };
     let weight = upload(&kernels, &shaped(&[4, 4], 122, 1.0));
     let inputs = vec![&weight; 12];

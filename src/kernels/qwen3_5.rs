@@ -25,6 +25,9 @@ pub struct GatedDeltaGeometry {
     pub value_dim: u64,
     pub conv_kernel: u64,
     pub epsilon: f32,
+    /// The output gate is `sigmoid(z)` rather than `silu(z)`
+    /// (`output_gate_type`).
+    pub sigmoid_gate: bool,
 }
 
 fn shape_error(detail: impl Into<String>) -> CudaError {
@@ -152,6 +155,7 @@ impl CudaKernels {
             value_dim,
             conv_kernel,
             epsilon,
+            sigmoid_gate,
         } = geometry;
         if !(12..=13).contains(&inputs.len()) {
             return Err(shape_error(
@@ -320,6 +324,7 @@ impl CudaKernels {
 
         // The gated RMSNorm, then the output projection.
         let rows = tokens * value_heads;
+        let sigmoid_flag = i32::from(sigmoid_gate);
         let mut normalized = self.alloc_output((tokens * value_width) as usize)?;
         {
             let func = self.function("gdn_gated_norm_kernel")?;
@@ -330,7 +335,8 @@ impl CudaKernels {
                 .arg(&mut normalized)
                 .arg(&rows)
                 .arg(&value_dim)
-                .arg(&epsilon);
+                .arg(&epsilon)
+                .arg(&sigmoid_flag);
             unsafe { args.launch(LaunchConfig::for_num_elems(rows as u32)) }?;
         }
         let normalized = buffer(normalized, vec![tokens, value_width]);

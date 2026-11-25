@@ -26,12 +26,13 @@ use magnetar_core::{
     operator::ATTENTION_LATENT_KV_FEATURE, operator::ATTENTION_SCALE_FEATURE,
     operator::ATTENTION_VALUE_HEAD_DIMENSION_FEATURE,
     operator::ATTENTION_VALUE_HEAD_STRIDE_FEATURE, operator::CONCAT_HEADS_FEATURE,
-    operator::EMBEDDING_SCALE_FEATURE, operator::MOE_EXPERTS_ACTIVATION_FEATURE,
-    operator::MOE_PER_EXPERT_SCALE_FEATURE, operator::OperatorFamily, operator::OperatorId,
-    operator::RMSNORM_PER_HEAD_FEATURE, operator::RMSNORM_WEIGHT_OFFSET_FEATURE,
-    operator::RMSNORM_WITHOUT_WEIGHT_FEATURE, operator::ROPE_BANDED_FREQUENCY_SCALING_FEATURE,
-    operator::ROPE_PARTIAL_ROTARY_FEATURE, operator::ROPE_YARN_FREQUENCY_SCALING_FEATURE,
-    operator::SPLIT_PER_HEAD_FEATURE, operator::TensorLayoutKind, operator::TensorRole,
+    operator::EMBEDDING_SCALE_FEATURE, operator::GATED_DELTA_SIGMOID_GATE_FEATURE,
+    operator::MOE_EXPERTS_ACTIVATION_FEATURE, operator::MOE_PER_EXPERT_SCALE_FEATURE,
+    operator::OperatorFamily, operator::OperatorId, operator::RMSNORM_PER_HEAD_FEATURE,
+    operator::RMSNORM_WEIGHT_OFFSET_FEATURE, operator::RMSNORM_WITHOUT_WEIGHT_FEATURE,
+    operator::ROPE_BANDED_FREQUENCY_SCALING_FEATURE, operator::ROPE_PARTIAL_ROTARY_FEATURE,
+    operator::ROPE_YARN_FREQUENCY_SCALING_FEATURE, operator::SPLIT_PER_HEAD_FEATURE,
+    operator::TensorLayoutKind, operator::TensorRole,
 };
 use magnetar_kernel::{
     kernel::KernelAdvertisement, kernel::KernelCancellationSupport, kernel::KernelId,
@@ -230,11 +231,13 @@ pub fn cuda_kernel_advertisements(
         ),
         // Qwen3.5's linear attention, with its two recurrent states as
         // explicit inputs and outputs (`support-qwen38-flash-next`).
-        baseline_advertisement(
+        // Honours `output_gate_type` (Qwen4-Exp's sigmoid gate).
+        advertisement_with_features(
             "gated-delta-mixer",
             OperatorFamily::LinearAlgebra,
             device_id,
             provider_name,
+            &[GATED_DELTA_SIGMOID_GATE_FEATURE],
         ),
         // Honours the banded and YaRN frequency-scaling attributes and
         // partial rotation.

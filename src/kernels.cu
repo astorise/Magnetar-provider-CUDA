@@ -8078,7 +8078,8 @@ extern "C" __global__ void __launch_bounds__(GDN_DELTA_THREADS) gdn_delta_kernel
 }
 
 // The gated RMSNorm of each (token, value head) row: `row / rms * weight *
-// silu(gate)`. One thread per row, its sum in order.
+// silu(gate)`, or `sigmoid(gate)` with `sigmoid_gate` (`output_gate_type`).
+// One thread per row, its sum in order.
 extern "C" __global__ void gdn_gated_norm_kernel(
     const float* values,
     const float* gates,
@@ -8086,7 +8087,8 @@ extern "C" __global__ void gdn_gated_norm_kernel(
     float* out,
     unsigned long long rows,
     unsigned long long value_dim,
-    float epsilon
+    float epsilon,
+    int sigmoid_gate
 ) {
     unsigned long long row = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= rows) {
@@ -8100,7 +8102,8 @@ extern "C" __global__ void gdn_gated_norm_kernel(
     }
     float inverse = 1.0f / sqrtf(sum / (float)value_dim + epsilon);
     for (unsigned long long c = 0; c < value_dim; ++c) {
-        out[row * value_dim + c] = x[c] * inverse * weight[c] * gdn_silu(g[c]);
+        float gate = sigmoid_gate ? gdn_sigmoid(g[c]) : gdn_silu(g[c]);
+        out[row * value_dim + c] = x[c] * inverse * weight[c] * gate;
     }
 }
 
