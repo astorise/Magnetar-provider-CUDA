@@ -45,6 +45,9 @@ fn buffer(slice: cudarc::driver::CudaSlice<f32>, shape: Vec<u64>) -> CudaDeviceB
 /// serves (`GDN_PROJECT_WARPS`, `GDN_PROJECT_ROWS` in `kernels.cu`).
 const PROJECT_WARPS: u64 = 8;
 const PROJECT_ROWS: u64 = 8;
+/// Threads per `gdn_delta_kernel` block (`GDN_DELTA_THREADS`): its
+/// register-held state column rules out larger blocks.
+const DELTA_THREADS: u64 = 64;
 
 impl CudaKernels {
     /// `x · weightᵀ` for a `[n, k]` weight in checkpoint `[out, in]` order,
@@ -307,7 +310,12 @@ impl CudaKernels {
                 .arg(&value_heads)
                 .arg(&key_dim)
                 .arg(&value_dim);
-            unsafe { args.launch(LaunchConfig::for_num_elems(value_width as u32)) }?;
+            let config = LaunchConfig {
+                grid_dim: (value_width.div_ceil(DELTA_THREADS) as u32, 1, 1),
+                block_dim: (DELTA_THREADS as u32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe { args.launch(config) }?;
         }
 
         // The gated RMSNorm, then the output projection.

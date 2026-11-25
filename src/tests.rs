@@ -115,14 +115,15 @@ fn kernel_advertisements_agree_with_availability() {
     if provider.is_available() {
         assert_eq!(
             advertisements.len(),
-            23,
+            25,
             "expected exactly the required-now kernel set this baseline implements, plus the \
              add-half/mul-half native half-precision Kernels \
              (enable-native-cuda-half-precision-elementwise-compute), the Runtime's fused \
              matmul-bias, matmul-residual and silu-mul (cache-and-optimize-prepared-graphs C03), \
              gated-matmul and kv-write (append-kv-history-in-place), moe-experts, row-scale \
-             and activation (execute-and-cache-moe-experts), gelu (layered models) and \
-             batched-matmul (cache-latent-attention-history)"
+             and activation (execute-and-cache-moe-experts), gelu (layered models), \
+             batched-matmul (cache-latent-attention-history), and split and \
+             gated-delta-mixer (support-qwen38-flash-next)"
         );
         let names: std::collections::BTreeSet<_> =
             advertisements.iter().map(|a| a.id.name.as_str()).collect();

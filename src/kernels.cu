@@ -8008,7 +8008,12 @@ extern "C" __global__ void gdn_qk_norm_kernel(
 // query)`, each sum in row order as the Reference computes it. `state_in`
 // is the initial state; `state_out` takes the next one.
 #define GDN_MAX_KEY_DIM 128
-extern "C" __global__ void gdn_delta_kernel(
+// Threads per block: the state column takes about GDN_MAX_KEY_DIM
+// registers per thread, too many for the 1024-thread blocks the
+// element-wise Kernels use (CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES); small
+// blocks also spread a decode step's few hundred columns over more SMs.
+#define GDN_DELTA_THREADS 64
+extern "C" __global__ void __launch_bounds__(GDN_DELTA_THREADS) gdn_delta_kernel(
     const float* query,
     const float* key,
     const float* convolved,
