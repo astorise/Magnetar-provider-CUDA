@@ -59,6 +59,7 @@ use magnetar_provider_api::{packed_weight::PackedWeight, packed_weight::PackedWe
 use crate::error::{CudaError, CudaErrorCode};
 use crate::kernels::{
     CapturedStep, CudaDeviceBuffer, CudaHalfDType, CudaKernels, CudaMoeOptions, CudaRopePairing,
+    GatedDeltaGeometry,
 };
 
 /// Reads which half-precision format an `add-half`/`mul-half` invocation
@@ -1270,8 +1271,10 @@ impl CudaExecutor {
         invocation: &KernelInvocation,
     ) -> Result<KernelResult, KernelError> {
         self.expand_unsupported_compact_inputs(invocation)?;
-        if invocation.kernel.name == "kv-write" {
-            return self.run_kv_write(invocation);
+        match invocation.kernel.name.as_str() {
+            "kv-write" => return self.run_kv_write(invocation),
+            "split" | "gated-delta-mixer" => return self.run_multi_output(invocation),
+            _ => {}
         }
         // The resource this invocation overwrites: its previous buffer is
         // dropped once the new output is stored anyway, so it is offered
@@ -1342,6 +1345,8 @@ impl CudaExecutor {
             // Latent K and V's projections (`chunk-latent-prefills`) go
             // through the matmul, which reads them compact.
             "attention" => (1..=4).contains(&index),
+            // The mixer's projection weights go through the matmul.
+            "gated-delta-mixer" => matches!(index, 3..=6 | 11),
             _ => false,
         };
         let mut storage = self.storage.lock().unwrap();
@@ -1416,6 +1421,106 @@ impl CudaExecutor {
             .output_readiness
             .insert(output.resource.id.to_string(), true);
         result.updated_resources.push(output.resource.clone());
+        Ok(result)
+    }
+
+    /// The Kernels with several outputs (`support-qwen38-flash-next`):
+    /// Qwen3.5's per-head `split` and the `gated-delta-mixer`, whose second
+    /// and third outputs are the next convolution and recurrent states.
+    /// Outputs must be distinct from each other and from every input.
+    fn run_multi_output(&self, invocation: &KernelInvocation) -> Result<KernelResult, KernelError> {
+        let name = invocation.kernel.name.as_str();
+        let expected = if name == "split" { 2 } else { 3 };
+        let outputs = &invocation.outputs;
+        if outputs.len() != expected {
+            return Err(KernelError::KernelExecutionFailed {
+                reason: format!("{name} requires exactly {expected} outputs"),
+            });
+        }
+        for (index, output) in outputs.iter().enumerate() {
+            let id = &output.resource.id;
+            if outputs[..index]
+                .iter()
+                .any(|other| &other.resource.id == id)
+                || invocation
+                    .inputs
+                    .iter()
+                    .any(|input| &input.resource.id == id)
+            {
+                return Err(KernelError::KernelExecutionFailed {
+                    reason: format!("{name} outputs must be distinct from all inputs and outputs"),
+                });
+            }
+        }
+        let computed: Vec<CudaDeviceBuffer> = {
+            let storage = self.storage.lock().unwrap();
+            let inputs = invocation
+                .inputs
+                .iter()
+                .map(|input| {
+                    let id = &input.resource.id;
+                    storage
+                        .get(id)
+                        .ok_or_else(|| KernelError::KernelExecutionFailed {
+                            reason: format!("no materialized data for input resource {id}"),
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if name == "split" {
+                let head_count = match invocation.attributes.get("head_count") {
+                    None => 1,
+                    Some(OperatorAttributeValue::Integer(value)) if *value > 0 => *value as u64,
+                    Some(other) => {
+                        return Err(KernelError::KernelAttributeUnsupported {
+                            attribute: format!("split head_count {other:?}"),
+                        });
+                    }
+                };
+                let [input] = inputs[..] else {
+                    return Err(KernelError::KernelExecutionFailed {
+                        reason: "split requires exactly one input".into(),
+                    });
+                };
+                self.kernels
+                    .split_halves(input, head_count)
+                    .map_err(KernelError::from)?
+                    .into()
+            } else {
+                let config = magnetar_provider_api::gated_delta_mixer_from_attributes(
+                    &invocation.attributes,
+                )
+                .map_err(KernelError::from)?;
+                let geometry = GatedDeltaGeometry {
+                    key_heads: config.key_heads as u64,
+                    value_heads: config.value_heads as u64,
+                    key_dim: config.key_dim as u64,
+                    value_dim: config.value_dim as u64,
+                    conv_kernel: config.conv_kernel as u64,
+                    epsilon: config.epsilon,
+                };
+                self.kernels
+                    .gated_delta_mixer(&inputs, geometry)
+                    .map_err(KernelError::from)?
+                    .into()
+            }
+        };
+        if outputs
+            .iter()
+            .zip(&computed)
+            .any(|(output, buffer)| output.resource.descriptor.shape.dimensions != buffer.shape)
+        {
+            return Err(KernelError::KernelExecutionFailed {
+                reason: format!("{name} output descriptor does not match computed shape"),
+            });
+        }
+        let mut result = KernelResult::success(invocation.id.clone());
+        for (index, buffer) in computed.into_iter().enumerate() {
+            let descriptor = self.store_output(invocation, index, buffer)?;
+            result
+                .output_readiness
+                .insert(descriptor.id.to_string(), true);
+            result.updated_resources.push(descriptor);
+        }
         Ok(result)
     }
 
@@ -1556,8 +1661,25 @@ impl CudaExecutor {
                         }
                     };
                     let epsilon = Self::attribute_float(&invocation.attributes, "epsilon", 1e-6);
+                    // Zero-centered norms scale by `weight_offset + weight`
+                    // (`support-qwen38-flash-next`).
+                    let weight_offset = match invocation.attributes.get("weight_offset") {
+                        None => 0.0,
+                        Some(OperatorAttributeValue::Float(offset))
+                            if offset.is_finite() && weight.is_some() =>
+                        {
+                            *offset as f32
+                        }
+                        Some(other) => {
+                            return Err(KernelError::KernelAttributeUnsupported {
+                                attribute: format!(
+                                    "rmsnorm weight_offset {other:?} (it needs a weight)"
+                                ),
+                            });
+                        }
+                    };
                     self.kernels
-                        .rmsnorm_with(input, weight, epsilon, heads)
+                        .rmsnorm_with(input, weight, epsilon, heads, weight_offset)
                         .map_err(KernelError::from)?
                 }
                 "rope" => {

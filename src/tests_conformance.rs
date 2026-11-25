@@ -5015,14 +5015,14 @@ fn per_head_and_weightless_rmsnorm_match_reference_cpu() {
     ] {
         let expected = rmsnorm_blocks(&input, weight_host, 1e-6, heads).unwrap();
         let actual = kernels
-            .rmsnorm_with(&device, weight_device, 1e-6, heads)
+            .rmsnorm_with(&device, weight_device, 1e-6, heads, 0.0)
             .unwrap();
         assert_close(&download(&kernels, &actual), &expected);
     }
     // Heads that do not tile the row are refused.
     assert!(
         kernels
-            .rmsnorm_with(&device, None, 1e-6, Some((3, 16)))
+            .rmsnorm_with(&device, None, 1e-6, Some((3, 16)), 0.0)
             .is_err()
     );
 }
@@ -5639,4 +5639,151 @@ fn concat_heads_matches_reference_cpu() {
             .concat_heads(&a, &upload(&kernels, &activations(5, 6, 105)), 4, 2)
             .is_err()
     );
+}
+
+/// `values` (from [`activations`]) reshaped to `shape` and scaled.
+fn shaped(shape: &[u64], seed: u32, scale: f32) -> HostTensor {
+    let count = shape.iter().product::<u64>();
+    let data: Vec<f32> = activations(1, count, seed)
+        .data
+        .into_iter()
+        .map(|value| value * scale)
+        .collect();
+    HostTensor::new(shape.to_vec(), data).unwrap()
+}
+
+/// Qwen3.5's forms (`support-qwen38-flash-next`): the zero-centered
+/// RMSNorm (`weight_offset`) and the per-head `split` of the query
+/// projection.
+#[test]
+fn qwen3_5_norm_offset_and_per_head_split_match_reference_cpu() {
+    use magnetar_provider_api::operator_semantics::rmsnorm_blocks;
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    // Per head (a [16] weight over 4 heads) and per row (a [64] weight).
+    let input = activations(5, 4 * 16, 106);
+    let device = upload(&kernels, &input);
+    for (width, heads) in [(16, Some((4, 16))), (64, None)] {
+        let weight = shaped(&[width], 107, 0.1);
+        let shifted = HostTensor::new(
+            [width],
+            weight.data.iter().map(|w| w + 1.0).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let expected = rmsnorm_blocks(&input, Some(&shifted), 1e-6, heads).unwrap();
+        let actual = kernels
+            .rmsnorm_with(&device, Some(&upload(&kernels, &weight)), 1e-6, heads, 1.0)
+            .unwrap();
+        assert_close(&download(&kernels, &actual), &expected);
+    }
+    // Rows of 4 heads of [query (8) | gate (8)].
+    let rows = activations(3, 4 * 16, 108);
+    let [query, gate] = kernels.split_halves(&upload(&kernels, &rows), 4).unwrap();
+    let mut expected = (Vec::new(), Vec::new());
+    for block in rows.data.as_chunks::<16>().0 {
+        expected.0.extend_from_slice(&block[..8]);
+        expected.1.extend_from_slice(&block[8..]);
+    }
+    assert_close(
+        &download(&kernels, &query),
+        &HostTensor::new([3, 32], expected.0).unwrap(),
+    );
+    assert_close(
+        &download(&kernels, &gate),
+        &HostTensor::new([3, 32], expected.1).unwrap(),
+    );
+    assert!(kernels.split_halves(&upload(&kernels, &rows), 3).is_err());
+}
+
+/// The gated-delta mixer against the shared f32 semantics: a masked
+/// five-token prefill from non-zero states, then a one-token decode from
+/// the states it returned. Every output is compared, the two next states
+/// included.
+#[test]
+fn gated_delta_mixer_matches_reference_cpu_across_steps() {
+    use crate::kernels::GatedDeltaGeometry;
+    use magnetar_provider_api::operator_semantics::{GatedDeltaMixer, gated_delta_mixer};
+    let Some(kernels) = kernels_or_skip() else {
+        return;
+    };
+    let (key_heads, value_heads, key_dim, value_dim, conv_kernel, hidden) = (2, 4, 16, 8, 4, 24);
+    let channels = 2 * key_heads * key_dim + value_heads * value_dim;
+    let value_width = value_heads * value_dim;
+    let reference = GatedDeltaMixer {
+        key_heads: key_heads as usize,
+        value_heads: value_heads as usize,
+        key_dim: key_dim as usize,
+        value_dim: value_dim as usize,
+        conv_kernel: conv_kernel as usize,
+        epsilon: 1e-6,
+    };
+    let geometry = GatedDeltaGeometry {
+        key_heads,
+        value_heads,
+        key_dim,
+        value_dim,
+        conv_kernel,
+        epsilon: 1e-6,
+    };
+    // Inputs 3..=11: the projections, convolution, A_log, dt_bias, norm
+    // and output projection.
+    let weights = [
+        shaped(&[channels, hidden], 110, 0.3),
+        shaped(&[value_width, hidden], 111, 0.3),
+        shaped(&[value_heads, hidden], 112, 0.3),
+        shaped(&[value_heads, hidden], 113, 0.3),
+        shaped(&[channels, conv_kernel], 114, 0.5),
+        shaped(&[value_heads], 115, 0.5),
+        shaped(&[value_heads], 116, 0.5),
+        shaped(&[value_dim], 117, 0.2),
+        shaped(&[hidden, value_width], 118, 0.3),
+    ];
+    let device_weights = weights
+        .iter()
+        .map(|tensor| upload(&kernels, tensor))
+        .collect::<Vec<_>>();
+    let mut states = [
+        shaped(&[channels, conv_kernel], 119, 0.5),
+        shaped(&[value_heads, key_dim, value_dim], 120, 0.2),
+    ];
+    for (tokens, mask) in [(5u64, Some(vec![1.0, 1.0, 0.0, 1.0, 1.0])), (1, None)] {
+        let hidden_states = shaped(&[tokens, hidden], 121 + tokens as u32, 1.0);
+        let mut host = vec![hidden_states, states[0].clone(), states[1].clone()];
+        host.extend(weights.iter().cloned());
+        if let Some(mask) = &mask {
+            host.push(HostTensor::new([tokens], mask.clone()).unwrap());
+        }
+        let expected = gated_delta_mixer(&host, reference).unwrap();
+        let mut device = vec![
+            upload(&kernels, &host[0]),
+            upload(&kernels, &states[0]),
+            upload(&kernels, &states[1]),
+        ];
+        if let Some(mask) = host.get(12) {
+            device.push(upload(&kernels, mask));
+        }
+        let mut inputs: Vec<&CudaDeviceBuffer> = device[..3].iter().collect();
+        inputs.extend(&device_weights);
+        inputs.extend(device.get(3));
+        let actual = kernels.gated_delta_mixer(&inputs, geometry).unwrap();
+        for (output, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+            let actual = download(&kernels, actual);
+            assert_eq!(actual.shape, expected.shape, "output {output}");
+            for (index, (a, e)) in actual.data.iter().zip(&expected.data).enumerate() {
+                assert!(
+                    (a - e).abs() <= 1e-4 * (1.0 + e.abs()),
+                    "{tokens} token(s), output {output}, element {index}: cuda={a} reference={e}"
+                );
+            }
+        }
+        states = [expected[1].clone(), expected[2].clone()];
+    }
+    // Wider key heads than the registers hold are refused.
+    let wide = GatedDeltaGeometry {
+        key_dim: 256,
+        ..geometry
+    };
+    let inputs: Vec<&CudaDeviceBuffer> = device_weights.iter().collect();
+    assert!(kernels.gated_delta_mixer(&inputs, wide).is_err());
 }

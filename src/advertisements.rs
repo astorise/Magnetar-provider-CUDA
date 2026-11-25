@@ -28,10 +28,10 @@ use magnetar_core::{
     operator::ATTENTION_VALUE_HEAD_STRIDE_FEATURE, operator::CONCAT_HEADS_FEATURE,
     operator::EMBEDDING_SCALE_FEATURE, operator::MOE_EXPERTS_ACTIVATION_FEATURE,
     operator::MOE_PER_EXPERT_SCALE_FEATURE, operator::OperatorFamily, operator::OperatorId,
-    operator::RMSNORM_PER_HEAD_FEATURE, operator::RMSNORM_WITHOUT_WEIGHT_FEATURE,
-    operator::ROPE_BANDED_FREQUENCY_SCALING_FEATURE, operator::ROPE_PARTIAL_ROTARY_FEATURE,
-    operator::ROPE_YARN_FREQUENCY_SCALING_FEATURE, operator::TensorLayoutKind,
-    operator::TensorRole,
+    operator::RMSNORM_PER_HEAD_FEATURE, operator::RMSNORM_WEIGHT_OFFSET_FEATURE,
+    operator::RMSNORM_WITHOUT_WEIGHT_FEATURE, operator::ROPE_BANDED_FREQUENCY_SCALING_FEATURE,
+    operator::ROPE_PARTIAL_ROTARY_FEATURE, operator::ROPE_YARN_FREQUENCY_SCALING_FEATURE,
+    operator::SPLIT_PER_HEAD_FEATURE, operator::TensorLayoutKind, operator::TensorRole,
 };
 use magnetar_kernel::{
     kernel::KernelAdvertisement, kernel::KernelCancellationSupport, kernel::KernelId,
@@ -207,13 +207,34 @@ pub fn cuda_kernel_advertisements(
             provider_name,
             &[EMBEDDING_SCALE_FEATURE],
         ),
-        // Honours per-head normalization and a missing weight.
+        // Honours per-head normalization, a missing weight and a weight
+        // offset (Qwen3.5's zero-centered norms).
         advertisement_with_features(
             "rmsnorm",
             OperatorFamily::Normalization,
             device_id,
             provider_name,
-            &[RMSNORM_PER_HEAD_FEATURE, RMSNORM_WITHOUT_WEIGHT_FEATURE],
+            &[
+                RMSNORM_PER_HEAD_FEATURE,
+                RMSNORM_WITHOUT_WEIGHT_FEATURE,
+                RMSNORM_WEIGHT_OFFSET_FEATURE,
+            ],
+        ),
+        // Halves each head's block (`head_count`): Qwen3.5's query and gate.
+        advertisement_with_features(
+            "split",
+            OperatorFamily::Tensor,
+            device_id,
+            provider_name,
+            &[SPLIT_PER_HEAD_FEATURE],
+        ),
+        // Qwen3.5's linear attention, with its two recurrent states as
+        // explicit inputs and outputs (`support-qwen38-flash-next`).
+        baseline_advertisement(
+            "gated-delta-mixer",
+            OperatorFamily::LinearAlgebra,
+            device_id,
+            provider_name,
         ),
         // Honours the banded and YaRN frequency-scaling attributes and
         // partial rotation.
