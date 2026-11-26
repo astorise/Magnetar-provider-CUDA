@@ -1,0 +1,38 @@
+name: Kernel timings
+
+# The Device time of this Provider's kernels, on real hardware. Each test is an
+# ignored test of this crate that prints its timings (and what the kernel reads
+# or writes): it measures, it does not gate, and the numbers are in the job's
+# log. Dispatch it by hand, after a change to a kernel, and compare with the
+# previous run.
+#
+# These used to be steps of Magnetar's `gpu-runner-smoke.yml`, which runs the
+# combination Magnetar pins; they exercise this Provider alone, so they run
+# here, on this repository's GPU runner. The workflow is defined once, in
+# Magnetar (`submodule-gpu-timings.yml`): it builds the crate inside a Magnetar
+# checkout, as `ci.yml` does, and runs each named test in release mode. One that
+# fails or runs past its limit fails the job after the others have run.
+on:
+  workflow_dispatch:
+    inputs:
+      tests:
+        description: >-
+          Space-separated names of the ignored tests to run, each printing its
+          timings. All of them by default.
+        required: false
+        default: >-
+          decode_matmul_bandwidth moe_decode_kernel_times moe_prefill_kernel_times
+          long_context_kernel_times decode_attention_times latent_prefill_attention_times
+          packed_embedding_lookup_times captured_step_device_memory
+
+permissions:
+  contents: read
+
+jobs:
+  timings:
+    uses: astorise/Magnetar/.github/workflows/submodule-gpu-timings.yml@main
+    with:
+      module-path: providers/cuda
+      siblings: providers/cpu
+      tests: ${{ inputs.tests }}
+      gpu-runner: arc-gpu-magnetar-provider-cuda

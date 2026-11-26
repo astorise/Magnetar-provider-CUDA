@@ -144,6 +144,15 @@ A second job, `gpu`, runs the same tests on the self-hosted runner
 is visible. It runs for pushes to `main` and for pull requests from branches
 of this repository, not for pull requests from forks.
 
+`.github/workflows/kernel-timings.yml`, dispatched by hand, prints the Device
+time of this Provider's kernels on the same runner: each is an ignored test of
+this crate (`decode_matmul_bandwidth`, `moe_decode_kernel_times`,
+`decode_attention_times`...), run in release mode with `--nocapture`. They
+measure and do not gate. The workflow is Magnetar's reusable
+[`submodule-gpu-timings.yml`](https://github.com/astorise/Magnetar/blob/main/.github/workflows/submodule-gpu-timings.yml);
+the timings used to be steps of Magnetar's `gpu-runner-smoke.yml`, which keeps
+what needs the whole pinned combination.
+
 A test failure that names `Cargo.lock` means the Runtime's dependency set
 changed in Magnetar; refresh the lockfile with `cargo update -w` from this
 crate's directory inside a Magnetar checkout.
