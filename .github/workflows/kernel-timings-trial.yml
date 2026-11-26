@@ -1,0 +1,20 @@
+name: Kernel timings (trial)
+
+# Runs the reusable workflow from the Magnetar branch that adds it, on this
+# branch's pushes, because a workflow dispatched by hand has to exist on the
+# default branch first. Removed once the reusable workflow is on Magnetar's main.
+on:
+  push:
+    branches: [claude/charming-lamport-1b9m74]
+
+permissions:
+  contents: read
+
+jobs:
+  timings:
+    uses: astorise/Magnetar/.github/workflows/submodule-gpu-timings.yml@claude/charming-lamport-1b9m74
+    with:
+      module-path: providers/cuda
+      siblings: providers/cpu
+      tests: captured_step_device_memory decode_matmul_bandwidth
+      gpu-runner: arc-gpu-magnetar-provider-cuda
