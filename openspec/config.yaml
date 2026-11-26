@@ -1,0 +1,8 @@
+schema: spec-driven
+
+context: |
+  Magnetar-provider-CUDA is part of Magnetar (https://github.com/astorise/Magnetar), a Rust-first
+  local AI Runtime. A Provider: it executes the Runtime's operators on one kind of Device through the
+  Provider API (`magnetar-provider-api`), and advertises what it can run. Its specifications and
+  changes live in this repository. A change that also reaches the Magnetar core is coordinated by a
+  change of the same name in Magnetar, which links to the companion change here.
